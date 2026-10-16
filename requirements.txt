@@ -1,0 +1,6 @@
+PySide6_Essentials==6.12.0
+PyInstaller==6.22.3
+ziglang==0.16.0
+comtypes==1.4.17
+pefile==2024.8.26
+capstone==5.0.9

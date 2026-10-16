@@ -1,0 +1,26 @@
+.venv/
+build/
+dist/
+release/
+__pycache__/
+*.pyc
+*.spec
+native/*.dll
+native/*.lib
+native/*.pdb
+
+# Local credentials and session state; never include these in source history.
+.env
+.env.*
+/api-settings.json
+/translations.json
+/live-session.json
+/effect-instance-session.json
+/parameter-session.json
+/parameter-translations.json
+/parameter-enabled.json
+/ae-installations.json
+/ae-version.json
+/adapter-analysis/
+/adapters/
+/ae-bridge/
