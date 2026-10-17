@@ -92,3 +92,15 @@ class AsciiTests(unittest.TestCase):
     def test_unreadable_or_non_ascii_is_not_accepted(self):
         with self.assertRaises(RuntimeError):n.bounded_ascii(SimpleNamespace(read=Mock(side_effect=RuntimeError('bad'))),0)
         with self.assertRaises(UnicodeDecodeError):n.bounded_ascii(SimpleNamespace(read=lambda a,s:b'\xff\0'+b'x'*(s-2)),0)
+    def test_non_ascii_internal_names_are_left_out_of_the_pool(self):
+        # Pool: 1 bucket -> node A ('Glow') -> node B (a Chinese internal name); B is skipped, A kept.
+        memory={0x10:struct.pack('<Q',0x50),0x50:struct.pack('<Q',0x100),0x100:struct.pack('<QQQ',0x200,0,0x400).ljust(64,b'\0')+b'A'*16,
+                0x200:struct.pack('<QQQ',0,0,0x500).ljust(64,b'\0')+b'B'*16,0x400:b'Glow\0'.ljust(32,b'x'),0x500:'中文\0'.encode('utf8').ljust(32,b'x')}
+        def read(addr,size):
+            for start,raw in memory.items():
+                if start<=addr and addr+size<=start+len(raw):return raw[addr-start:addr-start+size]
+            raise RuntimeError('unmapped')
+        catalog=object.__new__(n.ParameterCatalog);catalog.p=SimpleNamespace(read=read,u64=lambda a:struct.unpack('<Q',read(a,8))[0])
+        catalog.tdb=0;catalog.profile=SimpleNamespace(match_pool=0x1000)
+        memory[0x1000]=struct.pack('<QQQQQQ',0,1,0,0,0,0x10)
+        self.assertEqual(catalog.match_pool(),{b'A'*16:'Glow'})

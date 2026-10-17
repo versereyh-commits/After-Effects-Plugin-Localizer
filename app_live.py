@@ -25,7 +25,7 @@ from ui_kit import confirm,choose,inform,ask_text,SchemeDelegate,SchemeRow,Schem
 from ui_kit import (SHADOW,STATUS_MARK,Banner,DiamondDelegate,Breather,EmptyState,FadeStack,Legend,LoaderButton,MetricTile,UsageTile,NavRail,Pill,SearchField,Spinner,StatusTag,Surface,
                     button,divider,elastic,fade_in,icon,label,logo,menu_button,page_head,repolish,soft_path,table_style)
 
-APP_VERSION='1.1.1'
+APP_VERSION='1.1.2'
 APP_NAME='AE汉化工具'
 # Installed copies: the current folder name, and the folder older versions used (an upgrade keeps it).
 INSTALL_FOLDERS=('AE汉化工具','AE插件名称汉化')

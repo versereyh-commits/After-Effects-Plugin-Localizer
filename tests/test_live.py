@@ -24,7 +24,7 @@ class FakeRegistry:
     EFFECTS=[(1000,'S_Glow','Sapphire Lighting'),(2000,'tc Shine','RG Blurs and Glows')]
     def __init__(self,process):self.p=process
     def records(self):
-        return [{'address':address,'displayName':self.p.memory[address+16].split(b'\0',1)[0].decode(),'matchName':key,'category':category,'guard':b'stable-identity'} for address,key,category in self.EFFECTS]
+        return [{'address':address,'displayName':live.decode_name(self.p.memory[address+16],'utf8'),'matchName':key,'category':category,'guard':b'stable-identity'} for address,key,category in self.EFFECTS]
     def target(self,key):return next(x for x in self.records() if x['matchName']==key)
     def read_record(self,address):return next(x for x in self.records() if x['address']==address)
     unchanged=live.Registry.unchanged
@@ -66,11 +66,20 @@ class LiveSafetyTests(unittest.TestCase):
             with self.subTest(field=field):
                 journal=self._journal();journal['entries']['S_Glow'][field]=(b'A'*48).hex()
                 self._assert_bad_journal(json.dumps(journal).encode())
-    def test_non_utf8_hex_is_preserved_without_writes(self):
-        for field in ('originalHex','appliedHex'):
-            with self.subTest(field=field):
-                journal=self._journal();journal['entries']['S_Glow'][field]=(b'\xff'+b'\0'*47).hex()
-                self._assert_bad_journal(json.dumps(journal).encode())
+    def test_non_utf8_applied_hex_is_preserved_without_writes(self):
+        # What this program wrote is always readable; an original name may be any bytes a plugin shipped.
+        journal=self._journal();journal['entries']['S_Glow']['appliedHex']=(b'\xff'+b'\0'*47).hex()
+        self._assert_bad_journal(json.dumps(journal).encode())
+        journal=self._journal();journal['entries']['S_Glow']['originalHex']=(b'\xff'+b'\0'*47).hex()
+        self.session.journal_path.write_text(json.dumps(journal),encoding='utf8');self.assertEqual(self.session.journal()['entries']['S_Glow']['originalHex'],'ff'+'00'*47)
+    def test_names_shipped_in_another_encoding_apply_and_restore_byte_for_byte(self):
+        # A plugin with GBK names in a UTF-8 build: shown as AE shows them, renamed, and restored to the exact bytes.
+        gbk=('键控与混合'.encode('gbk')+b'\0').ljust(48,b'\0');self.process.memory[1016]=gbk
+        self.assertEqual(FakeRegistry(self.process).records()[0]['displayName'],'键控与混合'.encode('gbk').decode('latin-1'))
+        result=self.session.apply({'S_Glow':'辉光'});self.assertEqual(result['applied'],{'S_Glow':'辉光'})
+        self.assertEqual(self.process.memory[1016],live.encode_name('辉光'))
+        self.assertEqual(self.session.restore()['restored'],{'S_Glow':'键控与混合'.encode('gbk').decode('latin-1')})
+        self.assertEqual(self.process.memory[1016],gbk);self.assertEqual(self.session.journal()['entries'],{})
     def test_hex_requires_exact_length_and_hex_characters(self):
         for value in ('00'*49,'GG'*48,'00 '*32,0,None):
             for field in ('originalHex','appliedHex'):

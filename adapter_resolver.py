@@ -115,6 +115,18 @@ class Resolver(ModuleTools):
             count_get=count,count_bytes=count_bytes,display_get=fields['display_get'],match_pool=self.match_pool(),display_cache=self.display_cache(fields['display_get']),group_vector=fields['group_vector'],
             named_vector=named,named_map=named_map,codec_sha=hashlib.sha256(codec.read_bytes()).hexdigest(),native_dynamic=True,enabled=False)
 
+def _readings(raw:bytes,encoding:str)->set[str]:
+    """How AE's scripting may report a name field: in the build's encoding, or — only for bytes that encoding
+    cannot read (a plugin shipping GBK names, a Chinese internal name) — one character per byte, as AE shows
+    them. Either way the bytes are matched exactly, never loosely."""
+    raw=raw.split(b'\0',1)[0]
+    try:return {raw.decode(encoding)}
+    except UnicodeDecodeError:pass
+    found={raw.decode('latin-1')}
+    try:found.add(raw.decode('cp1252'))
+    except UnicodeDecodeError:pass
+    return found
+
 def registry_offset(process,profile,host_catalog):
     """Read-only exhaustive cross-check of a small bounded manager header."""
     base=next(m['base'] for m in process.modules() if m['name'].casefold()=='flt.dll');manager=process.u64(base+profile.manager)
@@ -129,13 +141,20 @@ def registry_offset(process,profile,host_catalog):
             for address in values[::2]:
                 raw=process.read(address,160)
                 if struct.unpack_from('<Q',raw)[0]!=base+profile.fc_vtable:raise ValueError()
-                key=raw[64:96].split(b'\0',1)[0].decode('ascii')
-                if key in rows or b'\0' not in raw[16:64] or b'\0' not in raw[96:160]:raise ValueError()
-                rows[key]=(raw[16:64],raw[96:160])
+                fields=(raw[16:64],raw[64:96],raw[96:160])
+                if fields[1] in rows or any(b'\0' not in field for field in fields):raise ValueError()
+                rows[fields[1]]=fields
             for encoding in ('utf8','mbcs'):
-                try:decoded={k:tuple(raw.split(b'\0',1)[0].decode(encoding) for raw in pair) for k,pair in rows.items()}
-                except UnicodeError:continue
-                if decoded==expected:matches.append(offset);break
+                # Every object must be one host row, each field the host's exact reading of its bytes.
+                seen=set()
+                for name,key,category in rows.values():
+                    keys=[k for k in _readings(key,encoding) if k in expected]
+                    if len(keys)!=1 or keys[0] in seen:break
+                    shown,group=expected[keys[0]]
+                    if shown not in _readings(name,encoding) or group not in _readings(category,encoding):break
+                    seen.add(keys[0])
+                else:
+                    if len(seen)==len(expected):matches.append(offset);break
         except (ValueError,RuntimeError,OSError,struct.error):continue
     return unique(matches,'完整效果目录向量')
 

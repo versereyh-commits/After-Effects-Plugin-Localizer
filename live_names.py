@@ -37,13 +37,23 @@ def _process_lock():
         if acquired:kernel.ReleaseMutex(handle)
         kernel.CloseHandle(handle)
 
-def _name_bytes(value,encoding='utf8'):
+def decode_name(raw:bytes,encoding:str)->str:
+    """A name field (up to its NUL) as text. Bytes this build's encoding cannot read — a plugin that ships GBK
+    names, or a Chinese internal name — are read one character per byte, the way AE itself shows them, so they
+    never stop a read; writes and restores always use the exact bytes."""
+    text=raw.split(b'\0',1)[0]
+    try:return text.decode(encoding)
+    except UnicodeDecodeError:return text.decode('latin-1')
+
+def _name_bytes(value,encoding='utf8',strict=True):
+    """A journal's name field as bytes. `strict`: it must also read in `encoding` (names this program wrote);
+    an original name may be any bytes a plugin shipped."""
     try:
         if not isinstance(value,str) or len(value)!=FIELD_SIZE*2 or any(c not in '0123456789abcdefABCDEF' for c in value):
             raise ValueError('名称字节必须是 96 个十六进制字符')
         raw=bytes.fromhex(value)
         if b'\0' not in raw:raise ValueError('名称字节缺少 NUL 终止符')
-        raw.split(b'\0',1)[0].decode(encoding)
+        if strict:raw.split(b'\0',1)[0].decode(encoding)
         return raw
     except ValueError as error:
         raise RuntimeError('恢复记录损坏，已停止写入，原文件已保留：'+str(error)) from error
@@ -118,7 +128,7 @@ class Registry:
         for start,end_field in ((16,64),(64,96),(96,160)):
             raw=data[start:end_field]
             if b'\0' not in raw:raise RuntimeError('AE 效果名称字段未终止，未执行写入')
-            fields.append(raw.split(b'\0',1)[0].decode(self.profile.encoding if start!=64 else 'ascii'))
+            fields.append(decode_name(raw,self.profile.encoding))
         return {'address':address,'displayName':fields[0],'matchName':fields[1],'category':fields[2],'guard':data[:16]+data[64:160]}
     def unchanged(self,row):
         # One catalog snapshot is taken before a batch; each object is then re-read just before its write.
@@ -178,7 +188,7 @@ class NameSession:
             for entry in journal['entries'].values():
                 if not isinstance(entry,dict):raise ValueError('名称条目必须是对象')
                 if not isinstance(entry.get('originalName'),str) or not isinstance(entry.get('newName'),str):raise ValueError('原始名称和新名称必须是文字')
-                _name_bytes(entry.get('originalHex'),journal.get('encoding','utf8'));_name_bytes(entry.get('appliedHex'),journal.get('encoding','utf8'))
+                _name_bytes(entry.get('originalHex'),journal.get('encoding','utf8'),strict=False);_name_bytes(entry.get('appliedHex'),journal.get('encoding','utf8'))
             return journal
         except FileNotFoundError:return {'schemaVersion':1,'entries':{}}
         except ValueError as error:
@@ -219,7 +229,7 @@ class NameSession:
             for key,value in encoded.items():
                 if key not in by_key:raise ValueError('当前 AE 未加载此效果：'+key)
                 row=by_key[key];before=p.read(row['address']+16,FIELD_SIZE)
-                try:_name_bytes(before.hex(),encoding)
+                try:_name_bytes(before.hex(),encoding,strict=False)
                 except RuntimeError:raise RuntimeError('AE 当前名称字段格式异常，未执行写入：'+key) from None
                 if before==value:unchanged.append(key);continue
                 entry=journal['entries'].get(key)
@@ -246,7 +256,7 @@ class NameSession:
                     try:
                         actual=registry.target(row['matchName'])
                         if actual['address']!=row['address'] or actual['guard']!=row['guard']:raise RuntimeError('回滚目标守卫不符')
-                        p.write_buffer(row['address']+16,_name_bytes(before.hex(),encoding))
+                        p.write_buffer(row['address']+16,_name_bytes(before.hex(),encoding,strict=False))
                     except Exception:failed.append(row['matchName'])
                 if failed:
                     retained=json.loads(json.dumps(previous))
@@ -279,7 +289,7 @@ class NameSession:
                     for key in wanted:
                         entry=journal['entries'][key];row=rows[key]
                         if not registry.unchanged(row):raise RuntimeError('AE 目录在操作期间发生变化，已停止：'+key)
-                        p.write_buffer(row['address']+16,_name_bytes(entry['originalHex'],journal.get('encoding','utf8')))
+                        p.write_buffer(row['address']+16,_name_bytes(entry['originalHex'],journal.get('encoding','utf8'),strict=False))
                         actual=registry.read_record(row['address'])
                         if actual['matchName']!=key or actual['guard']!=row['guard'] or actual['displayName']!=entry['originalName'] or p.read(row['address']+16,FIELD_SIZE).hex()!=entry['originalHex'].lower():
                             raise RuntimeError('效果目录恢复回读不一致，记录已保留：'+key)

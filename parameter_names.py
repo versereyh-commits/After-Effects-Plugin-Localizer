@@ -89,7 +89,10 @@ class ParameterCatalog:
             while node and node not in seen:
                 if len(seen)>200000:raise RuntimeError('参数内部标识池过大')
                 seen.add(node);b=p.read(node,80);ptr=struct.unpack_from('<Q',b,16)[0] or node+24
-                names[b[64:80]]=bounded_ascii(p,ptr);node=struct.unpack_from('<Q',b)[0]
+                # A plugin's non-ASCII internal name (Chinese) is left out: its effect / parameters are simply not listed.
+                try:names[b[64:80]]=bounded_ascii(p,ptr)
+                except UnicodeDecodeError:pass
+                node=struct.unpack_from('<Q',b)[0]
         return names
     def _scan_parades(self):
         from parallel_scan import scan_auto

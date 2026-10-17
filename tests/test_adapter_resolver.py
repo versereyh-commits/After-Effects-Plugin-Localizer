@@ -58,6 +58,23 @@ class RegistryOffsetTests(fixtures.AnalysisTests):
     def test_mismatched_category_is_rejected(self):
         self.host[0]['category']='Other'
         with self.assertRaises(ValueError):registry_offset(self.process,self.profile,self.host)
+    def rename(self,at,name=None,key=None):
+        data=bytearray(self.memory[at])
+        if name is not None:data[16:64]=name.ljust(48,b'\0')
+        if key is not None:data[64:96]=key.ljust(32,b'\0')
+        self.memory[at]=bytes(data)
+    def test_names_the_encoding_cannot_read_match_as_ae_shows_them(self):
+        # A plugin shipping GBK names into a UTF-8 build: AE's scripting shows them one character per byte.
+        gbk='BCC 键控与混合'.encode('gbk');self.rename(0x400000,name=gbk);self.host[0]['displayName']=gbk.decode('latin-1')
+        self.assertEqual(registry_offset(self.process,self.profile,self.host),32)
+        self.host[0]['displayName']='BCC 键控与合成'.encode('gbk').decode('latin-1')   # other bytes: still exact
+        with self.assertRaises(ValueError):registry_offset(self.process,self.profile,self.host)
+    def test_chinese_internal_names_match(self):
+        self.rename(0x400100,key='B中文'.encode('utf8'));self.host[1]['matchName']='B中文'
+        self.assertEqual(registry_offset(self.process,self.profile,self.host),32)
+    def test_readable_bytes_are_never_matched_one_character_per_byte(self):
+        self.rename(0x400000,name='Alpha辉光'.encode('utf8'));self.host[0]['displayName']='Alpha辉光'.encode('utf8').decode('latin-1')
+        with self.assertRaises(ValueError):registry_offset(self.process,self.profile,self.host)
     def test_wrong_object_type_is_rejected(self):
         data=bytearray(self.memory[0x400000]);struct.pack_into('<Q',data,0,0);self.memory[0x400000]=bytes(data)
         with self.assertRaises(ValueError):registry_offset(self.process,self.profile,self.host)

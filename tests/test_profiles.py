@@ -32,6 +32,12 @@ class ProfileTests(unittest.TestCase):
                 record[16:64]=live_names.encode_name('辉光',profile.encoding);record[64:96]=b'S_Glow\0'.ljust(32,b'\0');record[96:160]='灯光'.encode(profile.encoding).ljust(64,b'\0');p.blocks[obj]=bytes(record)
                 with patch.dict(ae_profiles.PROFILES,{version:profile}),patch.object(live_names,'file_version',return_value=version):
                     registry=live_names.Registry(p);rows=registry.records();self.assertEqual(rows[0]['displayName'],'辉光');self.assertEqual(rows[0]['category'],'灯光')
+                    # A Chinese internal name and GBK names a plugin shipped never stop the read.
+                    odd=bytearray(record);gbk='键控与混合'.encode('gbk')
+                    odd[16:64]=(gbk+b'\0').ljust(48,b'\0');odd[64:96]=('S_中文'.encode(profile.encoding)+b'\0').ljust(32,b'\0');p.blocks[obj]=bytes(odd)
+                    row=registry.records()[0];self.assertEqual(row['matchName'],'S_中文')
+                    if profile.encoding=='utf8':self.assertEqual(row['displayName'],gbk.decode('latin-1'))   # as AE shows them
+                    else:self.assertIsInstance(row['displayName'],str)   # readable or not depends on the system code page
                     p.blocks[obj]=bytes(160)
                     with self.assertRaisesRegex(RuntimeError,'对象类型不符'):registry.records()
                 self.assertEqual(p.writes,[])
