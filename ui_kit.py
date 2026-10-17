@@ -644,7 +644,7 @@ class Legend(QWidget):
 
 # Prompts: confirmation and one-line input in the app's own look.
 class Prompt(QDialog):
-    def __init__(self,parent,title,text,ok_text='确定',danger=False,value=None,label_text='',extra=()):
+    def __init__(self,parent,title,text,ok_text='确定',danger=False,value=None,label_text='',extra=(),cancel=True):
         super().__init__(parent);self.setObjectName('prompt');self.setWindowTitle(title);self.setMinimumWidth(460);self.choice=None
         col=QVBoxLayout(self);col.setContentsMargins(28,24,28,22);col.setSpacing(10)
         col.addWidget(label(title,'promptTitle'));body=label(text,'promptText',True);body.setVisible(bool(text));col.addWidget(body)
@@ -653,7 +653,7 @@ class Prompt(QDialog):
             if label_text:col.addWidget(label(label_text,'field'))
             self.edit=QLineEdit(value);self.edit.setObjectName('field');self.edit.selectAll();col.addWidget(self.edit)
         col.addSpacing(8);row=QHBoxLayout();row.setSpacing(8);row.addStretch()
-        cancel=button('取消');cancel.clicked.connect(self.reject);row.addWidget(cancel)
+        if cancel:cancel=button('取消');cancel.clicked.connect(self.reject);row.addWidget(cancel)
         for index,text_ in enumerate(extra):
             other=button(text_);other.clicked.connect(lambda _=False,i=index:(setattr(self,'choice',i),self.accept()));row.addWidget(other)
         ok=button(ok_text,'danger' if danger else 'primary');ok.clicked.connect(self.accept);ok.setDefault(True);row.addWidget(ok);col.addLayout(row)
@@ -662,6 +662,10 @@ class Prompt(QDialog):
 
 def confirm(parent,title,text,ok_text='确定',danger=False)->bool:
     return Prompt(parent,title,text,ok_text,danger).exec()==QDialog.DialogCode.Accepted
+
+def inform(parent,title,text,ok_text='知道了'):
+    """A message with a single button, for news rather than a decision."""
+    Prompt(parent,title,text,ok_text,cancel=False).exec()
 
 def choose(parent,title,text,choices:list[str])->int|None:
     """Asks for one of several answers; buttons follow 取消 left to right and the last is the default.
@@ -902,13 +906,18 @@ class UsageTile(QWidget):
         painter.setPen(QPen(QColor(LINE_SOFT),1));painter.setBrush(QColor(PAPER));painter.drawRoundedRect(rect,16,16)
         small=QFont(self.font());small.setPixelSize(12);painter.setFont(small);metrics=QFontMetrics(small)
         painter.setPen(QColor(MUTED));painter.drawText(QRectF(rect.x()+16,rect.y()+12,rect.width()-26,18),Qt.AlignmentFlag.AlignVCenter|Qt.AlignmentFlag.AlignLeft,self.caption)
-        # Period figures first: the main number takes what is left and shrinks rather than overlap them.
-        side=max((metrics.horizontalAdvance(f'{name}  {value}') for name,value in self.lines),default=0);right=rect.right()-14
-        for index,(name,value) in enumerate(self.lines):
+        # Period figures first: the main number takes what is left and shrinks rather than overlap them. On a narrow
+        # tile the period figures drop their unit (the main figure keeps it), and if that is still too wide, go.
+        number=QFont();number.setFamilies(list(NUMERAL_FAMILIES));number.setWeight(QFont.Weight.DemiBold);number.setPixelSize(14)
+        right=rect.right()-14;least=QFontMetrics(number).horizontalAdvance(self.figure)
+        for lines in (self.lines,[(name,value.split(' ')[0].rstrip('k')) for name,value in self.lines],[]):
+            side=max((metrics.horizontalAdvance(f'{name}  {value}') for name,value in lines),default=0)
+            room=right-(side+12 if lines else 0)-(rect.x()+16)
+            if room>=least:break
+        for index,(name,value) in enumerate(lines):
             line=QRectF(right-side,rect.y()+34+index*17,side,17)
             painter.setPen(QColor(MUTED));painter.drawText(line,Qt.AlignmentFlag.AlignVCenter|Qt.AlignmentFlag.AlignLeft,name)
             painter.setPen(QColor(INK_2));painter.drawText(line,Qt.AlignmentFlag.AlignVCenter|Qt.AlignmentFlag.AlignRight,value)
-        room=right-side-12-(rect.x()+16);number=QFont();number.setFamilies(list(NUMERAL_FAMILIES));number.setWeight(QFont.Weight.DemiBold)
         size=26
         while size>14:
             number.setPixelSize(size)

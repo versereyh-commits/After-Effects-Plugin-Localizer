@@ -232,12 +232,19 @@ def bridge_root():
 
 def run_native(p,operations,timeout=25,action='labels',project_token=None,scope=None):
     if scope is not None and (scope not in ('selected','project') or action not in ('catalog','selection')):raise ValueError('读取范围不能用于写入请求')
+    # With the background extension loaded in AE (cep_bridge) the request goes through the folder it watches:
+    # no second AfterFX.exe, so AE keeps its window state and focus. Otherwise -- or when the extension does not
+    # take the request in time -- the AfterFX.exe -r relay runs the same request.
     # The relay must use a directory visible to both the EXE and AE. In the
     # development host AE sees a different LocalAppData view from the executor;
     # a portable-folder IPC directory also avoids that ambiguity in production.
-    folder=bridge_root()/uuid.uuid4().hex
+    import cep_bridge
+    use_bridge=cep_bridge.connected()
+    folder=(cep_bridge.root() if use_bridge else bridge_root())/uuid.uuid4().hex
     try:folder.mkdir(parents=True)
-    except OSError as e:raise RuntimeError('软件所在目录不可写，请把完整软件目录放在可写位置后重试') from e
+    except OSError as e:
+        if use_bridge:raise RuntimeError('无法写入后台连接目录：'+str(cep_bridge.root())) from e
+        raise RuntimeError('软件所在目录不可写，请把完整软件目录放在可写位置后重试') from e
     script=folder/'request.jsx';output=folder/'result.json';permit=folder/'permit';permit.write_text('pending',encoding='ascii')
     profile=get_profile(file_version(Path(p.image)))
     helper=asset_root()/'native'/('ae_parameters_v9.dll' if profile.native_dynamic else 'ae_parameters_v8.dll')
@@ -247,36 +254,54 @@ def run_native(p,operations,timeout=25,action='labels',project_token=None,scope=
     if trial_projects():request['qaProjects']=list(trial_projects())
     if profile.native_dynamic:
         request['adapter']={'flt':profile.flt_sha,'tdb':profile.tdb_sha,'codec':profile.codec_sha,'layout':','.join(format(v,'x') for v in (profile.root_vtable,profile.group_vector,profile.named_map,int(profile.named_vector),profile.parent_get,profile.stream_match_get,profile.count_get)),'encoding':profile.encoding}
-    template=(asset_root()/'scripts'/'parameter_bridge.jsx').read_text(encoding='utf8')
-    # AE's command-line script loader otherwise may interpret non-ASCII source
-    # using a Windows legacy code page. Escape every non-ASCII
-    # source character; all paths/names are JSON literals, never executable text.
-    source=template.replace('@@REQUEST@@',json.dumps(request,ensure_ascii=True))
-    source=''.join(c if ord(c)<128 else '\\u%04x'%ord(c) for c in source)
-    # AE 26.0's -r relay silently ignores the BOM-prefixed file on this host.
-    script.write_text(source,encoding='ascii')
-    launcher=subprocess.Popen([p.image,'-r',str(script)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,creationflags=subprocess.CREATE_NO_WINDOW)
-    until=time.monotonic()+timeout
+    launcher=keeper=None
+    def relay():
+        nonlocal launcher,keeper
+        template=(asset_root()/'scripts'/'parameter_bridge.jsx').read_text(encoding='utf8')
+        # AE's command-line script loader otherwise may interpret non-ASCII source
+        # using a Windows legacy code page. Escape every non-ASCII
+        # source character; all paths/names are JSON literals, never executable text.
+        source=template.replace('@@REQUEST@@',json.dumps(request,ensure_ascii=True))
+        source=''.join(c if ord(c)<128 else '\\u%04x'%ord(c) for c in source)
+        # AE 26.0's -r relay silently ignores the BOM-prefixed file on this host.
+        script.write_text(source,encoding='ascii')
+        # The hand-over makes AE show its main window again; keep it maximized / minimized as the user left it.
+        from ae_ui import WindowKeeper
+        keeper=WindowKeeper(p.pid)
+        launcher=subprocess.Popen([p.image,'-r',str(script)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,creationflags=subprocess.CREATE_NO_WINDOW)
+    claim_by=None
+    if use_bridge:cep_bridge.submit(folder,request);claim_by=time.monotonic()+cep_bridge.CLAIM_WAIT
+    else:relay()
+    until=time.monotonic()+timeout;finished=False
     try:
         while time.monotonic()<until:
+            if keeper:keeper.check()
             if output.exists():
                 try:
                     result=json.loads(output.read_text(encoding='utf-8-sig'))
                     if action in ('instanceCatalog','instanceNames') and (result.get('requestId')!=folder.name or result.get('action')!=action):raise RuntimeError('效果标题响应身份不匹配')
                     if scope is not None and (result.get('requestId')!=folder.name or result.get('action')!=action or result.get('readScope')!=scope):raise RuntimeError('参数读取范围响应身份不匹配')
-                    return result
+                    finished=True;return result
                 except ValueError:pass
+            if use_bridge:
+                reason=cep_bridge.problem(folder)
+                if reason:finished=True;raise cep_bridge.Rejected(reason)
+                # Not taken in time (AE busy loading, an older extension): take it back and use the relay.
+                if claim_by is not None and time.monotonic()>claim_by:
+                    claim_by=None
+                    if cep_bridge.withdraw(folder):relay()
             time.sleep(.1)
         raise TimeoutError('AE 参数操作超时，已撤销执行许可；请关闭 AE 中可能弹出的对话框，并确认“编辑 → 首选项 → 脚本和表达式 → 允许脚本写入文件和访问网络”已勾选后重试')
     finally:
         permit.unlink(missing_ok=True)
         # Only the secondary CLI relay may be terminated; never the primary AE.
-        if launcher.poll() is None and launcher.pid!=p.pid:
+        if launcher is not None and launcher.poll() is None and launcher.pid!=p.pid:
             launcher.terminate();launcher.wait(timeout=5)
-        if output.exists():
+        if keeper:keeper.settle()
+        if finished or output.exists():
             # Only these task-owned files are removed. Never recurse into a
             # user-selected path or delete the parent portable directory.
-            for owned in (script,output):owned.unlink(missing_ok=True)
+            for owned in (script,output,*(folder/name for name in cep_bridge.OWNED)):owned.unlink(missing_ok=True)
             try:folder.rmdir()
             except OSError:pass
 

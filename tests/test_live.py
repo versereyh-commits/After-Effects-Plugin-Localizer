@@ -21,9 +21,10 @@ class FakeProcess:
         self.writes.append((address,value));self.memory[address]=value
 
 class FakeRegistry:
+    EFFECTS=[(1000,'S_Glow','Sapphire Lighting'),(2000,'tc Shine','RG Blurs and Glows')]
     def __init__(self,process):self.p=process
     def records(self):
-        return [{'address':address,'displayName':self.p.memory[address+16].split(b'\0',1)[0].decode(),'matchName':key,'category':category,'guard':b'stable-identity'} for address,key,category in [(1000,'S_Glow','Sapphire Lighting'),(2000,'tc Shine','RG Blurs and Glows')]]
+        return [{'address':address,'displayName':self.p.memory[address+16].split(b'\0',1)[0].decode(),'matchName':key,'category':category,'guard':b'stable-identity'} for address,key,category in self.EFFECTS]
     def target(self,key):return next(x for x in self.records() if x['matchName']==key)
     def read_record(self,address):return next(x for x in self.records() if x['address']==address)
     unchanged=live.Registry.unchanged
@@ -102,9 +103,6 @@ class LiveSafetyTests(unittest.TestCase):
         self.assertEqual(len(live.encode_name('辉'*15)),48)
         for value in ['辉'*16,'a\0b','a\nb','', ' '*3]:
             with self.assertRaises(ValueError):live.encode_name(value)
-    def test_collision_is_rejected_before_memory_write(self):
-        with self.assertRaises(ValueError):self.session.apply({'S_Glow':'Shine'})
-        self.assertEqual(self.process.writes,[])
     def test_verification_mismatch_restores_bytes_and_journal(self):
         before=self.process.memory.copy();write=self.process.write_buffer
         def interfere(address,value):
@@ -298,10 +296,24 @@ class LiveSafetyTests(unittest.TestCase):
         result=self.session.apply({'Missing FX':'缺失'},skip_missing=True)
         self.assertEqual((result['applied'],result['skipped'],self.process.writes),({},['Missing FX'],[]))
         self.assertFalse(self.session.journal_path.exists())
-    def test_every_name_conflict_is_reported_before_any_write(self):
-        with self.assertRaises(ValueError) as caught:self.session.apply({'S_Glow':'光','tc Shine':'光'})
-        self.assertIn('光',str(caught.exception))
-        self.assertEqual(self.process.writes,[])
+    def test_different_effects_may_share_a_name_and_are_reported(self):
+        # Different effects may share a name (user choice); it is written and reported with their original names.
+        result=self.session.apply({'S_Glow':'光','tc Shine':'光'})
+        self.assertEqual(result['applied'],{'S_Glow':'光','tc Shine':'光'});self.assertEqual(result['sharedNames'],['“光”（S_Glow / Shine）'])
+        self.assertEqual(live.NameSession.journal(self.session)['entries']['tc Shine']['originalName'],'Shine')
+        self.session.restore()
+        # Taking the name another effect shows now (a Chinese AE's own effect) is allowed and reported too.
+        result=self.session.apply({'S_Glow':'Shine'});self.assertEqual(result['sharedNames'],['“Shine”（S_Glow / Shine）'])
+        self.session.restore();self.assertEqual(self.process.memory,{1016:live.encode_name('S_Glow'),2016:live.encode_name('Shine')})
+    def test_effects_that_already_share_a_name_are_not_reported(self):
+        # BCC ships each transition as an effect and a Premiere copy, both listed by AE under one name.
+        self.process.memory[3016]=live.encode_name('Shine')
+        with patch.object(FakeRegistry,'EFFECTS',FakeRegistry.EFFECTS+[(3000,'tc ShinePrTr','RG Blurs and Glows')]):
+            result=self.session.apply({'tc Shine':'闪耀','tc ShinePrTr':'闪耀'})
+            self.assertEqual(result['applied'],{'tc Shine':'闪耀','tc ShinePrTr':'闪耀'});self.assertEqual(result['sharedNames'],[])
+            # One of the pair already renamed: its original name, from the record, still matches.
+            self.session.restore(['tc ShinePrTr']);self.assertEqual(self.session.apply({'tc ShinePrTr':'闪耀'})['sharedNames'],[])
+            self.assertEqual(self.session.apply({'S_Glow':'闪耀'})['sharedNames'],['“闪耀”（S_Glow / Shine）'])
     def test_effect_already_showing_target_name_is_not_rewritten(self):
         self.session.apply({'S_Glow':'辉光'})
         writes=len(self.process.writes)

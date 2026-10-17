@@ -312,6 +312,10 @@ class SchemeSystemTests(GuiCase):
         self.assertEqual(changes,{'效果中文':2,'效果勾选':1,'参数中文':1,'参数勾选':0})
         self.assertEqual(app_live.describe_changes(changes),'将替换：效果中文 2 项、效果勾选 1 项、参数中文 1 项')
         self.assertEqual(app_live.duplicate_names(scheme.names),{'甲':['a','b']})
+        # Effects AE already lists under one name may share a translation; unknown originals still count.
+        self.assertEqual(app_live.duplicate_names(scheme.names,{'a':'Wipe','b':'wipe'}),{})
+        self.assertEqual(app_live.duplicate_names(scheme.names,{'a':'Wipe','b':'Other'}),{'甲':['a','b']})
+        self.assertEqual(app_live.duplicate_names(scheme.names,{'a':'Wipe'}),{'甲':['a','b']})
         self.assertNotIn('参数中文',app_live.scheme_changes(({},set()),({},set()),scheme._replace(parameter_names=None)))
     def test_preview_compares_with_the_table_and_warns_about_duplicate_names(self):
         w=self.window;w.translated(({'tc Shine':'辉光','Atom Key':'原子抠像'},''));self.check('S_Glow');self.save('甲')

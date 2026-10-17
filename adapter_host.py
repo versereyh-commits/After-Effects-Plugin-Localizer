@@ -4,6 +4,7 @@ import json,subprocess,time,uuid
 from ae_paths import path_key
 from runtime import native_probe,file_version,asset_root,write_json_atomic
 from parameter_names import bridge_root
+from ae_ui import WindowKeeper
 from win_process import Process
 
 class HostBridge:
@@ -64,11 +65,14 @@ class HostBridge:
             if frame.parent!=self.folder or frame.suffix!='.png':raise ValueError('QA frame path rejected')
         template=(asset_root()/'scripts'/'adapter_qa.jsx').read_text(encoding='utf8');source=template.replace('@@REQUEST@@',json.dumps(q,ensure_ascii=True));source=''.join(c if ord(c)<128 else '\\u%04x'%ord(c) for c in source)
         script.write_text(source,encoding='ascii')
+        # The hand-over makes AE show its main window again; keep it as the user left it.
+        keeper=WindowKeeper(pid)
         relay=subprocess.Popen([str(self.exe),'-r',str(script)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,creationflags=subprocess.CREATE_NO_WINDOW)
         self._relay_pid=relay.pid;self.diagnostic('request_started',action=action,requestId=request_id,hostPid=pid)
         try:
             until=time.monotonic()+55;last_phase='等待 AE 进入脚本'
             while time.monotonic()<until:
+                keeper.check()
                 if progress_file.exists():
                     try:ack=json.loads(progress_file.read_text(encoding='utf-8-sig'))
                     except (ValueError,OSError):ack={}
@@ -98,7 +102,7 @@ class HostBridge:
         finally:
             permit.unlink(missing_ok=True)
             try:self.finish_relay(relay,pid)
-            finally:self._relay_pid=None
+            finally:self._relay_pid=None;keeper.settle()
     def assert_owned(self):
         status=self.call('status');path=status.get('project')
         if not path or path_key(path) not in (path_key(self.project),path_key(self.second)):raise RuntimeError('当前不是软件自有 QA 工程，已停止验证')

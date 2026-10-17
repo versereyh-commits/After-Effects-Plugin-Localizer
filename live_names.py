@@ -202,16 +202,19 @@ class NameSession:
             for key in skipped:del encoded[key]
             if not encoded:return {'applied':{},'unchanged':[],'skipped':skipped,'pid':p.pid}
             final={key:encoded[key].split(b'\0',1)[0].decode(encoding) if key in encoded else row['displayName'] for key,row in by_key.items()}
-            seen={};conflicts=[]
-            for key,name in final.items():
-                folded=name.casefold()
-                if folded in seen and (key in encoded or seen[folded] in encoded):conflicts.append(name)
-                seen[folded]=key
-            if conflicts:
-                # Report every clash at once so a whole scheme can be fixed in one pass.
-                names=sorted(set(conflicts));shown='、'.join(names[:15])+(f' 等 {len(names)} 个' if len(names)>15 else '')
-                raise ValueError('名称与其他效果重复，请修改：'+shown)
             journal=self._identity(p,self.journal());previous=json.loads(json.dumps(journal));staged=[];unchanged=[]
+            original={key:(journal['entries'].get(key) or {}).get('originalName',row['displayName']) for key,row in by_key.items()}
+            # AE tells effects apart by internal identifier and already lists some under one name (BCC's effect and
+            # Premiere copy of a transition; a Chinese AE's own effects), so a shared name is allowed (user choice).
+            # Different effects ending up with one name are only reported, with their original names.
+            groups={}
+            for key,name in final.items():groups.setdefault(name.casefold(),[]).append(key)
+            shared=[]
+            for keys in groups.values():
+                if len(keys)<2 or not any(key in encoded for key in keys):continue
+                names=sorted({original[key] for key in keys},key=str.casefold)
+                if len({name.casefold() for name in names})>1:shared.append(f"“{final[keys[0]]}”（{' / '.join(names)}）")
+            shared.sort()
             journal.update({'pid':p.pid,'creationTime':p.creation_time,'image':p.image,'profileSha256':profile.flt_sha if profile else PROFILE_SHA,'encoding':encoding})
             for key,value in encoded.items():
                 if key not in by_key:raise ValueError('当前 AE 未加载此效果：'+key)
@@ -224,7 +227,7 @@ class NameSession:
                 journal['entries'][key]={'originalHex':entry['originalHex'] if entry else before.hex(),'appliedHex':value.hex(),'originalName':entry['originalName'] if entry else row['displayName'],'newName':final[key]}
                 staged.append((row,before,value))
             applied={key:final[key] for key in encoded}
-            if not staged:return {'applied':applied,'unchanged':unchanged,'skipped':skipped,'pid':p.pid}
+            if not staged:return {'applied':applied,'unchanged':unchanged,'skipped':skipped,'pid':p.pid,'sharedNames':shared}
             _save(self.journal_path,journal)
             attempted=[]
             try:
@@ -236,7 +239,7 @@ class NameSession:
                 # AE's palette is refreshed only when the user asks for it (the refresh button).
                 verified=registry.records()
                 if {r['matchName']:r['displayName'] for r in verified}!=final:raise RuntimeError('更名后目录校验不一致')
-                return {'applied':applied,'unchanged':unchanged,'skipped':skipped,'pid':p.pid}
+                return {'applied':applied,'unchanged':unchanged,'skipped':skipped,'pid':p.pid,'sharedNames':shared}
             except Exception as error:
                 failed=[]
                 for row,before in reversed(attempted):

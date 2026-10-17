@@ -27,7 +27,8 @@ class TokenUsageTests(unittest.TestCase):
         self.assertEqual(token_usage.summary(self.root,DAY),{'all':0,'30d':0,'7d':0})
         token_usage.record(7,self.root,DAY);self.assertEqual(token_usage.summary(self.root,DAY)['all'],7)
     def test_compact_figures(self):
-        self.assertEqual([token_usage.compact(v) for v in (0,9999,99999,100000,123456,99990000,120000000)],['0','9,999','99,999','10万','12.3万','9999万','1.2亿'])
+        self.assertEqual([token_usage.compact(v) for v in (0,49,1500,9999,14400,123456,144000,12345678)],
+                         ['0k','0.05k','1.5k','10k','14.4k','123k','144k','12,346k'])
 
 class FakeReply:
     def __init__(self,payload):self.body=json.dumps(payload).encode('utf8')
@@ -103,11 +104,11 @@ class DetailFitTests(GuiCase):
 
 class UsageTileTests(GuiCase):
     def test_tile_shows_totals_after_work(self):
-        w=self.window;self.assertEqual((w.usage_tile.figure,w.usage_tile.lines),('0',[('近 30 天','0'),('近 7 天','0')]))
+        w=self.window;self.assertEqual((w.usage_tile.figure,w.usage_tile.lines),('0k',[('近 30 天','0k'),('近 7 天','0k')]))
         app_live.record_usage(1500);w.record_usage(123456)
         token_usage.record(900,Path(self.temp.name),datetime.date.today()-datetime.timedelta(days=10))
-        w.finished();self.assertEqual(w.usage_tile.figure,'12.6万')
-        self.assertEqual(w.usage_tile.lines,[('近 30 天','12.6万'),('近 7 天','12.5万')])
+        w.finished();self.assertEqual(w.usage_tile.figure,'126k')
+        self.assertEqual(w.usage_tile.lines,[('近 30 天','126k'),('近 7 天','125k')])
         self.assertIn('125,856',w.usage_tile.toolTip());self.assertIn('不含 AI 诊断',w.usage_tile.toolTip())
         w.usage_tile.resize(170,78);w.usage_tile.grab()  # paints at the narrowest width without error
 

@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 import parameter_names as names
+import cep_bridge
 import runtime
 
 class ParameterTests(unittest.TestCase):
@@ -151,8 +152,25 @@ class TransportTests(unittest.TestCase):
                 request=json.loads(source.split('var request=',1)[1].split(',result=',1)[0]);captured.append(request)
                 Path(request['output']).write_text('{"changed":1}',encoding='utf8')
                 return SimpleNamespace(pid=8,poll=lambda:0,terminate=lambda:self.fail('completed relay terminated'))
-            with patch.object(names,'asset_root',lambda:root),patch.object(names,'bridge_root',lambda:root/'ipc'),patch.object(names.subprocess,'Popen',launch),patch.object(names,'file_version',return_value='26.0.0.67'):
+            with patch.object(names,'asset_root',lambda:root),patch.object(names,'bridge_root',lambda:root/'ipc'),patch.object(names.subprocess,'Popen',launch),patch.object(names,'file_version',return_value='26.0.0.67'),patch.object(cep_bridge,'_appdata',lambda:root/'appdata'):
                 result=names.run_native(SimpleNamespace(pid=3,image='AfterFX.exe'),[{'after':'中文"\\\u2028'}])
             self.assertEqual(result,{'changed':1});self.assertEqual(captured[0]['operations'][0]['after'],'中文"\\\u2028');self.assertEqual(list((root/'ipc').iterdir()),[])
+    def test_ae_window_state_is_kept_around_the_hand_over(self):
+        import ae_ui
+        events=[]
+        class Keeper:
+            def __init__(self,pid):events.append(('keep',pid))
+            def check(self):events.append('check')
+            def settle(self):events.append('settle')
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);(root/'native').mkdir();(root/'native'/'ae_parameters_v8.dll').touch();(root/'scripts').mkdir()
+            (root/'scripts'/'parameter_bridge.jsx').write_text('var request=@@REQUEST@@,result=0;',encoding='utf8')
+            def launch(args,**kwargs):
+                events.append('launch');request=json.loads(Path(args[-1]).read_text(encoding='ascii').split('var request=',1)[1].split(',result=',1)[0])
+                Path(request['output']).write_text('{}',encoding='utf8');return SimpleNamespace(pid=8,poll=lambda:0)
+            with patch.object(names,'asset_root',lambda:root),patch.object(names,'bridge_root',lambda:root/'ipc'),patch.object(names.subprocess,'Popen',launch),                 patch.object(names,'file_version',return_value='26.0.0.67'),patch.object(ae_ui,'WindowKeeper',Keeper),patch.object(cep_bridge,'_appdata',lambda:root/'appdata'):
+                names.run_native(SimpleNamespace(pid=3,image='AfterFX.exe'),[])
+        # Read before the hand-over, watched while waiting, settled after the relay is done.
+        self.assertEqual(events,[('keep',3),'launch','check','settle'])
 
 if __name__=='__main__':unittest.main()

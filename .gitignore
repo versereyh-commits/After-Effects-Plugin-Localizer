@@ -24,3 +24,7 @@ native/*.pdb
 /adapter-analysis/
 /adapters/
 /ae-bridge/
+
+# CEP signing material (build/signing) and signed packages
+*.p12
+*.zxp

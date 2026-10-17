@@ -35,6 +35,79 @@ def main_window(pid:int):
     if not u.IsWindowEnabled(result[0]):raise RuntimeError('请先关闭 AE 中的对话框，再应用名称')
     return result[0]
 
+class _Placement(C.Structure):
+    _fields_=[('length',W.UINT),('flags',W.UINT),('showCmd',W.UINT),('ptMinPosition',W.POINT),('ptMaxPosition',W.POINT),('rcNormalPosition',W.RECT)]
+
+def _rect(rect):return (rect.left,rect.top,rect.right,rect.bottom)
+
+class WindowKeeper:
+    """Keeps AE's main window as the user left it while a script is handed to AE.
+
+    Handing AE a script (AfterFX.exe -r) makes AE show its main window again, which takes a maximized or
+    minimized window back to its normal size. The state is read before the hand-over; check() puts it back
+    as soon as it changes, and gives the foreground back to this program when AE took it. Only asynchronous
+    window calls are used, so a busy AE never blocks the caller. Anything unreadable leaves the window alone."""
+    def __init__(self,pid:int,u=None,own_pid=None):
+        import os
+        self.pid=pid;self.own=own_pid if own_pid is not None else os.getpid();self.hwnd=None;self.restored=0
+        try:
+            self.u=u or _user32();self._api()
+            hwnd=self._find()
+            if hwnd:self.hwnd=hwnd;self.saved=self._state();self.foreground=self.u.GetForegroundWindow()
+        except (OSError,AttributeError,ValueError):self.hwnd=None
+    def _api(self):
+        u=self.u
+        for name,args,result in (('GetWindowPlacement',[W.HWND,C.POINTER(_Placement)],W.BOOL),('GetWindowRect',[W.HWND,C.POINTER(W.RECT)],W.BOOL),
+                                 ('ShowWindowAsync',[W.HWND,C.c_int],W.BOOL),('SetWindowPos',[W.HWND,W.HWND,C.c_int,C.c_int,C.c_int,C.c_int,W.UINT],W.BOOL),
+                                 ('GetForegroundWindow',[],W.HWND),('SetForegroundWindow',[W.HWND],W.BOOL),('IsWindow',[W.HWND],W.BOOL)):
+            fn=getattr(u,name,None)
+            if fn is not None and hasattr(fn,'argtypes'):fn.argtypes=args;fn.restype=result
+    def _find(self):
+        u=self.u;found=[];callback=C.WINFUNCTYPE(W.BOOL,W.HWND,W.LPARAM)
+        @callback
+        def visit(hwnd,arg):
+            owner=W.DWORD();name=C.create_unicode_buffer(256)
+            u.GetWindowThreadProcessId(hwnd,C.byref(owner));u.GetClassNameW(hwnd,name,len(name))
+            if owner.value==self.pid and name.value.startswith('AE_CApplication_'):found.append(hwnd)
+            return True
+        u.EnumWindows(visit,0)
+        return found[0] if len(found)==1 else None
+    def _state(self):
+        placement=_Placement();placement.length=C.sizeof(_Placement);rect=W.RECT()
+        if not self.u.GetWindowPlacement(self.hwnd,C.byref(placement)) or not self.u.GetWindowRect(self.hwnd,C.byref(rect)):raise ValueError('window state unreadable')
+        # showCmd: 1 normal, 2 minimized, 3 maximized.
+        return {'show':{2:2,3:3}.get(placement.showCmd,1),'normal':_rect(placement.rcNormalPosition),'rect':_rect(rect)}
+    def check(self)->bool:
+        """Puts the window back if the hand-over changed it; True when something was put back."""
+        if not self.hwnd:return False
+        try:
+            if not self.u.IsWindow(self.hwnd):self.hwnd=None;return False
+            now=self._state()
+        except (OSError,ValueError):return False
+        saved=self.saved;changed=False
+        if now['show']!=saved['show']:
+            # SW_MAXIMIZE / SW_SHOWMINNOACTIVE / SW_SHOWNOACTIVATE
+            self.u.ShowWindowAsync(self.hwnd,{3:3,2:7,1:4}[saved['show']]);changed=True
+        elif saved['show']==1 and now['rect']!=saved['rect']:
+            left,top,right,bottom=saved['rect']
+            # SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS
+            self.u.SetWindowPos(self.hwnd,None,left,top,right-left,bottom-top,0x0004|0x0010|0x4000);changed=True
+        if changed:self.restored+=1;self.last=time.monotonic()
+        # AE may take the foreground along with the hand-over (or with the restore, which is asynchronous).
+        # Give it back only shortly after a restore, so a user who clicks AE meanwhile keeps that choice.
+        if self.restored and time.monotonic()-self.last<1:
+            foreground=self.u.GetForegroundWindow()
+            if self.foreground and foreground!=self.foreground and self.u.IsWindow(self.foreground) and _owner(self.u,self.foreground)==self.own and _owner(self.u,foreground)==self.pid:
+                self.u.SetForegroundWindow(self.foreground)
+        return changed
+    def settle(self,wait=.25,step=.05):
+        """The final check after the hand-over; when this AE changed its window, watch a moment longer for
+        the asynchronous restore and foreground change to land."""
+        self.check()
+        if not self.restored:return
+        until=time.monotonic()+wait
+        while time.monotonic()<until:time.sleep(step);self.check()
+
 def _refresh_popup(u,pid):
     result=[];stalled=[];disabled=[];callback=C.WINFUNCTYPE(W.BOOL,W.HWND,W.LPARAM)
     @callback

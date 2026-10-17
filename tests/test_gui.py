@@ -29,6 +29,11 @@ class GuiCase(unittest.TestCase):
         # No real AE installation leaks in: one fallback version holds every plugin.
         for name,value in (('installations',lambda:self.installs()),('shared_roots',lambda:[]),('file_version',lambda exe:self.versions[Path(exe).parent.parent.name])):
             handle=patch.object(app_live,name,value);handle.start();self.addCleanup(handle.stop)
+        # The background extension's folders (APPDATA) are the test's own, never the real CEP install.
+        handle=patch.object(app_live.cep_bridge,'_appdata',lambda:root/'appdata');handle.start();self.addCleanup(handle.stop)
+        # Nor Adobe's real registry settings (the extension debug mode).
+        for name,value in (('_registry_get',lambda version:None),('_registry_set',lambda version,value:None)):
+            handle=patch.object(app_live.cep_bridge,name,value);handle.start();self.addCleanup(handle.stop)
         self.window=app_live.Window();self.addCleanup(self.window.deleteLater)
         # Same effect installed for two AE versions gives two rows with one identity.
         self.window.show_scan(([plugin('S_Glow','S_Glow','Sapphire Lighting','a/S_Glow.aex'),plugin('Shine','tc Shine','RG Blurs and Glows','b/Shine.aex'),
@@ -381,6 +386,11 @@ class NavigationTests(GuiCase):
         w=self.window;w.go(app_live.EFFECTS);w.error('一');w.error('二')
         self.assertEqual(w.nav_buttons[app_live.SETTINGS].count.text(),'2');self.assertTrue(w.nav_buttons[app_live.SETTINGS].count.property('alert'))
         w.go(app_live.SETTINGS);self.assertEqual(w.nav_buttons[app_live.SETTINGS].count.text(),'')
+    def test_shared_names_are_applied_and_only_noted(self):
+        w=self.window;operation={'applied':{'S_Glow':'三色调'},'unchanged':[],'skipped':[],'sharedNames':['“三色调”（S_TriTone / 三色调）']}
+        with patch.object(w,'show_reread'),patch.object(w.toast,'notify') as toast:w.applied((operation,None,None))
+        self.assertEqual(toast.call_args_list[0].args[0],'实时更名已生效');self.assertFalse(any(c.kwargs.get('error') for c in toast.call_args_list))
+        self.assertIn('提示：1 组中文名称与其他效果相同',w.log.toPlainText());self.assertIn('S_TriTone / 三色调',w.log.toPlainText())
     def test_state_chips_filter_rows_and_show_counts(self):
         w=self.window;self.check('tc Shine')
         w.chips['checked'].click();self.assertEqual(self.shown(),{'tc Shine'})

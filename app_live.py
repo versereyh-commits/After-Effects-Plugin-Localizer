@@ -4,8 +4,8 @@ from dataclasses import asdict
 from datetime import datetime
 from typing import NamedTuple
 import json,os,re,shutil,subprocess,sys,threading
-from PySide6.QtCore import Qt,QEvent,QEventLoop,QObject,QTimer,QItemSelection,QItemSelectionModel,QPoint,QRect,QRectF,QEasingCurve,Signal
-from PySide6.QtGui import QAction,QColor,QFont,QKeySequence,QPainter,QShortcut
+from PySide6.QtCore import Qt,QEvent,QEventLoop,QObject,QTimer,QItemSelection,QItemSelectionModel,QPoint,QRect,QRectF,QEasingCurve,QUrl,Signal
+from PySide6.QtGui import QAction,QColor,QDesktopServices,QFont,QKeySequence,QPainter,QShortcut
 from PySide6.QtWidgets import (QApplication,QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,QLabel,QPushButton,QLineEdit,QTableWidget,QTableWidgetItem,QHeaderView,QPlainTextEdit,QFileDialog,QCheckBox,QDialog,QFormLayout,QMessageBox,
                                QComboBox,QInputDialog,QMenu,QFrame,QToolButton,QButtonGroup,QListWidget,QListWidgetItem,QSizePolicy,QGridLayout,QGraphicsOpacityEffect,QAbstractItemView,QWidgetAction,QScrollArea)
 from app import Job,apply_theme
@@ -18,14 +18,14 @@ from llm_client import translate_names,TranslationError,PROVIDERS,list_models
 from parameter_names import ParameterSession,identity,split_identity,validate_label
 from effect_instances import EffectInstanceSession
 from ae_profiles import is_supported,supported_text
-import ui_kit,token_usage,updater
+import cep_bridge,release_notes,ui_kit,token_usage,updater
 from PySide6.QtWidgets import QStackedWidget
 from shortcuts import Keymap,ShortcutDialog,PAGES,local_shortcut
-from ui_kit import confirm,choose,ask_text,SchemeDelegate,SchemeRow,SchemeSwitcher,CheckHeader,CheckDragger,TrashDelegate,check_state
+from ui_kit import confirm,choose,inform,ask_text,SchemeDelegate,SchemeRow,SchemeSwitcher,CheckHeader,CheckDragger,TrashDelegate,check_state
 from ui_kit import (SHADOW,STATUS_MARK,Banner,DiamondDelegate,Breather,EmptyState,FadeStack,Legend,LoaderButton,MetricTile,UsageTile,NavRail,Pill,SearchField,Spinner,StatusTag,Surface,
                     button,divider,elastic,fade_in,icon,label,logo,menu_button,page_head,repolish,soft_path,table_style)
 
-APP_VERSION='1.0'
+APP_VERSION='1.1'
 APP_NAME='AE汉化工具'
 # Installed copies: the current folder name, and the folder older versions used (an upgrade keeps it).
 INSTALL_FOLDERS=('AE汉化工具','AE插件名称汉化')
@@ -190,12 +190,15 @@ def describe_changes(changes:dict[str,int])->str:
     parts=[f'{name} {count} 项' for name,count in changes.items() if count]
     return '将替换：'+'、'.join(parts) if parts else '与当前表格相同'
 
-def duplicate_names(names:dict[str,str])->dict[str,list[str]]:
-    """Chinese names used by more than one effect; AE would list them identically."""
+def duplicate_names(names:dict[str,str],originals:dict[str,str]|None=None)->dict[str,list[str]]:
+    """Chinese names used by more than one effect; AE would list them identically. Effects that already
+    share one original name (BCC's effect and Premiere copy of a transition) may share a translation too."""
     users={}
     for key,value in names.items():
         if value.strip():users.setdefault(value.strip(),[]).append(key)
-    return {value:sorted(keys,key=str.casefold) for value,keys in users.items() if len(keys)>1}
+    originals=originals or {}
+    def same(keys):return all(key in originals for key in keys) and len({originals[key].casefold() for key in keys})==1
+    return {value:sorted(keys,key=str.casefold) for value,keys in users.items() if len(keys)>1 and not same(keys)}
 
 def next_title(schemes:list[SavedScheme])->str:
     taken={s.title.casefold() for s in schemes};number=1
@@ -455,6 +458,8 @@ def pick_parameters(parent,rows)->list[str]:return pick_effects(parent,rows,'参
 class Window(QMainWindow):
     def __init__(self):
         super().__init__();self.setWindowTitle(f'{APP_NAME} {APP_VERSION}');self.resize(1400,880);self.setMinimumSize(1200,720)
+        # Someone who used an earlier version (before anything below writes a file): only they get the update notice.
+        self.returning=(data_root()/'ui.json').is_file() or (data_root()/'versions').is_dir()
         self.session=NameSession();self.settings=Settings();self.live=None;self.job=None;self.plugins=[];self.pending={};self._fill=False;self.close_after=False
         self.schemes=[];self.active=None;self.preview_path=None;self.skipped_schemes=0;self.all_plugins=[];self.scan_errors=[];self.unread=0
         self.needs_refresh=False;self.writing=set();self.loading_button=None;self.next_loader=None
@@ -498,10 +503,21 @@ class Window(QMainWindow):
         _,path_warning=read_saved(data_root()/'ae-installations.json')
         if path_warning:self.log.appendPlainText(path_warning)
         self.refresh_schemes(self.remembered_scheme());self.update_version_bar();self.update_api_info()
+        self.refresh_bridge()
         self.keymap.listeners.append(self.refresh_shortcut_hints);self.refresh_shortcut_hints()
         self.go(EFFECTS);self.update_buttons();QTimer.singleShot(100,self.start_scan)
         self.update_job=None;self.update_offer=None;self.pending_installer=None;self.reapplied_for=None;self.show_update_info()
-        QTimer.singleShot(2500,self.auto_check_update)
+        QTimer.singleShot(2500,self.auto_check_update);QTimer.singleShot(600,self.show_release_notice)
+    # What is new: shown once, the first time a new version opens; the settings page offers it again.
+    def show_release_notice(self):
+        seen=self.ui_preferences().get('seenVersion')
+        if seen==APP_VERSION:return
+        entries=release_notes.newer(seen,APP_VERSION) if seen or self.returning else []
+        # Remembered before showing, so the notice never comes back for this version whatever happens next.
+        self.save_ui_preference('seenVersion',APP_VERSION)
+        if entries:inform(self,f'{APP_NAME} {APP_VERSION} 更新内容',release_notes.html(entries))
+    def show_current_notes(self):
+        inform(self,f'{APP_NAME} {APP_VERSION} 更新内容',release_notes.html(release_notes.newer(None,APP_VERSION)))
     # Preferences that only concern the interface.
     def ui_preferences(self)->dict:return ui_prefs()
     def save_ui_preference(self,key,value):
@@ -598,14 +614,20 @@ class Window(QMainWindow):
         if picked is None:return
         if picked==0:
             self.save_ui_preference('skippedVersion',offer['version']);self.update_notice.hide();self.status.setText(f"已跳过版本 {offer['version']}，可在设置页手动检查更新");return
-        folder=data_root()/'updates'
+        folder=data_root()/'updates';name=offer['installer']['name']
         def fetch(progress):
-            # Older downloads are of no use once a newer installer is wanted.
+            # Older downloads are of no use once a newer installer is wanted; a part of this one is continued.
             if folder.is_dir():
                 for old in folder.iterdir():
-                    if old.is_file() and old.name not in (offer['installer']['name'],):old.unlink(missing_ok=True)
+                    if old.is_file() and old.name not in (name,name+'.part',name+'.part.json'):old.unlink(missing_ok=True)
             return updater.download(offer,folder,progress=lambda done,total:progress(f'正在下载更新 {done/1048576:.1f} / {total/1048576:.1f} MB'))
-        self.status.setText(f"正在下载 {offer['version']}……");self.work(fetch,lambda path:self.downloaded(offer,path))
+        self.status.setText(f"正在下载 {offer['version']}……");self.work(fetch,lambda path:self.downloaded(offer,path),failure=lambda message:self.download_failed(offer,message))
+    def download_failed(self,offer,message):
+        """A failed download offers the release page, so the installer can still be fetched in a browser."""
+        page=updater.release_page(offer['version'])
+        self.status.setText(message);self.status.setToolTip(message);self.log.appendPlainText(f'下载更新未完成：{message}（发布页面：{page}）')
+        picked=choose(self,'下载更新未完成',f"{message}\n\n也可以打开发布页面，用浏览器或下载工具下载 {offer['installer']['name']}，下载后双击运行即可安装。",['关闭','打开下载页面'])
+        if picked==1:QDesktopServices.openUrl(QUrl(page))
     def downloaded(self,offer,path):
         self.log.appendPlainText(f"已下载并核对 {offer['version']} 安装包：{path.name}")
         exe=Path(sys.executable);programs=Path(os.environ.get('LOCALAPPDATA',''))/'Programs';home=programs/INSTALL_FOLDERS[0]
@@ -920,13 +942,22 @@ class Window(QMainWindow):
         col.addWidget(label('深色背景、浅色文字，立即生效。','muted',True));col.addStretch();grid.addWidget(frame,0,2)
         frame,col=self.settings_card('适配范围')
         self.scope_info=label('','field',True);col.addWidget(self.scope_info)
-        col.addWidget(label(f'候选、勾选、方案和恢复记录保存在：\n{data_root()}','muted',True));col.addStretch();grid.addWidget(frame,1,0)
+        col.addWidget(label(f'候选、勾选、方案和恢复记录保存在：\n{data_root()}','muted',True));col.addSpacing(6)
+        # The background extension (cep_bridge): parameter reads and writes without a second AfterFX.exe.
+        col.addWidget(label('无感读写','cardTitle'));self.bridge_info=label('','muted',True);col.addWidget(self.bridge_info);col.addStretch()
+        row=QHBoxLayout();row.setSpacing(8)
+        self.bridge_btn=button('安装后台连接');self.bridge_btn.clicked.connect(self.install_bridge);row.addWidget(self.bridge_btn)
+        self.bridge_remove=button('移除','quiet');self.bridge_remove.clicked.connect(self.remove_bridge);row.addWidget(self.bridge_remove);row.addStretch();col.addLayout(row)
+        grid.addWidget(frame,1,0)
         frame,col=self.settings_card('软件更新')
         # On by default; at most one network check a day, the result is kept for the rest of that day.
         self.update_box=QCheckBox('启动时自动检查更新');self.update_box.setToolTip('每天最多联网检查一次。只从 GitHub 公开发布页读取版本信息，不发送本机或工程信息；发现新版只提示，下载和安装都要你确认');self.update_box.setChecked(self.ui_preferences().get('updateCheck') is not False)
         self.update_box.toggled.connect(lambda on:self.save_ui_preference('updateCheck',bool(on)));col.addWidget(self.update_box)
         self.update_info=label('','muted',True);col.addWidget(self.update_info);col.addStretch()
-        self.update_btn=LoaderButton('检查更新');self.update_btn.clicked.connect(lambda:self.check_update(manual=True));col.addWidget(self.update_btn,0,Qt.AlignmentFlag.AlignLeft)
+        row=QHBoxLayout();row.setSpacing(8)
+        self.update_btn=LoaderButton('检查更新');self.update_btn.clicked.connect(lambda:self.check_update(manual=True));row.addWidget(self.update_btn)
+        self.notes_btn=button('本版更新内容','quiet');self.notes_btn.clicked.connect(self.show_current_notes);self.notes_btn.setVisible(bool(release_notes.newer(None,APP_VERSION)))
+        row.addWidget(self.notes_btn);row.addStretch();col.addLayout(row)
         grid.addWidget(frame,1,1)
         frame,col=self.settings_card('快捷键')
         # The master switch: off pauses every shortcut, keeping the chosen keys for when it is switched back on.
@@ -993,8 +1024,42 @@ class Window(QMainWindow):
         self.update_detail_actions()
     def go(self,index:int):
         self.pages.setCurrentIndex(index);self.nav_buttons[index].setChecked(True);self.nav.select(index)
-        if index==SETTINGS:self.unread=0
+        if index==SETTINGS:self.unread=0;self.update_bridge_info()
         self.update_nav()
+    # Background extension: installed on request into the user's CEP folder, active after AE restarts.
+    BRIDGE_TEXT={'unavailable':'这个版本没有附带后台连接扩展。读写参数时用命令行把脚本交给 AE，AE 窗口可能被还原（软件会立即恢复）。',
+                 'missing':'未安装。安装后重启一次 AE，读写参数和同步图层效果标题时不再启动第二个 AE 进程，AE 窗口和焦点保持不变。',
+                 'outdated':'已安装的扩展与本软件版本不一致，请重新安装，然后重启 AE。',
+                 'installed':'已安装，重启 AE 后生效。生效前仍用命令行转交。',
+                 'connected':'已连接：读写在 AE 后台进行，AE 窗口和焦点保持不变。'}
+    def refresh_bridge(self):
+        """An extension installed earlier but from another build of this program is brought up to date (the user
+        chose to install it); AE loads the new files at its next start."""
+        try:
+            if cep_bridge.status()=='outdated':cep_bridge.install();self.log.appendPlainText('后台连接扩展已更新为本版本，重启 AE 后生效')
+        except OSError as error:self.log.appendPlainText('后台连接扩展未能更新：'+str(error))
+        self.update_bridge_info()
+    def update_bridge_info(self):
+        if not hasattr(self,'bridge_info'):return
+        try:state=cep_bridge.status()
+        except OSError:state='missing'
+        self.bridge_info.setText(self.BRIDGE_TEXT[state])
+        self.bridge_btn.setVisible(state in ('missing','outdated'));self.bridge_btn.setText('重新安装' if state=='outdated' else '安装后台连接')
+        self.bridge_remove.setVisible(state in ('outdated','installed','connected'))
+    def install_bridge(self):
+        if not confirm(self,'安装后台连接？',f'把 AE 后台扩展（看不见的 CEP 扩展，不需要管理员权限）复制到：\n{cep_bridge.installed()}\n\n'
+                       '同时开启 Adobe 扩展调试模式（当前用户注册表 Software\\Adobe\\CSXS.10～13 的 PlayerDebugMode），让 AE 一定加载这个扩展。'
+                       '调试模式下 AE 不再检查扩展签名，对你所有 Adobe 扩展都生效；移除后台连接时，本软件改过的值会恢复原样。\n\n'
+                       '安装后需要重启一次 AE 才会生效；之后读写参数不再启动第二个 AE 进程，AE 窗口和焦点保持不变。没有加载时软件自动改用原来的方式。','安装'):return
+        try:cep_bridge.install(debug_mode=True)
+        except Exception as error:self.error('安装后台连接失败：'+str(error));return
+        self.log.appendPlainText(f'已安装后台连接扩展：{cep_bridge.installed()}；Adobe 扩展调试模式已开启');self.update_bridge_info()
+        self.toast.notify('后台连接已安装','重启 AE 后生效')
+    def remove_bridge(self):
+        if not confirm(self,'移除后台连接？','删除 AE 后台扩展，并把本软件开启的 Adobe 扩展调试模式恢复原样（原来就开着的不动）。重启 AE 后读写参数改回命令行转交（AE 窗口可能被还原，软件会立即恢复）。','移除',danger=True):return
+        try:cep_bridge.remove()
+        except Exception as error:self.error('移除后台连接失败：'+str(error));return
+        self.log.appendPlainText('已移除后台连接扩展');self.update_bridge_info()
     def update_nav(self):
         counts=(len(self.plugins),len(self.parameter_page.rows) or '',len(self.schemes),len(self.spaces),self.unread or '')
         for button_,count in zip(self.nav_buttons,counts):button_.set_count(count,button_ is self.nav_buttons[SETTINGS] and bool(self.unread))
@@ -1512,6 +1577,9 @@ class Window(QMainWindow):
         written={k:v for k,v in applied.items() if k not in unchanged}
         if written:self.toast.notify('实时更名已生效',f'已应用 {len(written)} 项');self.log.appendPlainText(f'已应用 {len(written)} 项：'+brief(written))
         if unchanged:self.log.appendPlainText(f'{len(unchanged)} 项已经是目标名称，未重复写入')
+        if shared:=operation.get('sharedNames'):
+            # Allowed, only noted: AE lists these effects under the same name; renaming one tells them apart.
+            self.log.appendPlainText(f'提示：{len(shared)} 组中文名称与其他效果相同，AE 列表里会出现同名项（需要区分时改其中一个）：'+'；'.join(shared))
         instances=operation.get('instanceResult',{});instance_count=instances.get('changed',0)
         if instance_count:self.toast.notify('图层效果标题已同步',f'已更新 {instance_count} 个实例');self.log.appendPlainText(f'已同步 {instance_count} 个图层效果标题')
         if instances.get('customSkipped'):self.log.appendPlainText(f"保留 {instances['customSkipped']} 个手动命名的效果实例")
@@ -1733,7 +1801,7 @@ class Window(QMainWindow):
         self.effect_tile.set_value(len(set(scheme.names)|scheme.enabled))
         if scheme.parameters is None:self.param_tile.caption='参数名称（未保存）';self.param_tile.set_blank()
         else:self.param_tile.caption='参数名称';self.param_tile.set_value(len(set(scheme.parameter_names)|scheme.parameter_enabled))
-        duplicates=duplicate_names(scheme.names)
+        duplicates=duplicate_names(scheme.names,{p.match_name:p.display_name for p in self.plugins})
         if duplicates:
             shown=list(duplicates.items())[:3]
             self.dup_banner.text.setText(f'{sum(len(v) for v in duplicates.values())} 个效果的中文名称重复，AE 列表里会无法区分：'+'；'.join(f'“{name}”（{"、".join(keys)}）' for name,keys in shown)+(' 等' if len(duplicates)>3 else ''))

@@ -47,7 +47,8 @@ def summary(root:Path,today:datetime.date|None=None)->dict[str,int]:
     return result
 
 def compact(value:int)->str:
-    """12,345 · 12.3万 · 1.2亿 — short enough for a metric tile."""
-    if value<100000:return f'{value:,}'
-    if value<100000000:return f'{value/10000:.1f}'.rstrip('0').rstrip('.')+'万'
-    return f'{value/100000000:.1f}'.rstrip('0').rstrip('.')+'亿'
+    """In thousands of tokens, short enough for a metric tile: 0.05k / 1.5k / 14.4k / 144k / 12,346k."""
+    k=value/1000;digits=2 if k<10 else 1 if k<100 else 0
+    text=f'{k:,.{digits}f}'
+    if '.' in text:text=text.rstrip('0').rstrip('.')
+    return text+'k'

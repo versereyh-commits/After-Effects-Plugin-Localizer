@@ -19,7 +19,7 @@ class ParameterGuiTests(unittest.TestCase):
             handle=patch.object(module,'data_root',lambda:root);handle.start();self.addCleanup(handle.stop)
         # A verified build, so the parameter page is available.
         install=[{'name':'Adobe After Effects 2026','exe':str(root/'AE'/'AfterFX.exe'),'plugins':str(root/'AE'/'Plug-ins')}]
-        with patch.object(app_live.QTimer,'singleShot'),patch.object(app_live,'installations',return_value=install),patch.object(app_live,'shared_roots',return_value=[]),patch.object(app_live,'file_version',return_value='26.0.0.67'):self.window=app_live.Window()
+        with patch.object(app_live.QTimer,'singleShot'),patch.object(app_live,'installations',return_value=install),patch.object(app_live,'shared_roots',return_value=[]),patch.object(app_live,'file_version',return_value='26.0.0.67'),patch.object(app_live.cep_bridge,'_appdata',lambda:Path(self.temp.name)/'appdata'):self.window=app_live.Window()
         self.addCleanup(self.window.deleteLater);self.dialog=self.window.parameter_page;self.window.update_buttons()
         self.keys=[identity('S_Glow','Brightness'),identity('Other','Brightness')]
         self.rows=[{'id':key,'name':'Brightness','effectMatchName':effect,'matchName':'Brightness','instances':1} for key,effect in zip(self.keys,['S_Glow','Other'])]
