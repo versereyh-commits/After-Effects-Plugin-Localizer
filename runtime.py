@@ -19,6 +19,36 @@ def data_root() -> Path:
     return root
 
 
+def short_path(path: Path) -> str:
+    """The 8.3 form of an existing path, or the path itself when Windows has none (8.3 names off on that drive)."""
+    try:
+        buffer = ctypes.create_unicode_buffer(32768)
+        if ctypes.windll.kernel32.GetShortPathNameW(str(path), buffer, len(buffer)):return buffer.value
+    except (AttributeError, OSError):pass
+    return str(path)
+
+
+def relay_script(folder: Path) -> Path:
+    """Where to write a script handed to AfterFX.exe -r for the request in `folder`.
+
+    AE silently runs nothing when that path has a space (AE 2024 checked: one space is enough; the exit code
+    is the same either way), and users unpack the program anywhere, e.g. "E:\\ae O.o  2026". So: the request
+    folder itself when its path, or its 8.3 form, has no space; otherwise <requestId>.jsx in the first writable
+    folder without one (this program's data folder, temp, Public, ProgramData). Only the script moves; the
+    output and permit stay in the request folder (paths inside the script are JSON strings, spaces are fine)."""
+    for base in (folder, Path(short_path(folder))):
+        if " " not in str(base):return base/"request.jsx"
+    candidates = [lambda: data_root()/"relay"]
+    candidates += [lambda name=name: Path(os.environ[name])/"AE-Localizer"/"relay" for name in ("TEMP", "PUBLIC", "ProgramData") if os.environ.get(name)]
+    for candidate in candidates:
+        try:
+            base = candidate();base.mkdir(parents=True, exist_ok=True)
+        except OSError:continue
+        for form in (str(base), short_path(base)):
+            if " " not in form:return Path(form)/f"{folder.name}.jsx"
+    raise RuntimeError("软件所在路径含空格，AE 不会执行从这里转交的脚本，而且找不到不含空格的可写目录。请把软件放到不含空格的文件夹，或在“设置与日志 → 适配范围”安装后台连接后重试")
+
+
 def write_json_atomic(path, value, *, ensure_ascii=False, indent=2):
     """Writes JSON beside the target under a per-process name, then os.replace: a crash or a full disk never leaves
     a half-written file, and a failed write removes its temporary file. Every saved JSON file goes through here."""

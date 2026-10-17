@@ -1,4 +1,4 @@
-import copy,json,tempfile,unittest
+import copy,json,os,tempfile,unittest
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -172,5 +172,99 @@ class TransportTests(unittest.TestCase):
                 names.run_native(SimpleNamespace(pid=3,image='AfterFX.exe'),[])
         # Read before the hand-over, watched while waiting, settled after the relay is done.
         self.assertEqual(events,[('keep',3),'launch','check','settle'])
+
+class TimeoutDiagnosticTests(unittest.TestCase):
+    """A request AE never answers says why as far as can be told, and leaves a diagnostic file (no paths)."""
+    def run_timeout(self,poll=lambda:0,enter=False,mismatch='',bridge=False):
+        import ae_ui,win_process
+        self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup);root=Path(self.tmp.name)
+        (root/'native').mkdir();(root/'native'/'ae_parameters_v8.dll').touch();(root/'scripts').mkdir()
+        (root/'scripts'/'parameter_bridge.jsx').write_text('var request=@@REQUEST@@,result=0;',encoding='utf8')
+        stopped=[]
+        def launch(args,**kwargs):
+            if enter:(Path(args[-1]).parent/names.STARTED).write_text('1',encoding='ascii')   # AE entered the script, then stalled
+            return SimpleNamespace(pid=8,poll=poll,terminate=lambda:stopped.append(8),wait=lambda timeout:0)
+        class Keeper:
+            def __init__(self,pid):pass
+            def check(self):pass
+            def settle(self):pass
+        patches=[patch.object(names,'asset_root',lambda:root),patch.object(names,'bridge_root',lambda:root/'ipc'),patch.object(names.subprocess,'Popen',launch),
+                 patch.object(names,'file_version',return_value='26.0.0.67'),patch.object(ae_ui,'WindowKeeper',Keeper),patch.object(cep_bridge,'_appdata',lambda:root/'appdata'),
+                 patch.object(win_process,'elevation_mismatch',return_value=mismatch),patch.object(win_process,'elevated',return_value=False),
+                 patch.object(cep_bridge,'connected',return_value=bridge),patch.object(cep_bridge,'withdraw',return_value=False),patch.object(cep_bridge,'CLAIM_WAIT',.05)]
+        for handle in patches:handle.start();self.addCleanup(handle.stop)
+        with self.assertRaises(TimeoutError) as caught:names.run_native(SimpleNamespace(pid=3,image='AfterFX.exe'),[],timeout=.3,action='selection',scope='selected')
+        message=str(caught.exception);path=Path(message.split('诊断记录：',1)[1]);details=json.loads(path.read_text(encoding='utf-8'))
+        self.assertNotIn(self.tmp.name,json.dumps(details,ensure_ascii=False))
+        return message,details,stopped
+    def test_ae_never_ran_the_relayed_script(self):
+        message,details,_=self.run_timeout()
+        self.assertIn('AE 没有执行转交的脚本（转交进程已退出，退出码 0）',message);self.assertIn('允许脚本写入文件和访问网络',message)
+        self.assertEqual({k:details[k] for k in ('kind','action','readScope','aeVersion','route','scriptStarted','relayLaunched','relayExitCode','aeElevated','selfElevated')},
+                         {'kind':'parameter-timeout','action':'selection','readScope':'selected','aeVersion':'26.0x67','route':'relay','scriptStarted':False,
+                          'relayLaunched':True,'relayExitCode':0,'aeElevated':False,'selfElevated':False})
+    def test_relay_still_running_is_named_and_stopped(self):
+        message,details,stopped=self.run_timeout(poll=lambda:None)
+        self.assertIn('转交进程仍未退出',message);self.assertIsNone(details['relayExitCode']);self.assertEqual(stopped,[8])
+    def test_script_entered_but_did_not_finish(self):
+        message,details,_=self.run_timeout(enter=True,mismatch='不应出现')
+        self.assertIn('AE 已开始执行脚本，但 0.3 秒内没有完成',message);self.assertNotIn('不应出现',message);self.assertTrue(details['scriptStarted'])
+    def test_different_administrator_rights_are_named(self):
+        message,_,_=self.run_timeout(mismatch='AE 与本程序的管理员权限不同')
+        self.assertIn('AE 没有执行脚本：AE 与本程序的管理员权限不同',message)
+    def test_extension_took_the_request(self):
+        message,details,_=self.run_timeout(bridge=True)
+        self.assertIn('后台扩展已接收请求',message);self.assertEqual((details['route'],details['relayLaunched']),('extension',False))
+
+class RelayPathTests(unittest.TestCase):
+    """AE runs nothing handed over with -r from a path with a space (checked on AE 2024), so the script moves."""
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup);self.root=Path(self.tmp.name)
+    def paths(self,folder,short=lambda p:str(p),environ=None):
+        with patch.object(runtime,'short_path',short),patch.object(runtime,'data_root',lambda:self.root/'data'),patch.dict(os.environ,environ or {},clear=environ is not None):
+            return runtime.relay_script(folder)
+    def test_request_folder_is_used_when_it_has_no_space(self):
+        folder=self.root/'ae-bridge'/'abc';folder.mkdir(parents=True)
+        self.assertEqual(self.paths(folder),folder/'request.jsx')
+    def test_short_form_of_a_folder_with_spaces(self):
+        folder=self.root/'ae O.o  2026'/'abc';folder.mkdir(parents=True)
+        self.assertEqual(self.paths(folder,short=lambda p:'C:\\AEO~1\\ABC' if p==folder else str(p)),Path('C:\\AEO~1\\ABC')/'request.jsx')
+    def test_folder_without_a_short_form_moves_the_script_only(self):
+        folder=self.root/'ae O.o  2026'/'abc';folder.mkdir(parents=True)
+        self.assertEqual(self.paths(folder),self.root/'data'/'relay'/'abc.jsx')
+        # The data folder has a space too (a user name with a space): the next candidate without one.
+        spaced=self.root/'John Smith';(spaced).mkdir()
+        with patch.object(runtime,'short_path',lambda p:str(p)),patch.object(runtime,'data_root',lambda:spaced),patch.dict(os.environ,{'TEMP':str(spaced),'PUBLIC':str(self.root/'Public')},clear=True):
+            self.assertEqual(runtime.relay_script(folder),self.root/'Public'/'AE-Localizer'/'relay'/'abc.jsx')
+        with patch.object(runtime,'short_path',lambda p:str(p)),patch.object(runtime,'data_root',lambda:spaced),patch.dict(os.environ,{},clear=True):
+            with self.assertRaisesRegex(RuntimeError,'不含空格的文件夹.*后台连接'):runtime.relay_script(folder)
+    def test_run_native_hands_over_a_path_without_spaces_and_removes_it(self):
+        import ae_ui
+        assets=self.root/'assets';(assets/'native').mkdir(parents=True);(assets/'native'/'ae_parameters_v8.dll').touch();(assets/'scripts').mkdir()
+        (assets/'scripts'/'parameter_bridge.jsx').write_text('var request=@@REQUEST@@,result=0;',encoding='utf8')
+        handed=[]
+        def launch(args,**kwargs):
+            path=Path(args[-1]);handed.append(path);self.assertNotIn(' ',str(path))
+            request=json.loads(path.read_text(encoding='ascii').split('var request=',1)[1].split(',result=',1)[0])
+            self.assertIn('ae O.o  2026',request['output']);Path(request['output']).write_text('{"changed":0}',encoding='utf8')
+            return SimpleNamespace(pid=8,poll=lambda:0)
+        class Keeper:
+            def __init__(self,pid):pass
+            def check(self):pass
+            def settle(self):pass
+        with patch.object(names,'asset_root',lambda:assets),patch.object(names,'bridge_root',lambda:self.root/'ae O.o  2026'/'ae-bridge'),patch.object(names.subprocess,'Popen',launch),\
+             patch.object(names,'file_version',return_value='26.0.0.67'),patch.object(ae_ui,'WindowKeeper',Keeper),patch.object(cep_bridge,'_appdata',lambda:self.root/'appdata'),\
+             patch.object(runtime,'short_path',lambda p:str(p)),patch.object(runtime,'data_root',lambda:self.root/'data'):
+            self.assertEqual(names.run_native(SimpleNamespace(pid=3,image='AfterFX.exe'),[]),{'changed':0})
+        self.assertEqual(handed[0].parent,self.root/'data'/'relay');self.assertFalse(handed[0].exists())
+        self.assertEqual(list((self.root/'ae O.o  2026'/'ae-bridge').iterdir()),[])
+
+class ElevationTests(unittest.TestCase):
+    def test_elevation_query(self):
+        import win_process
+        self.assertIn(win_process.elevated(os.getpid()),(True,False));self.assertIsNone(win_process.elevated(0xFFFFFFF0))
+        with patch.object(win_process,'elevated',side_effect=lambda pid:pid==3):
+            self.assertIn('AE：以管理员身份运行，本程序：普通权限',win_process.elevation_mismatch(3));self.assertEqual(win_process.elevation_mismatch(os.getpid()),'')
+        with patch.object(win_process,'elevated',return_value=None):self.assertEqual(win_process.elevation_mismatch(3),'')
 
 if __name__=='__main__':unittest.main()

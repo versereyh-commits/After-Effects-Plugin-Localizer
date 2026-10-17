@@ -127,36 +127,80 @@ def _readings(raw:bytes,encoding:str)->set[str]:
     except UnicodeDecodeError:pass
     return found
 
+class CatalogMismatch(ValueError):
+    """No unique registry vector. `details` says how the closest candidates differed from AE's own catalog:
+    effect names and field bytes only, never addresses."""
+    def __init__(self,message,details):super().__init__(message);self.details=details
+
+FIELD_LABELS={'displayName':'显示名称','matchName':'内部标识','category':'分类'}
+EXAMPLES=20
+
+def _differences(rows,expected,encoding):
+    """How the memory rows differ from the host catalog when read in `encoding` (every difference counted,
+    the first EXAMPLES kept)."""
+    count=0;examples=[];seen=set()
+    def note(item):
+        nonlocal count
+        count+=1
+        if len(examples)<EXAMPLES:examples.append(item)
+    for name,key,category in rows:
+        keys=[k for k in _readings(key,encoding) if k in expected]
+        if len(keys)!=1 or keys[0] in seen:
+            note({'field':'matchName','memoryHex':key.split(b'\0',1)[0].hex(),'memoryText':sorted(_readings(key,encoding))});continue
+        seen.add(keys[0]);shown,group=expected[keys[0]]
+        for field,raw,want in (('displayName',name,shown),('category',category,group)):
+            if want not in _readings(raw,encoding):
+                note({'matchName':keys[0],'field':field,'memoryHex':raw.split(b'\0',1)[0].hex(),'memoryText':sorted(_readings(raw,encoding)),'host':want})
+    for key in sorted(set(expected)-seen)[:max(0,EXAMPLES-len(examples))]:examples.append({'matchName':key,'field':'missing'})
+    return count+len(set(expected)-seen),examples
+
 def registry_offset(process,profile,host_catalog):
-    """Read-only exhaustive cross-check of a small bounded manager header."""
+    """Read-only exhaustive cross-check of a small bounded manager header. When no vector matches, raises
+    CatalogMismatch telling how the closest ones differed, so a failure on someone else's AE can be read."""
     base=next(m['base'] for m in process.modules() if m['name'].casefold()=='flt.dll');manager=process.u64(base+profile.manager)
     expected={row['matchName']:(row['displayName'],row['category']) for row in host_catalog}
     if len(expected)!=len(host_catalog) or not 1<len(expected)<32768:raise ValueError('宿主目录不能作为唯一完整对照')
-    matches=[]
+    matches=[];vectors=[];candidates=[]
     for offset in range(0,129,8):
+        try:begin,end=struct.unpack('<QQ',process.read(manager+offset,16))
+        except (RuntimeError,OSError,struct.error):continue
+        if begin<end and (end-begin)%16==0 and (end-begin)//16<32768:vectors.append({'offset':offset,'count':(end-begin)//16})
+        if end-begin!=len(expected)*16:continue
+        candidate={'offset':offset};candidates.append(candidate)
         try:
-            begin,end=struct.unpack('<QQ',process.read(manager+offset,16))
-            if end-begin!=len(expected)*16:continue
-            values=struct.unpack('<'+'Q'*(len(expected)*2),process.read(begin,end-begin));rows={}
-            for address in values[::2]:
+            values=struct.unpack('<'+'Q'*(len(expected)*2),process.read(begin,end-begin));rows=[];keys=set()
+            for index,address in enumerate(values[::2]):
                 raw=process.read(address,160)
-                if struct.unpack_from('<Q',raw)[0]!=base+profile.fc_vtable:raise ValueError()
+                if struct.unpack_from('<Q',raw)[0]!=base+profile.fc_vtable:raise ValueError(f'第 {index+1} 项对象类型不符')
                 fields=(raw[16:64],raw[64:96],raw[96:160])
-                if fields[1] in rows or any(b'\0' not in field for field in fields):raise ValueError()
-                rows[fields[1]]=fields
-            for encoding in ('utf8','mbcs'):
-                # Every object must be one host row, each field the host's exact reading of its bytes.
-                seen=set()
-                for name,key,category in rows.values():
-                    keys=[k for k in _readings(key,encoding) if k in expected]
-                    if len(keys)!=1 or keys[0] in seen:break
-                    shown,group=expected[keys[0]]
-                    if shown not in _readings(name,encoding) or group not in _readings(category,encoding):break
-                    seen.add(keys[0])
-                else:
-                    if len(seen)==len(expected):matches.append(offset);break
-        except (ValueError,RuntimeError,OSError,struct.error):continue
-    return unique(matches,'完整效果目录向量')
+                for label,field in zip(('displayName','matchName','category'),fields):
+                    if b'\0' not in field:raise ValueError(f'第 {index+1} 项{FIELD_LABELS[label]}没有结尾符（{field.hex()}）')
+                if fields[1] in keys:raise ValueError(f'第 {index+1} 项内部标识重复（{fields[1].split(bytes(1),1)[0].hex()}）')
+                keys.add(fields[1]);rows.append(fields)
+        except (ValueError,RuntimeError,OSError,struct.error) as error:
+            candidate['problem']=str(error) or type(error).__name__;continue
+        for encoding in ('utf8','mbcs'):
+            # Every object must be one host row, each field the host's exact reading of its bytes.
+            count,examples=_differences(rows,expected,encoding)
+            candidate[encoding]={'differences':count,'examples':examples}
+            if not count:matches.append(offset);break
+    if len(matches)==1:return matches[0]
+    details={'hostCount':len(expected),'vectors':vectors,'candidates':candidates}
+    if matches:raise CatalogMismatch(f'完整效果目录向量未找到唯一证据（{len(matches)} 处都与 AE 目录一致）',details)
+    raise CatalogMismatch('完整效果目录向量未找到唯一证据（'+_summary(details)+'）',details)
+
+def _summary(details)->str:
+    """One line on the closest candidate, for the error shown to the user."""
+    total=details['hostCount'];candidates=details['candidates']
+    if not candidates:
+        counts='、'.join(str(v['count']) for v in details['vectors'][:6]) or '无'
+        return f'AE 报告 {total} 个效果，内存里没有数量相同的目录；找到的目录数量：{counts}'
+    readable=[c for c in candidates if 'problem' not in c]
+    if not readable:return f'AE 报告 {total} 个效果；数量相同的目录读取时{candidates[0]["problem"]}'
+    best=min(((c[e]['differences'],e,c) for c in readable for e in ('utf8','mbcs') if e in c),key=lambda x:x[0])
+    count,encoding,candidate=best;first=candidate[encoding]['examples'][0] if candidate[encoding]['examples'] else {}
+    where=f"，例如 {first.get('matchName') or first.get('memoryHex','?')} 的{FIELD_LABELS.get(first.get('field'),'条目')}" if first else ''
+    return f'AE 报告 {total} 个效果，最接近的目录有 {count} 项不一致{where}'
 
 
 def run_static_analysis(exe,progress=None,cancel=None,*,resolver_factory=Resolver):

@@ -1,5 +1,7 @@
 (function(){
     var request=@@REQUEST@@,result={changed:0},lib=null,done=[],instanceDone=[];
+    // Tells the program AE entered this script, so a timeout can say whether AE ran it at all.
+    try{var mark=new File(new File(request.output).parent.fsName+'/started');if(mark.open('w')){mark.write('1');mark.close();}}catch(markError){}
     function permitted(){return new File(request.permit).exists&&new Date().getTime()<request.expires;}
     function quoted(s){return '"'+String(s).replace(/\\/g,'\\\\').replace(/"/g,'\\"').replace(/\r/g,'\\r').replace(/\n/g,'\\n').replace(/[\x00-\x1f]/g,function(c){return '\\u'+('0000'+c.charCodeAt(0).toString(16)).slice(-4);})+'"';}
     function projectToken(){var source=app.project.file?app.project.file.fsName:'unsaved',hash=2166136261;for(var i=1;i<=app.project.numItems;i++)source+='|'+app.project.item(i).id;for(var j=0;j<source.length;j++){hash^=source.charCodeAt(j);hash+=(hash<<1)+(hash<<4)+(hash<<7)+(hash<<8)+(hash<<24);}return (hash>>>0).toString(16);}

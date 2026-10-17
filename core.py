@@ -121,6 +121,11 @@ def pascal_string(value: bytes) -> str:
     try:
         return raw.decode("utf-8")
     except UnicodeDecodeError:
+        pass
+    try:
+        # Some localized plugins (a Chinese BCC build) ship names in the system's legacy encoding, e.g. GBK.
+        return raw.decode("mbcs")
+    except (UnicodeDecodeError, LookupError):
         return raw.decode("cp1252", errors="replace")
 
 

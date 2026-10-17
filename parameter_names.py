@@ -7,10 +7,10 @@ are eligible. Unsupported layouts fail closed.
 from __future__ import annotations
 import ctypes as C
 from ctypes import wintypes as W
-import hashlib,json,struct,subprocess,time,uuid,sys,threading
+import hashlib,json,os,struct,subprocess,time,uuid,sys,threading
 from pathlib import Path
 from live_names import current_process,Registry,_lock,_process_lock,_save,module_digest
-from runtime import asset_root,data_root
+from runtime import asset_root,data_root,relay_script,write_json_atomic
 from ae_profiles import get_profile,trial_projects
 from runtime import file_version
 
@@ -233,6 +233,29 @@ def bridge_root():
     base=Path(sys.executable).parent if getattr(sys,'frozen',False) else Path(__file__).resolve().parent
     return base/'ae-bridge'
 
+STARTED='started'   # parameter_bridge.jsx writes this into the request folder as soon as AE enters the script
+
+def _timeout_message(p,folder,request,timeout,use_bridge,launcher)->str:
+    """Why a request timed out, as far as can be told from outside AE, and a diagnostic file beside it (versions,
+    route, whether AE entered the script, administrator rights; no paths, projects or names)."""
+    import cep_bridge
+    from win_process import elevated,elevation_mismatch
+    started=(folder/STARTED).exists();exit_code=launcher.poll() if launcher is not None else None
+    route='extension' if use_bridge and launcher is None else 'relay'   # the relay runs only when the extension did not take it
+    mismatch='' if started else elevation_mismatch(p.pid)
+    if started:cause=f'AE 已开始执行脚本，但 {timeout} 秒内没有完成：AE 可能正忙或显示了对话框，请关闭 AE 中的对话框后重试'
+    elif mismatch:cause='AE 没有执行脚本：'+mismatch
+    elif route=='extension':cause='后台扩展已接收请求，但 AE 没有开始执行：AE 可能正忙或显示了对话框。请关闭 AE 中的对话框后重试；仍不行可在设置页移除后台连接，改用转交方式'
+    else:cause=('AE 没有执行转交的脚本'+('' if launcher is None else '（转交进程仍未退出）' if exit_code is None else f'（转交进程已退出，退出码 {exit_code}）')+
+                '。请关闭 AE 中可能弹出的对话框，并确认“编辑 → 首选项 → 脚本和表达式 → 允许脚本写入文件和访问网络”已勾选后重试')
+    details={'schemaVersion':1,'kind':'parameter-timeout','action':request.get('action'),'readScope':request.get('readScope'),'aeVersion':request.get('hostVersion'),
+             'timeoutSeconds':timeout,'route':route,'extensionStatus':cep_bridge.status(),'extensionClaimed':(folder/'claimed.json').exists(),'scriptStarted':started,
+             'relayLaunched':launcher is not None,'relayExitCode':exit_code,'folderPathHasSpace':' ' in str(folder),'aeElevated':elevated(p.pid),'selfElevated':elevated(os.getpid())}
+    note=''
+    try:write_json_atomic(folder/'timeout-diagnostic.json',details,ensure_ascii=False,indent=1);note='；诊断记录：'+str(folder/'timeout-diagnostic.json')
+    except OSError:pass
+    return 'AE 参数操作超时，已撤销执行许可。'+cause+note
+
 def run_native(p,operations,timeout=25,action='labels',project_token=None,scope=None):
     if scope is not None and (scope not in ('selected','project') or action not in ('catalog','selection')):raise ValueError('读取范围不能用于写入请求')
     # With the background extension loaded in AE (cep_bridge) the request goes through the folder it watches:
@@ -259,7 +282,8 @@ def run_native(p,operations,timeout=25,action='labels',project_token=None,scope=
         request['adapter']={'flt':profile.flt_sha,'tdb':profile.tdb_sha,'codec':profile.codec_sha,'layout':','.join(format(v,'x') for v in (profile.root_vtable,profile.group_vector,profile.named_map,int(profile.named_vector),profile.parent_get,profile.stream_match_get,profile.count_get)),'encoding':profile.encoding}
     launcher=keeper=None
     def relay():
-        nonlocal launcher,keeper
+        nonlocal launcher,keeper,script
+        script=relay_script(folder)   # AE runs nothing from a path with a space
         template=(asset_root()/'scripts'/'parameter_bridge.jsx').read_text(encoding='utf8')
         # AE's command-line script loader otherwise may interpret non-ASCII source
         # using a Windows legacy code page. Escape every non-ASCII
@@ -294,17 +318,19 @@ def run_native(p,operations,timeout=25,action='labels',project_token=None,scope=
                     claim_by=None
                     if cep_bridge.withdraw(folder):relay()
             time.sleep(.1)
-        raise TimeoutError('AE 参数操作超时，已撤销执行许可；请关闭 AE 中可能弹出的对话框，并确认“编辑 → 首选项 → 脚本和表达式 → 允许脚本写入文件和访问网络”已勾选后重试')
+        raise TimeoutError(_timeout_message(p,folder,request,timeout,use_bridge,launcher))
     finally:
         permit.unlink(missing_ok=True)
         # Only the secondary CLI relay may be terminated; never the primary AE.
         if launcher is not None and launcher.poll() is None and launcher.pid!=p.pid:
             launcher.terminate();launcher.wait(timeout=5)
         if keeper:keeper.settle()
+        # A script moved out of the request folder (a path with spaces) has no use once the permit is gone.
+        if script.name!='request.jsx':script.unlink(missing_ok=True)
         if finished or output.exists():
             # Only these task-owned files are removed. Never recurse into a
             # user-selected path or delete the parent portable directory.
-            for owned in (script,output,*(folder/name for name in cep_bridge.OWNED)):owned.unlink(missing_ok=True)
+            for owned in (script,output,folder/STARTED,*(folder/name for name in cep_bridge.OWNED)):owned.unlink(missing_ok=True)
             try:folder.rmdir()
             except OSError:pass
 

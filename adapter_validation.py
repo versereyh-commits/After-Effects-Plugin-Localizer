@@ -3,14 +3,14 @@ from dataclasses import replace
 from pathlib import Path
 import json,shutil,uuid,threading
 from ae_profiles import trial_adapter
-from adapter_resolver import Resolver,registry_offset
+from adapter_resolver import CatalogMismatch,Resolver,registry_offset
 from adapter_host import HostBridge
 from parameter_names import bridge_root,ParameterSession,ParameterCatalog,identity,_host_names,run_native
 from live_names import NameSession,read_live,_save
 from local_adapters import save_validated
 from local_adapters import profile_data
 from ae_paths import path_key
-from runtime import legacy_text_problem
+from runtime import legacy_text_problem,write_json_atomic
 
 EFFECT_LABEL='适配验证效果';PARAMETER_LABEL='适配参数'
 DRIZZLE_LABELS={'0001':'滴落率','0002':'存续时间','0003':'涟漪','0004':'位移','0005':'波纹高度','0006':'扩散','0007':'光照','0015':'明暗'}
@@ -47,6 +47,13 @@ class ValidationRun:
         if self.report.get('analysisSource','ai') not in ('code','ai') or self.report.get('runtimeEnabled') is not False or self.report.get('hostVerified') is not False:raise ValueError('候选来源或状态无效')
         fields=self.report.get('candidateReadConfig')
         if not fields or any(k not in evidence or evidence[k]!=v for k,v in fields.items()):raise ValueError('候选字段无法由本机重新复现')
+    def _catalog_diagnostic(self,details)->str:
+        """Saves how AE's catalog and the memory catalog differed (effect names and field bytes, no addresses,
+        project or personal data), so a user can send it; returns the note naming the file."""
+        path=self.bridge.folder/'catalog-diagnostic.json'
+        try:write_json_atomic(path,{'schemaVersion':1,'kind':'catalog-diagnostic','aeVersion':self.bridge.version,**details},ensure_ascii=False,indent=1)
+        except OSError:return ''
+        return '；诊断记录：'+str(path)
     def run(self,progress=None):
         """Requires the selected AE ready with an empty project. No user projects are closed."""
         self.bridge.progress=progress
@@ -56,7 +63,9 @@ class ValidationRun:
             self._verify_analysis(resolver);status=self.bridge.call('status')
             if status.get('project') or status.get('items'):raise RuntimeError('请先自行保存并关闭当前工程，使所选 AE 保持空工程')
             profile=resolver.complete_static(status['hostVersion']);host=self.bridge.call('catalog')['effects']
-            with self.bridge.process() as p:offset=registry_offset(p,profile,host)
+            with self.bridge.process() as p:
+                try:offset=registry_offset(p,profile,host)
+                except CatalogMismatch as error:raise RuntimeError(str(error)+self._catalog_diagnostic(error.details)) from None
             self.profile=replace(profile,registry_vector=offset)
             resolver.verify_files()
         finally:resolver.close()

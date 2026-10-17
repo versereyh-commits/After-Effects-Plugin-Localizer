@@ -66,6 +66,11 @@ class ResourceTests(unittest.TestCase):
     def test_observed_continuum_inclusive_length_quirk(self):
         self.assertEqual(pascal_string(b"\x08Glow\0\0\0"),"Glow")
         with self.assertRaises(ValueError):pascal_string(b"\xffabc")
+    def test_legacy_encoded_names_read_in_the_system_encoding(self):
+        raw="BCC 键控与混合".encode("gbk")
+        try:expected=raw.decode("mbcs")
+        except (UnicodeDecodeError,LookupError):expected=raw.decode("cp1252",errors="replace")
+        self.assertEqual(pascal_string(bytes([len(raw)])+raw),expected)
 
     def test_runtime_writer_remains_gated_for_unverified_catalog_change(self):
         self.assertFalse(rename_gate(None)[0])

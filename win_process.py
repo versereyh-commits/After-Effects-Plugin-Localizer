@@ -5,6 +5,34 @@ from ctypes import wintypes as W
 from pathlib import Path
 import struct
 
+def elevated(pid:int)->bool|None:
+    """Whether a process runs elevated ("以管理员身份运行"); None when Windows will not tell (gone, no access).
+    Only query rights are asked for, which Windows grants across elevation levels."""
+    k=C.WinDLL('kernel32',use_last_error=True);a=C.WinDLL('advapi32',use_last_error=True)
+    k.OpenProcess.argtypes=[W.DWORD,W.BOOL,W.DWORD];k.OpenProcess.restype=C.c_void_p;k.CloseHandle.argtypes=[C.c_void_p]
+    a.OpenProcessToken.argtypes=[C.c_void_p,W.DWORD,C.POINTER(C.c_void_p)];a.OpenProcessToken.restype=W.BOOL
+    a.GetTokenInformation.argtypes=[C.c_void_p,C.c_int,C.c_void_p,W.DWORD,C.POINTER(W.DWORD)];a.GetTokenInformation.restype=W.BOOL
+    handle=k.OpenProcess(0x1000,False,pid)   # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:return None
+    token=C.c_void_p()
+    try:
+        if not a.OpenProcessToken(handle,0x8,C.byref(token)):return None   # TOKEN_QUERY
+        try:
+            value=W.DWORD();size=W.DWORD()
+            if not a.GetTokenInformation(token,20,C.byref(value),C.sizeof(value),C.byref(size)):return None   # TokenElevation
+            return bool(value.value)
+        finally:k.CloseHandle(token)
+    finally:k.CloseHandle(handle)
+
+def elevation_mismatch(pid:int)->str:
+    """A sentence naming the difference when AE and this program run with different administrator rights
+    (Windows may then stop the AfterFX.exe -r hand-over without a word), otherwise ''."""
+    import os
+    host,own=elevated(pid),elevated(os.getpid())
+    if host is None or own is None or host==own:return ''
+    side=lambda value:'以管理员身份运行' if value else '普通权限'
+    return f'AE 与本程序的管理员权限不同（AE：{side(host)}，本程序：{side(own)}），Windows 可能拦截了脚本转交。请让两者用相同权限运行（建议都不要“以管理员身份运行”）后重试'
+
 class Process:
     def __init__(self,pid:int,write:bool=False):
         self.pid=pid;self.k=C.WinDLL('kernel32',use_last_error=True)

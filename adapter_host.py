@@ -2,7 +2,7 @@
 from pathlib import Path
 import json,subprocess,time,uuid
 from ae_paths import path_key
-from runtime import native_probe,file_version,asset_root,write_json_atomic
+from runtime import native_probe,file_version,asset_root,relay_script,write_json_atomic
 from parameter_names import bridge_root
 from ae_ui import WindowKeeper
 from win_process import Process
@@ -57,7 +57,7 @@ class HostBridge:
         extras={'status':{'diagnoseCatalog'},'render':{'frame','disabled'},'edit':{'parameterEffect','parameterMatch'},'switch':{'target'}}
         if set(kwargs)-extras.get(action,set()):raise ValueError('QA 请求不能覆盖身份、许可或输出路径')
         with self.process() as p:pid=p.pid
-        request_folder=self.folder/uuid.uuid4().hex;request_folder.mkdir();permit=request_folder/'permit';permit.touch();output=request_folder/'result.json';script=request_folder/'request.jsx'
+        request_folder=self.folder/uuid.uuid4().hex;request_folder.mkdir();permit=request_folder/'permit';permit.touch();output=request_folder/'result.json';script=relay_script(request_folder)   # AE runs nothing from a path with a space
         progress_file=request_folder/'progress.json';request_id=request_folder.name
         q={'action':action,'requestId':request_id,'hostVersion':self.host_version,'project':self.project.as_posix(),'second':self.second.as_posix(),'comp':self.comp,'permit':permit.as_posix(),'output':output.as_posix(),'progress':progress_file.as_posix(),'expires':int((time.time()+53)*1000),**kwargs}
         if action=='render':
@@ -96,13 +96,19 @@ class HostBridge:
             labels={'status':'读取 AE 状态','catalog':'读取效果目录','prepare':'创建 QA 工程','render':'渲染 QA 帧'}
             if not progress_file.exists():
                 # AE never reported entering the script: a blocking dialog or the
-                # scripting file-access preference is the usual cause.
+                # scripting file-access preference is the usual cause, or AE and this program running with
+                # different administrator rights.
+                from win_process import elevation_mismatch
+                mismatch=elevation_mismatch(pid);self.diagnostic('request_not_started',action=action,requestId=request_id,hostPid=pid,elevationMismatch=bool(mismatch))
+                if mismatch:raise TimeoutError(f"{labels.get(action,action)}超时：AE 没有开始执行验证脚本。{mismatch}。已撤销后续操作许可。")
                 raise TimeoutError(f"{labels.get(action,action)}超时：AE 没有开始执行验证脚本。请关闭 AE 中可能弹出的对话框，并确认“编辑 → 首选项 → 脚本和表达式 → 允许脚本写入文件和访问网络”已勾选，然后重试。已撤销后续操作许可。")
             raise TimeoutError(f"{labels.get(action,action)}超时；最后阶段：{last_phase}。已撤销后续操作许可；AE 可能仍在完成当前调用，请等待返回后再重试或恢复。")
         finally:
             permit.unlink(missing_ok=True)
             try:self.finish_relay(relay,pid)
-            finally:self._relay_pid=None;keeper.settle()
+            finally:
+                self._relay_pid=None;keeper.settle()
+                if script.name!='request.jsx':script.unlink(missing_ok=True)   # moved out of the request folder
     def assert_owned(self):
         status=self.call('status');path=status.get('project')
         if not path or path_key(path) not in (path_key(self.project),path_key(self.second)):raise RuntimeError('当前不是软件自有 QA 工程，已停止验证')

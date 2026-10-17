@@ -70,6 +70,13 @@ class ValidationSafetyTests(unittest.TestCase):
         run=self.run_object();run.review_ready=True;run.checks={key:True for key in AUTOMATED}
         with self.assertRaises(RuntimeError):run.finish({})
         run.bridge.assert_owned.assert_not_called()
+    def test_catalog_mismatch_is_saved_for_the_user_to_send(self):
+        with tempfile.TemporaryDirectory() as temp:
+            run=self.run_object();run.bridge=SimpleNamespace(folder=Path(temp),version='99.0.0.1')
+            details={'hostCount':2,'vectors':[{'offset':32,'count':2}],'candidates':[{'offset':32,'utf8':{'differences':1,'examples':[{'matchName':'BCC_X','field':'displayName','memoryHex':'c4e3','memoryText':['Äã'],'host':'你'}]}}]}
+            note=run._catalog_diagnostic(details);path=Path(temp)/'catalog-diagnostic.json'
+            self.assertEqual(note,'；诊断记录：'+str(path))
+            saved=json.loads(path.read_text(encoding='utf-8'));self.assertEqual(saved['aeVersion'],'99.0.0.1');self.assertEqual(saved['candidates'],details['candidates'])
     def test_model_config_is_rechecked_without_trusting_evidence_labels(self):
         run=self.run_object();run.report={'kind':'ae-adapter-analysis','version':'99','modules':{'FLT.dll':'a'},'candidateReadConfig':{'manager':123}}
         resolver=SimpleNamespace(version='99',modules={'FLT.dll':{'sha256':'a'}},getters=lambda:[])

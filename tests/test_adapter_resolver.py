@@ -1,4 +1,4 @@
-import struct
+import json,struct
 from types import SimpleNamespace
 from unittest.mock import patch
 import test_adapter_analysis as fixtures
@@ -75,6 +75,20 @@ class RegistryOffsetTests(fixtures.AnalysisTests):
     def test_readable_bytes_are_never_matched_one_character_per_byte(self):
         self.rename(0x400000,name='Alpha辉光'.encode('utf8'));self.host[0]['displayName']='Alpha辉光'.encode('utf8').decode('latin-1')
         with self.assertRaises(ValueError):registry_offset(self.process,self.profile,self.host)
+    def test_failure_says_how_the_closest_catalog_differed(self):
+        from adapter_resolver import CatalogMismatch
+        self.host[0]['category']='Other'
+        with self.assertRaises(CatalogMismatch) as caught:registry_offset(self.process,self.profile,self.host)
+        self.assertIn('最接近的目录有 1 项不一致，例如 A 的分类',str(caught.exception))
+        candidate=caught.exception.details['candidates'][0];self.assertEqual(candidate['offset'],32)
+        self.assertEqual(candidate['utf8']['examples'],[{'matchName':'A','field':'category','memoryHex':b'Test'.hex(),'memoryText':['Test'],'host':'Other'}])
+        self.assertNotIn(str(0x400000),json.dumps(caught.exception.details),'no addresses in the diagnostic')
+    def test_failure_names_counts_and_unreadable_objects(self):
+        from adapter_resolver import CatalogMismatch
+        self.host.append({'matchName':'C','displayName':'Gamma','category':'Test'})
+        with self.assertRaisesRegex(CatalogMismatch,'AE 报告 3 个效果，内存里没有数量相同的目录；找到的目录数量：2'):registry_offset(self.process,self.profile,self.host)
+        self.host.pop();data=bytearray(self.memory[0x400000]);data[16:64]=b'X'*48;self.memory[0x400000]=bytes(data)
+        with self.assertRaisesRegex(CatalogMismatch,'第 1 项显示名称没有结尾符'):registry_offset(self.process,self.profile,self.host)
     def test_wrong_object_type_is_rejected(self):
         data=bytearray(self.memory[0x400000]);struct.pack_into('<Q',data,0,0);self.memory[0x400000]=bytes(data)
         with self.assertRaises(ValueError):registry_offset(self.process,self.profile,self.host)
