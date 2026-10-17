@@ -4,3 +4,4 @@ ziglang==0.16.0
 comtypes==1.4.17
 pefile==2024.8.26
 capstone==5.0.9
+certifi==2026.7.22

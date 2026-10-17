@@ -109,7 +109,7 @@ GUIDE='''AE汉化工具 {version} 使用说明
 
 def notices(folder:Path):
     folder.mkdir(parents=True,exist_ok=True);site=root/'.venv'/'Lib'/'site-packages'
-    for package in ('pyside6_essentials-6.12.0','shiboken6-6.12.0','pyinstaller-6.22.3','comtypes-1.4.17'):
+    for package in ('pyside6_essentials-6.12.0','shiboken6-6.12.0','pyinstaller-6.22.3','comtypes-1.4.17','certifi-2026.7.22'):
         source=site/(package+'.dist-info')/'licenses'
         for file in (source.rglob('*') if source.is_dir() else []):
             if file.is_file():

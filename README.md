@@ -56,7 +56,7 @@
 
 - 翻译时只把所选效果 / 参数的名称、内部标识和分类发给你配置的翻译服务，不发送工程、画面或参数值。
 - API Key 默认只在本次运行中使用；勾选后用 Windows 当前用户加密保存。
-- 检查更新只读取本仓库 Releases 中的 `update.json`，不发送本机或工程信息，可在设置中关闭。
+- 检查更新只读取本仓库 Releases 中的 `update.json`（连不上时改读 GitHub API 上同一个 Release 的版本信息），不发送本机或工程信息，可在设置中关闭。依次尝试系统代理、自动代理脚本（PAC）和直连；失败时会写明原因。证书除了 Windows 系统根证书，还信任随软件附带的 Mozilla 根证书（certifi），校验依然严格。
 
 ## 从源码构建
 
@@ -73,8 +73,10 @@ python -m venv .venv
 运行测试（先运行一次 `build.py` 或 `build.py --native-only` 编译原生模块，个别测试需要它；装了 Node.js 时还会用模拟的 CEP 环境检查扩展脚本）：
 
 ```bash
-.venv\Scripts\python.exe -m unittest discover -s tests
+.venv\Scripts\python.exe run_tests.py
 ```
+
+每个测试模块用独立进程并行运行，全部约 1 分钟，测试期间不联网。只跑某几个模块：`run_tests.py test_updater test_gui`。
 
 打安装包需要 [Inno Setup 6](https://jrsoftware.org/isinfo.php)：
 

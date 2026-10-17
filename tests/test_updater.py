@@ -1,5 +1,5 @@
 """Update check: manifest validation, verified download, and the window's offer / skip / install flow."""
-import datetime,hashlib,io,json,shutil,tempfile,unittest
+import datetime,hashlib,io,json,shutil,socket,ssl,tempfile,unittest
 from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError,URLError
@@ -74,6 +74,105 @@ class CheckTests(unittest.TestCase):
             with self.assertRaisesRegex(UpdateError,message):updater.check('0.8.0',opener=server)
         def offline(request,timeout):raise URLError('down')
         with self.assertRaisesRegex(UpdateError,'无法连接'):updater.check('0.8.0',opener=offline)
+
+def release(version='9.1.0',payload=PAYLOAD,**changes):
+    """The GitHub API's description of the release that carries manifest(version)."""
+    asset={'name':f'ae-localizer-setup-{version}.exe','size':len(payload),'digest':'sha256:'+hashlib.sha256(payload).hexdigest()}
+    value={'tag_name':f'v{version}','published_at':'2026-10-16T08:00:00Z','body':'修复若干问题\r\n第二行',
+           'assets':[asset,{'name':'update.json','size':1228,'digest':'sha256:'+'0'*64}]}
+    return {**value,**changes}
+def failing(error):
+    def opener(request,timeout):raise error
+    return opener
+
+class ConnectionTests(unittest.TestCase):
+    """Why a check failed, the routes it tries, and the GitHub API as the fallback for update.json."""
+    def test_reasons_name_what_went_wrong(self):
+        cases=((URLError(socket.gaierror(11001,'getaddrinfo failed')),'域名解析失败'),(URLError(TimeoutError('timed out')),'连接超时'),(TimeoutError('timed out'),'连接超时'),
+               (URLError(ConnectionResetError(10054,'reset')),'连接被重置'),(URLError(ConnectionRefusedError(10061,'refused')),'连接被拒绝'),
+               (URLError(ssl.SSLCertVerificationError(1,'certificate verify failed')),'证书校验失败'),(URLError(OSError('Tunnel connection failed: 502 Bad Gateway')),'代理无法连到 GitHub'),
+               (URLError('down'),'网络错误'))
+        for error,reason in cases:
+            with self.assertRaisesRegex(UpdateError,'无法连接更新服务器.*'+reason,msg=reason):updater.check('0.8.0',opener=failing(error))
+    def test_api_is_the_fallback_and_gives_the_same_manifest(self):
+        self.assertEqual(updater.from_release(release()),updater.validate(manifest()))
+        urls=[]
+        def opener(request,timeout):
+            urls.append(request.full_url)
+            if 'api.github.com' not in request.full_url:raise URLError(ConnectionResetError(10054,'reset'))
+            self.assertEqual(request.get_header('Accept'),'application/vnd.github+json')
+            return Reply(json.dumps(release()).encode('utf8'),request.full_url)
+        self.assertEqual(updater.check('0.8.0',opener=opener),updater.validate(manifest()))
+        self.assertEqual(urls,[updater.manifest_url(),updater.api_url()])
+    def test_api_release_is_checked_like_the_manifest(self):
+        two=release();two['assets']=two['assets']+[{**two['assets'][0],'name':'other.exe'}]
+        cases=((release(assets=[{**release()['assets'][0],'digest':None}]),'校验值'),(two,'不唯一'),(release(assets=[]),'不唯一'),(release(tag_name='latest'),'版本号'),
+               (release(assets=[{**release()['assets'][0],'size':0}]),'大小'),({'assets':[]},'缺少'),([],'缺少'),(release(body=None,published_at=None),None))
+        for value,message in cases:
+            if message is None:self.assertEqual(updater.from_release(value)['notes'],'');continue
+            with self.assertRaisesRegex(UpdateError,message,msg=message):updater.from_release(value)
+        def opener(request,timeout):
+            if 'api.github.com' not in request.full_url:raise URLError(TimeoutError('timed out'))
+            return Reply(b' '*(updater.MAX_RELEASE+1),request.full_url)
+        with self.assertRaisesRegex(UpdateError,'过大'):updater.check('0.8.0',opener=opener)
+    def test_answers_that_are_wrong_do_not_fall_back(self):
+        for server in (Server(status=404),Server(b'{')):
+            with self.assertRaises(UpdateError):updater.check('0.8.0',opener=server)
+            self.assertEqual(server.urls,[updater.manifest_url()])
+    def test_a_proxy_that_is_not_running_is_tried_once_then_direct(self):
+        asked=[]
+        def connect(proxy):
+            def opener(request,timeout):
+                asked.append((proxy,request.full_url))
+                if proxy:raise URLError(ConnectionRefusedError(10061,'refused'))
+                return Server(manifest())(request,timeout)
+            return opener
+        with patch.object(updater,'routes',return_value=[('系统代理','http://127.0.0.1:7890'),('直连',None)]),patch.object(updater,'_connect',connect):
+            self.assertEqual(updater.check('0.8.0')['version'],'9.1.0')
+        self.assertEqual(asked,[('http://127.0.0.1:7890',updater.manifest_url()),(None,updater.manifest_url())])
+    def test_every_route_and_reason_is_reported(self):
+        asked=[]
+        def connect(proxy):
+            def opener(request,timeout):
+                asked.append(proxy)
+                raise URLError(ConnectionRefusedError(10061,'refused') if proxy else TimeoutError('timed out'))
+            return opener
+        with patch.object(updater,'routes',return_value=[('系统代理','http://127.0.0.1:7890'),('直连',None)]),patch.object(updater,'_connect',connect):
+            with self.assertRaises(UpdateError) as caught:updater.check('0.8.0')
+        self.assertEqual(str(caught.exception),'无法连接更新服务器，请检查网络（系统代理：代理连不上（代理软件可能没开）；直连：连接超时；直连·备用地址：连接超时）')
+        self.assertEqual(asked,['http://127.0.0.1:7890',None,None],'a proxy that refused is not asked again for the fallback')
+        self.assertNotIn('7890',str(caught.exception))
+    def test_routes(self):
+        url=updater.manifest_url()
+        def routes(proxies={},environment={},bypass=False,pac=None):
+            with patch.object(updater,'getproxies',return_value=proxies),patch.object(updater,'getproxies_environment',return_value=environment),\
+                 patch.object(updater,'proxy_bypass',return_value=bypass),patch.object(updater,'_pac_proxy',return_value=pac):return updater.routes(url)
+        system={'https':'http://127.0.0.1:10808'}
+        self.assertEqual(routes(),[('直连',None)])
+        self.assertEqual(routes(system),[('系统代理','http://127.0.0.1:10808'),('直连',None)])
+        self.assertEqual(routes(system,system),[('代理（环境变量）','http://127.0.0.1:10808'),('直连',None)])
+        self.assertEqual(routes(system,bypass=True),[('直连',None)])
+        self.assertEqual(routes(pac='http://127.0.0.1:1080'),[('自动代理脚本','http://127.0.0.1:1080'),('直连',None)])
+        self.assertEqual(routes(system,pac='http://127.0.0.1:10808'),[('系统代理','http://127.0.0.1:10808'),('直连',None)])
+    def test_certificate_reasons(self):
+        for code,reason in ((10,'日期和时间'),(9,'日期和时间'),(62,'网络劫持'),(19,'自签名'),(20,'根证书'),(None,'可能被安全软件')):
+            error=ssl.SSLCertVerificationError(1,'certificate verify failed')
+            if code is not None:error.verify_code=code
+            with self.assertRaisesRegex(UpdateError,'证书校验失败.*'+reason,msg=str(code)):updater.check('0.8.0',opener=failing(URLError(error)))
+    def test_connections_trust_mozilla_roots_as_well_as_windows(self):
+        # GitHub chains to USERTrust ECC; a Windows install that has not fetched that root yet still verifies.
+        import certifi
+        context=updater.tls_context();bundled=ssl.create_default_context(cafile=certifi.where())
+        self.assertEqual(context.verify_mode,ssl.CERT_REQUIRED);self.assertTrue(context.check_hostname)
+        names={dict(x[0] for x in c['subject']).get('commonName') for c in context.get_ca_certs()}
+        self.assertIn('USERTrust ECC Certification Authority',names);self.assertGreaterEqual(len(context.get_ca_certs()),len(bundled.get_ca_certs()))
+        with patch.object(updater,'tls_context',return_value=context) as made:
+            updater._connect(None);updater._connect(updater.SYSTEM)
+        self.assertEqual(made.call_count,2)
+    def test_pac_proxy_lists(self):
+        for listed,proxy in (('127.0.0.1:1080','http://127.0.0.1:1080'),('a.example:8080;b.example:8080','http://a.example:8080'),
+                             ('http=a:1;https=b:2','http://b:2'),('http://p:3','http://p:3'),('[::1]:7890','http://[::1]:7890'),('',None),('DIRECT',None),('http=a:1',None)):
+            self.assertEqual(updater._proxy_entry(listed),proxy,listed)
 
 class DownloadTests(unittest.TestCase):
     def setUp(self):self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup);self.folder=Path(self.temp.name)/'updates'
@@ -230,7 +329,7 @@ class UnconfiguredTests(GuiCase):
     def test_nothing_goes_online(self):
         w=self.window;self.assertFalse(updater.configured())
         self.assertFalse(w.update_btn.isEnabled());self.assertFalse(w.update_box.isEnabled());self.assertIn('尚未设置',w.update_info.text())
-        with patch.object(app_live.updater,'urlopen',side_effect=AssertionError('online')):
+        with patch.object(app_live.updater,'_connect',side_effect=AssertionError('online')):
             w.auto_check_update();w.check_update(manual=True)
             with self.assertRaisesRegex(UpdateError,'尚未设置'):updater.check('0.8.0')
         self.assertIsNone(w.update_job)
