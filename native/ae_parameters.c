@@ -9,18 +9,19 @@
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
-#include <bcrypt.h>
 
 typedef struct { union {long integer;double number;char *string;void *object;} data;long type,filler;} TaggedData;
 typedef struct {union {wchar_t small[8];wchar_t *pointer;} data;uint64_t length,capacity;} WideString;
 #define API __declspec(dllexport)
 static DWORD script_thread;
 static int profile_ok;
-typedef struct {const char *flt,*tdb;uintptr_t root,vector;int named_vector,legacy;} Adapter;
+/* map: where a named group's stream list starts (its head; the count getter reads the size 8 bytes later).
+   It was vector+8 up to AE 26.0; AE 26.5 moved it, so a dynamic adapter passes it explicitly. */
+typedef struct {const char *flt,*tdb;uintptr_t root,vector;int named_vector,legacy;uintptr_t map;} Adapter;
 static const Adapter adapters[]={
- {"68b229950e95dedf630f5d09653715268e8beba4830590433abe7cb58e78a357","8e1ea3d5e08d91dd25e899d43e0ad69a525b161716bb4c29250e3711b2591c80",0xc8e80,0x220,0,0},
- {"a4896d34e20f1fb08ba9afd0fc6e428081bd51dba6abb39e87aa6342c973a183","6d8f80729ef02538415bb6578399cee667101b6c218ea73d85d74357558b660e",0xce2f0,0x220,0,1},
- {"abf6673b380450cc98549876c3738135bc025345b619cc4cba9d17bf98d05bc9","2214da04c37c197f8cefb3cc825eaab6f45efa3c1bdd300e2157842e4b38113d",0x8f0f0,0x190,1,1}
+ {"68b229950e95dedf630f5d09653715268e8beba4830590433abe7cb58e78a357","8e1ea3d5e08d91dd25e899d43e0ad69a525b161716bb4c29250e3711b2591c80",0xc8e80,0x220,0,0,0x228},
+ {"a4896d34e20f1fb08ba9afd0fc6e428081bd51dba6abb39e87aa6342c973a183","6d8f80729ef02538415bb6578399cee667101b6c218ea73d85d74357558b660e",0xce2f0,0x220,0,1,0x228},
+ {"abf6673b380450cc98549876c3738135bc025345b619cc4cba9d17bf98d05bc9","2214da04c37c197f8cefb3cc825eaab6f45efa3c1bdd300e2157842e4b38113d",0x8f0f0,0x190,1,1,0x198}
 };
 static const Adapter *adapter;
 #ifdef AE_DYNAMIC
@@ -31,29 +32,94 @@ static int readable(const void *address,SIZE_T size) {
     return address&&VirtualQuery(address,&m,sizeof(m))&&m.State==MEM_COMMIT&&!(m.Protect&(PAGE_GUARD|PAGE_NOACCESS))&&
         (uintptr_t)address+size<=(uintptr_t)m.BaseAddress+m.RegionSize;
 }
-static int module_hash(HMODULE module,const char *expected) {
-    wchar_t path[32768];if(!GetModuleFileNameW(module,path,32768))return 0;
+/* Breadcrumb for a call that never returns (AE 2025 25.6 hung while hashing FLT.dll): the step reached is written
+   to %TEMP%\AE-Localizer-native-step.txt, which the program reads when a request times out. Only a step name. */
+static void step(const char *name) {
+    wchar_t path[MAX_PATH+40];DWORD n=GetTempPathW(MAX_PATH,path);
+    if(!n||n>MAX_PATH)return;
+    wcscat(path,L"AE-Localizer-native-step.txt");
+    HANDLE file=CreateFileW(path,GENERIC_WRITE,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,NULL,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL);
+    if(file==INVALID_HANDLE_VALUE)return;
+    DWORD written=0;WriteFile(file,name,(DWORD)strlen(name),&written,NULL);CloseHandle(file);
+}
+/* SHA-256 (FIPS 180-4) computed here rather than through Windows CNG (bcrypt), so hashing AE's modules depends on
+   nothing but reading the file: on that AE 2025 25.6 the first module hash never returned. */
+typedef struct {uint32_t h[8];uint64_t length;unsigned char block[64];size_t used;} Sha256;
+static const uint32_t sha_k[64]={
+ 0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,
+ 0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+ 0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,
+ 0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+ 0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,
+ 0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2};
+#define ROR32(x,n) (((x)>>(n))|((x)<<(32-(n))))
+static void sha_block(Sha256 *s,const unsigned char *p) {
+    uint32_t w[64],v[8];
+    for(int i=0;i<16;i++)w[i]=(uint32_t)p[i*4]<<24|(uint32_t)p[i*4+1]<<16|(uint32_t)p[i*4+2]<<8|(uint32_t)p[i*4+3];
+    for(int i=16;i<64;i++)w[i]=w[i-16]+(ROR32(w[i-15],7)^ROR32(w[i-15],18)^(w[i-15]>>3))+w[i-7]+(ROR32(w[i-2],17)^ROR32(w[i-2],19)^(w[i-2]>>10));
+    memcpy(v,s->h,sizeof(v));
+    for(int i=0;i<64;i++){
+        uint32_t t1=v[7]+(ROR32(v[4],6)^ROR32(v[4],11)^ROR32(v[4],25))+((v[4]&v[5])^(~v[4]&v[6]))+sha_k[i]+w[i];
+        uint32_t t2=(ROR32(v[0],2)^ROR32(v[0],13)^ROR32(v[0],22))+((v[0]&v[1])^(v[0]&v[2])^(v[1]&v[2]));
+        v[7]=v[6];v[6]=v[5];v[5]=v[4];v[4]=v[3]+t1;v[3]=v[2];v[2]=v[1];v[1]=v[0];v[0]=t1+t2;
+    }
+    for(int i=0;i<8;i++)s->h[i]+=v[i];
+}
+static void sha_init(Sha256 *s) {
+    static const uint32_t iv[8]={0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19};
+    memcpy(s->h,iv,sizeof(iv));s->length=0;s->used=0;
+}
+static void sha_update(Sha256 *s,const unsigned char *p,size_t n) {
+    s->length+=n;
+    while(n){size_t take=64-s->used;if(take>n)take=n;memcpy(s->block+s->used,p,take);s->used+=take;p+=take;n-=take;if(s->used==64){sha_block(s,s->block);s->used=0;}}
+}
+static void sha_final(Sha256 *s,unsigned char out[32]) {
+    uint64_t bits=s->length*8;s->block[s->used++]=0x80;
+    if(s->used>56){memset(s->block+s->used,0,64-s->used);sha_block(s,s->block);s->used=0;}
+    memset(s->block+s->used,0,56-s->used);
+    for(int i=0;i<8;i++)s->block[56+i]=(unsigned char)(bits>>(56-8*i));
+    sha_block(s,s->block);
+    for(int i=0;i<8;i++){out[i*4]=(unsigned char)(s->h[i]>>24);out[i*4+1]=(unsigned char)(s->h[i]>>16);out[i*4+2]=(unsigned char)(s->h[i]>>8);out[i*4+3]=(unsigned char)s->h[i];}
+}
+/* Large buffers are static, not on the stack: the helper runs only on AE's script thread (setLabel checks it), and
+   a newer AE may run scripts on a small stack -- AE 2025 hung (25.6) or crashed (25.0) while the helper loaded. */
+static wchar_t module_path[32768];
+static UCHAR read_buffer[65536];
+static Sha256 module_sha;
+static int module_hash(HMODULE module,const char *expected,const char *label) {
+    char crumb[64];size_t base=strlen(label)+4;if(base>48)return 0;
+    strcpy(crumb,"hash");strcat(crumb,label);
+    wchar_t *path=module_path;if(!GetModuleFileNameW(module,path,32768))return 0;
+    strcpy(crumb+base,":open");step(crumb);
     HANDLE file=CreateFileW(path,GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,NULL,OPEN_EXISTING,0,NULL);
     if(file==INVALID_HANDLE_VALUE)return 0;
-    BCRYPT_ALG_HANDLE alg=NULL;BCRYPT_HASH_HANDLE hash=NULL;UCHAR digest[32],buffer[65536];DWORD read=0;int ok=0;
-    if(BCryptOpenAlgorithmProvider(&alg,BCRYPT_SHA256_ALGORITHM,NULL,0)<0)goto done;
-    if(BCryptCreateHash(alg,&hash,NULL,0,NULL,0,0)<0)goto done;
-    for(;;){if(!ReadFile(file,buffer,sizeof(buffer),&read,NULL))goto done;if(!read)break;if(BCryptHashData(hash,buffer,read,0)<0)goto done;}
-    if(BCryptFinishHash(hash,digest,32,0)<0)goto done;
+    strcpy(crumb+base,":read");step(crumb);
+    UCHAR digest[32];DWORD read=0;int ok=0;Sha256 *s=&module_sha;sha_init(s);
+    for(;;){if(!ReadFile(file,read_buffer,sizeof(read_buffer),&read,NULL))goto done;if(!read)break;sha_update(s,read_buffer,read);}
+    sha_final(s,digest);
     char hex[65];static const char digits[]="0123456789abcdef";
     for(int i=0;i<32;i++){hex[i*2]=digits[digest[i]>>4];hex[i*2+1]=digits[digest[i]&15];}hex[64]=0;ok=!strcmp(hex,expected);
 done:
-    if(hash)BCryptDestroyHash(hash);if(alg)BCryptCloseAlgorithmProvider(alg,0);CloseHandle(file);return ok;
+    CloseHandle(file);return ok;
 }
 static int profile(void) {
     HMODULE t=GetModuleHandleW(L"TDB.dll"),f=GetModuleHandleW(L"FLT.dll");
     if(!t||!f)return 0;
     for(unsigned i=0;i<sizeof(adapters)/sizeof(adapters[0]);i++)
-        if(module_hash(t,adapters[i].tdb)&&module_hash(f,adapters[i].flt)){adapter=&adapters[i];return 1;}
+        if(module_hash(t,adapters[i].tdb,"TDB")&&module_hash(f,adapters[i].flt,"FLT")){adapter=&adapters[i];return 1;}
     return 0;
 }
 API long ESGetVersion(void){return 1;}
-API char *ESInitialize(TaggedData *a,long count){(void)a;(void)count;script_thread=GetCurrentThreadId();profile_ok=profile();return "setLabel_sssss";}
+API char *ESInitialize(TaggedData *a,long count){
+    (void)a;(void)count;script_thread=GetCurrentThreadId();
+#ifdef AE_DYNAMIC
+    /* Loading does as little as possible: a dynamic adapter is set (and its modules hashed) by "configure";
+       the built-in builds use the v8 helper. */
+    profile_ok=0;
+#else
+    profile_ok=profile();
+#endif
+    return "setLabel_sssss";}
 API void ESTerminate(void){}
 API void ESFreeMem(void *p){free(p);}
 static int hexval(char c){if(c>='0'&&c<='9')return c-'0';if(c>='a'&&c<='f')return c-'a'+10;if(c>='A'&&c<='F')return c-'A'+10;return -1;}
@@ -101,10 +167,14 @@ static int configure(TaggedData *a) {
         if(i<6){if(*end!=',')return 0;pos=end+1;}else if(*end)return 0;
     }
     uintptr_t root=v[0],vector=v[1],map=v[2],named=v[3],parent_get=v[4],match_get=v[5],count_get=v[6];
-    if(vector<0x80||vector>0x800||vector%8||map!=vector+8||named>1)return 0;
+    if(vector<0x80||vector>0x800||vector%8||named>1)return 0;
+    if(named?map!=vector+8:(map%8||map<=vector||map>0x800))return 0;
     HMODULE f=GetModuleHandleW(L"FLT.dll"),t=GetModuleHandleW(L"TDB.dll"),u=GetModuleHandleW(L"U.dll");
-    if(strlen(a[1].data.string)!=64||strlen(a[2].data.string)!=64||strlen(a[4].data.string)!=64||
-        !module_hash(f,a[1].data.string)||!module_hash(t,a[2].data.string)||!module_hash(u,a[4].data.string)||!primary_root(f,root))return 0;
+    if(strlen(a[1].data.string)!=64||strlen(a[2].data.string)!=64||strlen(a[4].data.string)!=64)return 0;
+    step("hashFLT");if(!module_hash(f,a[1].data.string,"FLT"))return 0;
+    step("hashTDB");if(!module_hash(t,a[2].data.string,"TDB"))return 0;
+    step("hashU");if(!module_hash(u,a[4].data.string,"U"))return 0;
+    step("checks");if(!primary_root(f,root))return 0;
     if(!module_range(t,parent_get,5)||memcmp((void*)((uintptr_t)t+parent_get),"\x48\x8b\x41\x20\xc3",5)||
         !module_range(t,match_get,5)||memcmp((void*)((uintptr_t)t+match_get),"\x48\x8d\x41\x08\xc3",5))return 0;
     UCHAR *indexed=(UCHAR*)GetProcAddress(t,"?GetNumStreams@TDB_IndexedStreamGroup@@UEBAIXZ");
@@ -113,9 +183,9 @@ static int configure(TaggedData *a) {
     if(!module_range(t,count_get,named?19:7))return 0;
     UCHAR *count=(UCHAR*)((uintptr_t)t+count_get);
     if(named){if(memcmp(count,indexed,19))return 0;}
-    else if(memcmp(count,"\x8b\x81",2)||*(uint32_t*)(count+2)!=vector+16||count[6]!=0xc3)return 0;
-    int codec=codec_probe(u);if(!codec)return 0;
-    dynamic_adapter.root=root;dynamic_adapter.vector=vector;dynamic_adapter.named_vector=(int)named;dynamic_adapter.legacy=codec==2;
+    else if(memcmp(count,"\x8b\x81",2)||*(uint32_t*)(count+2)!=map+8||count[6]!=0xc3)return 0;
+    step("codecCall");int codec=codec_probe(u);step(codec?"codecReturned":"codecRefused");if(!codec)return 0;
+    dynamic_adapter.root=root;dynamic_adapter.vector=vector;dynamic_adapter.map=map;dynamic_adapter.named_vector=(int)named;dynamic_adapter.legacy=codec==2;
     adapter=&dynamic_adapter;profile_ok=1;return codec;
 }
 #endif
@@ -130,7 +200,7 @@ static int child_attached(uintptr_t parent,uintptr_t address,const UCHAR *guid) 
         if(end<begin||(end-begin)%8||end-begin>8192*8||!readable((void*)begin,end-begin))return 0;
         for(uintptr_t at=begin;at<end;at+=8)if(*(uintptr_t*)at==address)return 1;
     }else{
-        uintptr_t head=*(uintptr_t*)(parent+adapter->vector+8);
+        uintptr_t head=*(uintptr_t*)(parent+adapter->map);
         if(!readable((void*)head,40))return 0;
         uintptr_t node=*(uintptr_t*)head;
         for(unsigned i=0;node!=head&&i<8192;i++){

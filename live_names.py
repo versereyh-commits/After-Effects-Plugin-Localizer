@@ -8,7 +8,7 @@ import hashlib,json,os,struct,threading
 from win_process import Process
 from ae_ui import main_window
 from runtime import data_root,native_probe,file_version,write_json_atomic,unencodable,encoding_problem
-from ae_profiles import get_profile,supported_text,PROFILES,runtime_allowed
+from ae_profiles import get_profile,supported_text,PROFILES,runtime_allowed,nameless,match_encoding
 
 PROFILE_SHA='68b229950e95dedf630f5d09653715268e8beba4830590433abe7cb58e78a357'
 MANAGER_RVA=0x14dee0
@@ -120,7 +120,12 @@ class Registry:
         begin,end=struct.unpack('<QQ',self.p.read(self.manager+self.profile.registry_vector,16))
         if end<begin or (end-begin)%16 or not 1<=(end-begin)//16<32768:raise RuntimeError('AE 效果目录结构不符，未执行写入')
         vector=self.p.read(begin,end-begin)
-        return [self.read_record(address) for address in struct.unpack(f'<{len(vector)//8}Q',vector)[::2] if address]
+        rows=[self.read_record(address) for address in struct.unpack(f'<{len(vector)//8}Q',vector)[::2] if address]
+        # Effects AE reports without an internal name -- empty, or bytes this build cannot read (seen on AE 2021) --
+        # cannot be told apart, renamed or restored, so they are left out, untouched, and only listed in `unnamed`.
+        bare=[nameless(r['guard'][16:48],match_encoding(self.profile)) for r in rows]
+        self.unnamed=[r['displayName'] for r,b in zip(rows,bare) if b]
+        return [r for r,b in zip(rows,bare) if not b]
     def read_record(self,address):
         data=self.p.read(address,160)
         if struct.unpack_from('<Q',data)[0]!=self.base+self.profile.fc_vtable:raise RuntimeError('AE 效果目录对象类型不符，未执行写入')
@@ -128,7 +133,8 @@ class Registry:
         for start,end_field in ((16,64),(64,96),(96,160)):
             raw=data[start:end_field]
             if b'\0' not in raw:raise RuntimeError('AE 效果名称字段未终止，未执行写入')
-            fields.append(decode_name(raw,self.profile.encoding))
+            # The internal name is read the way AE reads it (see Profile.match_encoding), so keys match AE's own.
+            fields.append(decode_name(raw,match_encoding(self.profile) if start==64 else self.profile.encoding))
         return {'address':address,'displayName':fields[0],'matchName':fields[1],'category':fields[2],'guard':data[:16]+data[64:160]}
     def unchanged(self,row):
         # One catalog snapshot is taken before a batch; each object is then re-read just before its write.
@@ -169,9 +175,10 @@ def current_process(write=False,expected_image=None):
 
 def read_live(expected_image=None):
     with (current_process(expected_image=expected_image) if expected_image else current_process()) as p:
-        records=Registry(p).records()
+        registry=Registry(p);records=registry.records()
         profile=get_profile(file_version(Path(p.image)))
-        return {'pid':p.pid,'creationTime':p.creation_time,'image':p.image,'version':profile.version,'profileSha256':profile.flt_sha,'effects':[{k:v for k,v in r.items() if k not in ('address','guard')} for r in records]}
+        return {'pid':p.pid,'creationTime':p.creation_time,'image':p.image,'version':profile.version,'profileSha256':profile.flt_sha,'effects':[{k:v for k,v in r.items() if k not in ('address','guard')} for r in records],
+                'unnamedEffects':list(getattr(registry,'unnamed',[]))}
 
 class NameSession:
     def __init__(self):self.journal_path=data_root()/'live-session.json';self.expected_image=None

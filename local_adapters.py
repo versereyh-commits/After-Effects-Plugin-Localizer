@@ -41,11 +41,11 @@ def load_validated(exe,root=None):
         record=json.loads(_crypt(base64.b64decode(envelope['protected'],validate=True),True).decode('utf8'))
         if record.get('schemaVersion')!=1 or record.get('pendingRestores')!=0 or not validation_complete(record.get('checks',{}),record.get('native',{})):raise ValueError('本机证书缺少完整验收')
         data=record['profile'];data['count_bytes']=bytes.fromhex(data['count_bytes']);stored=Profile(**data)
-        if stored.version!=resolver.version or stored.encoding not in ('utf8','mbcs') or type(stored.registry_vector) is not int or stored.registry_vector not in range(0,129,8):raise ValueError('本机证书目标不匹配')
-        if stored.encoding=='mbcs' and record.get('codepage')!=ctypes.windll.kernel32.GetACP():raise ValueError('系统编码发生变化，请重新验证')
+        if stored.version!=resolver.version or stored.encoding not in ('utf8','mbcs') or stored.match_encoding not in ('','utf8','mbcs') or type(stored.registry_vector) is not int or stored.registry_vector not in range(0,129,8):raise ValueError('本机证书目标不匹配')
+        if 'mbcs' in (stored.encoding,stored.match_encoding) and record.get('codepage')!=ctypes.windll.kernel32.GetACP():raise ValueError('系统编码发生变化，请重新验证')
         fresh=resolver.complete_static(stored.host_version)
         for key,value in asdict(fresh).items():
-            if key not in ('registry_vector','encoding','enabled') and getattr(stored,key)!=value:raise ValueError('本机证书与重新解析的结构不符：'+key)
+            if key not in ('registry_vector','encoding','match_encoding','enabled') and getattr(stored,key)!=value:raise ValueError('本机证书与重新解析的结构不符：'+key)
         if not stored.enabled or not stored.native_dynamic:raise ValueError('本机证书未启用')
         if stored.version not in PROFILES:LOCAL_PROFILES[stored.version]=stored
         return stored

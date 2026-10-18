@@ -35,6 +35,11 @@ class Profile:
     named_map:int=0x228
     codec_sha:str=''
     native_dynamic:bool=False
+    # How AE reads the internal-name field, when that differs from the names: AE 2021 (18.0) reads names as UTF-8
+    # but internal names in the system code page. '' means the same as `encoding`.
+    match_encoding:str=''
+
+def match_encoding(profile)->str:return getattr(profile,'match_encoding','') or profile.encoding
 
 PROFILES={
     '26.0.0.67':Profile('26.0.0.67','26.0x67',
@@ -83,5 +88,14 @@ def is_supported(version):
 def runtime_allowed(version):
     trial=_trial.get()
     return bool(trial and trial[0].version==version) or is_supported(version)
+
+def nameless(raw:bytes,encoding:str)->bool:
+    """Whether AE reports this internal-name field to scripts as '': empty, or bytes `encoding` cannot read.
+    (On AE 2021 seven effects came back from app.effects with an empty matchName while memory held non-empty
+    bytes for each.) Such an effect cannot be identified, so it is never renamed or restored."""
+    raw=raw.split(b'\0',1)[0]
+    if not raw:return True
+    try:raw.decode(encoding);return False
+    except UnicodeDecodeError:return True
 
 def supported_text():return '、'.join([*(p.version for p in PROFILES.values() if p.enabled),*(p.version+'（本机验证）' for key,p in LOCAL_PROFILES.items() if p.enabled and key not in PROFILES)])

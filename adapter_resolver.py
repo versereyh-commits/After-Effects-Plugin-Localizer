@@ -7,7 +7,7 @@ from pathlib import Path
 import hashlib,struct
 import capstone
 from adapter_analysis import ModuleTools
-from ae_profiles import Profile
+from ae_profiles import Profile,nameless
 
 def unique(values,label):
     values=set(values)
@@ -105,7 +105,10 @@ class Resolver(ModuleTools):
             named=True;count_bytes=raw[:14];named_map=fields['group_vector']+8
         elif raw[:2]==bytes.fromhex('8b81') and raw[6]==0xc3:
             named=False;count_bytes=raw[:7];named_map=struct.unpack_from('<I',raw,2)[0]-8
-            if named_map!=fields['group_vector']+8:raise ValueError('命名参数映射与索引容器不一致')
+            # The named group's stream list (head, then its size, which the count getter reads). Up to 26.0 it sat
+            # right after the indexed vector's begin (group_vector+8); AE 26.5 moved it further down. Its place is
+            # taken from the getter's own instruction; the self-check then walks every real parameter tree with it.
+            if named_map%8 or not fields['group_vector']<named_map<=0x800:raise ValueError('命名参数映射位置不合理（%#x）'%named_map)
         else:raise ValueError('尚未识别命名参数容器')
         codec=self.exe.parent/'U.dll'
         if codec.is_symlink() or not codec.is_file():raise ValueError('名称编码模块缺失或是链接')
@@ -135,18 +138,18 @@ class CatalogMismatch(ValueError):
 FIELD_LABELS={'displayName':'显示名称','matchName':'内部标识','category':'分类'}
 EXAMPLES=20
 
-def _differences(rows,expected,encoding):
-    """How the memory rows differ from the host catalog when read in `encoding` (every difference counted,
-    the first EXAMPLES kept)."""
-    count=0;examples=[];seen=set()
+def _differences(rows,expected,encoding,key_encoding=None):
+    """How the memory rows differ from the host catalog when names are read in `encoding` and internal names in
+    `key_encoding` (default: the same); every difference counted, the first EXAMPLES kept."""
+    count=0;examples=[];seen=set();key_encoding=key_encoding or encoding
     def note(item):
         nonlocal count
         count+=1
         if len(examples)<EXAMPLES:examples.append(item)
     for name,key,category in rows:
-        keys=[k for k in _readings(key,encoding) if k in expected]
+        keys=[k for k in _readings(key,key_encoding) if k in expected]
         if len(keys)!=1 or keys[0] in seen:
-            note({'field':'matchName','memoryHex':key.split(b'\0',1)[0].hex(),'memoryText':sorted(_readings(key,encoding))});continue
+            note({'field':'matchName','memoryHex':key.split(b'\0',1)[0].hex(),'memoryText':sorted(_readings(key,key_encoding))});continue
         seen.add(keys[0]);shown,group=expected[keys[0]]
         for field,raw,want in (('displayName',name,shown),('category',category,group)):
             if want not in _readings(raw,encoding):
@@ -161,9 +164,12 @@ def _host_entries(host_catalog):
     MediaCore, or an old and a new version). Copies that agree are one effect and are compared once; the memory
     vector must still hold each matchName exactly once. Copies whose names differ leave no single truth to compare
     against, so the check stops and names them."""
-    expected={};variants={};times={}
+    expected={};variants={};times={};unnamed=[]
     for row in host_catalog:
         key=row['matchName'];value=(row['displayName'],row['category'])
+        # An effect a plugin registered without an internal name (AE reports ''): nothing to compare it by.
+        # It is counted, not compared; the memory vector must hold exactly as many unnamed entries.
+        if not key:unnamed.append(row['displayName']);continue
         times[key]=times.get(key,0)+1;variants.setdefault(key,[])
         if value not in variants[key]:variants[key].append(value)
         expected.setdefault(key,value)
@@ -173,54 +179,77 @@ def _host_entries(host_catalog):
         first=conflicts[0];shown=' / '.join(v['displayName'] for v in first['names'][:3])
         raise CatalogMismatch(f'AE 效果列表里有 {len(conflicts)} 个内部标识对应不同的名称（例如 {first["matchName"]}：{shown}），'
                               '可能同一插件的不同版本装了两份；请删掉多余的一份并重启 AE 后重试',
-                              {'hostCount':len(expected),'hostRows':len(host_catalog),'duplicates':duplicates[:EXAMPLES],'conflicts':len(conflicts)})
-    return expected,duplicates[:EXAMPLES]
+                              {'hostCount':len(expected),'hostRows':len(host_catalog),'duplicates':duplicates[:EXAMPLES],'conflicts':len(conflicts),'unnamed':unnamed[:EXAMPLES]})
+    return expected,duplicates[:EXAMPLES],unnamed
 
-def registry_offset(process,profile,host_catalog):
-    """Read-only exhaustive cross-check of a small bounded manager header. When no vector matches, raises
+# (names, internal names): the same encoding for both, or -- as AE 2021 (18.0) does -- names in UTF-8 and internal
+# names in the system code page (its scripting showed UTF-8 Chinese internal names decoded as GBK, and ''
+# where GBK could not decode them).
+READINGS=(('utf8','utf8'),('mbcs','mbcs'),('utf8','mbcs'))
+
+def registry_offset(process,profile,host_catalog):return registry_layout(process,profile,host_catalog)['offset']
+
+def registry_layout(process,profile,host_catalog):
+    """Read-only exhaustive cross-check of a small bounded manager header: the one vector holding AE's catalog,
+    and how AE reads internal names ({'offset', 'matchEncoding'}). When no vector matches, raises
     CatalogMismatch telling how the closest ones differed, so a failure on someone else's AE can be read."""
     base=next(m['base'] for m in process.modules() if m['name'].casefold()=='flt.dll');manager=process.u64(base+profile.manager)
-    expected,duplicates=_host_entries(host_catalog)
-    if not 1<len(expected)<32768:raise CatalogMismatch(f'AE 报告的效果数量异常（{len(expected)} 个），不能作为对照',{'hostCount':len(expected),'hostRows':len(host_catalog)})
+    expected,duplicates,unnamed=_host_entries(host_catalog)
+    unnamed_rows=[(row['displayName'],row['category']) for row in host_catalog if not row['matchName']]
+    if not 1<len(expected)<32768:raise CatalogMismatch(f'AE 报告的效果数量异常（{len(expected)} 个），不能作为对照',{'hostCount':len(expected),'hostRows':len(host_catalog),'unnamed':unnamed[:EXAMPLES]})
+    total=len(expected)+len(unnamed)
     matches=[];vectors=[];candidates=[]
     for offset in range(0,129,8):
         try:begin,end=struct.unpack('<QQ',process.read(manager+offset,16))
         except (RuntimeError,OSError,struct.error):continue
         if begin<end and (end-begin)%16==0 and (end-begin)//16<32768:vectors.append({'offset':offset,'count':(end-begin)//16})
-        if end-begin!=len(expected)*16:continue
+        if end-begin!=total*16:continue
         candidate={'offset':offset};candidates.append(candidate)
         try:
-            values=struct.unpack('<'+'Q'*(len(expected)*2),process.read(begin,end-begin));rows=[];keys=set()
+            values=struct.unpack('<'+'Q'*(total*2),process.read(begin,end-begin));rows=[];keys=set()
             for index,address in enumerate(values[::2]):
                 raw=process.read(address,160)
                 if struct.unpack_from('<Q',raw)[0]!=base+profile.fc_vtable:raise ValueError(f'第 {index+1} 项对象类型不符')
                 fields=(raw[16:64],raw[64:96],raw[96:160])
                 for label,field in zip(('displayName','matchName','category'),fields):
                     if b'\0' not in field:raise ValueError(f'第 {index+1} 项{FIELD_LABELS[label]}没有结尾符（{field.hex()}）')
-                if fields[1] in keys:raise ValueError(f'第 {index+1} 项内部标识重复（{fields[1].split(bytes(1),1)[0].hex()}）')
+                if fields[1].split(b'\0',1)[0] and fields[1] in keys:raise ValueError(f'第 {index+1} 项内部标识重复（{fields[1].split(bytes(1),1)[0].hex()}）')
                 keys.add(fields[1]);rows.append(fields)
         except (ValueError,RuntimeError,OSError,struct.error) as error:
             candidate['problem']=str(error) or type(error).__name__;continue
-        for encoding in ('utf8','mbcs'):
-            # Every object must be one host row, each field the host's exact reading of its bytes.
-            count,examples=_differences(rows,expected,encoding)
-            candidate[encoding]={'differences':count,'examples':examples}
-            if not count:matches.append(offset);break
-    if len(matches)==1:return matches[0]
-    details={'hostCount':len(expected),'hostRows':len(host_catalog),'duplicates':duplicates,'vectors':vectors,'candidates':candidates}
+        for encoding,key_encoding in READINGS:
+            # Entries AE reports without an internal name (empty, or bytes AE cannot read: it returns '' for those)
+            # pair one to one with AE's nameless rows by exact name and category; every other object must be one
+            # host row, each field the host's exact reading of its bytes. One reading holds for the whole catalog.
+            named=[r for r in rows if not nameless(r[1],key_encoding)];bare=[r for r in rows if nameless(r[1],key_encoding)]
+            count,examples=_differences(named,expected,encoding,key_encoding)
+            left=list(unnamed_rows)
+            for name,key,category in bare:
+                pair=next((u for u in left if u[0] in _readings(name,encoding) and u[1] in _readings(category,encoding)),None)
+                if pair:left.remove(pair);continue
+                count+=1
+                if len(examples)<EXAMPLES:examples.append({'field':'unnamed','matchNameHex':key.split(b'\0',1)[0].hex(),'memoryText':sorted(_readings(name,encoding))})
+            count+=len(left);examples+=[{'field':'unnamedMissing','host':u[0]} for u in left][:max(0,EXAMPLES-len(examples))]
+            label=encoding if encoding==key_encoding else f'{encoding}+{key_encoding}'
+            candidate[label]={'differences':count,'examples':examples,'unnamedInMemory':len(bare)}
+            # '' when internal names read like the names: the profile then follows the encoding the helper detects.
+            if not count:matches.append((offset,'' if key_encoding==encoding else key_encoding));break
+    if len(matches)==1:return {'offset':matches[0][0],'matchEncoding':matches[0][1]}
+    details={'hostCount':len(expected),'hostRows':len(host_catalog),'duplicates':duplicates,'unnamedCount':len(unnamed),'unnamed':unnamed[:EXAMPLES],'vectors':vectors,'candidates':candidates}
     twice=f'；AE 列表里有 {len(duplicates)} 个效果重复出现（例如 {duplicates[0]["matchName"]}），可能同一插件装了两份，已按一份对比' if duplicates else ''
     if matches:raise CatalogMismatch(f'完整效果目录向量未找到唯一证据（{len(matches)} 处都与 AE 目录一致{twice}）',details)
     raise CatalogMismatch('完整效果目录向量未找到唯一证据（'+_summary(details)+twice+'）',details)
 
 def _summary(details)->str:
     """One line on the closest candidate, for the error shown to the user."""
-    total=details['hostCount'];candidates=details['candidates']
+    total=details['hostCount']+details.get('unnamedCount',0);candidates=details['candidates']
     if not candidates:
         counts='、'.join(str(v['count']) for v in details['vectors'][:6]) or '无'
         return f'AE 报告 {total} 个效果，内存里没有数量相同的目录；找到的目录数量：{counts}'
     readable=[c for c in candidates if 'problem' not in c]
     if not readable:return f'AE 报告 {total} 个效果；数量相同的目录读取时{candidates[0]["problem"]}'
-    best=min(((c[e]['differences'],e,c) for c in readable for e in ('utf8','mbcs') if e in c),key=lambda x:x[0])
+    labels=[a if a==b else f'{a}+{b}' for a,b in READINGS]
+    best=min(((c[e]['differences'],e,c) for c in readable for e in labels if e in c),key=lambda x:x[0])
     count,encoding,candidate=best;first=candidate[encoding]['examples'][0] if candidate[encoding]['examples'] else {}
     where=f"，例如 {first.get('matchName') or first.get('memoryHex','?')} 的{FIELD_LABELS.get(first.get('field'),'条目')}" if first else ''
     return f'AE 报告 {total} 个效果，最接近的目录有 {count} 项不一致{where}'

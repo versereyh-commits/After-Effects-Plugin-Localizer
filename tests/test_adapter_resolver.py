@@ -1,8 +1,11 @@
-import json,struct
+import json,struct,unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 import test_adapter_analysis as fixtures
 from adapter_resolver import Resolver,registry_offset
+def _decodes(raw,encoding):
+    try:raw.decode(encoding);return True
+    except UnicodeDecodeError:return False
 
 class ResolverTests(fixtures.AnalysisTests):
     # Inherit the isolated PE fixture, not the existing fixture's test cases.
@@ -37,6 +40,28 @@ class ResolverTests(fixtures.AnalysisTests):
     def test_ambiguous_primary_vtables_stop_resolution(self):
         self.rtti();self.put('FLT.dll',864,struct.pack('<QQ',0x140001100,0x140001000))
         with self.assertRaises(ValueError):self.resolver.primary_vtable('.?AVFLT_FCSeqSpec@@')
+
+class NamedListPlacementTests(unittest.TestCase):
+    """Where the named group's stream list sits comes from the count getter's instruction (AE 26.5 moved it)."""
+    def resolver(self,count_instruction):
+        import tempfile
+        from pathlib import Path
+        folder=tempfile.TemporaryDirectory();self.addCleanup(folder.cleanup);(Path(folder.name)/'U.dll').write_bytes(b'u')
+        fields=dict(name_get=1,match_get=2,category_get=3,parent_get=4,stream_match_get=5,count_get=0x500,display_get=6,group_vector=0x220,
+                    name_offset=16,match_offset=64,category_offset=96,parent_offset=32,guid_offset=8)
+        r=Resolver.__new__(Resolver)
+        r.getters=lambda:[{'field':k,'value':v} for k,v in fields.items()];r.span=lambda module,rva,size,code=False:count_instruction.ljust(size,b'\xcc')
+        r.exe=Path(folder.name)/'AfterFX.exe';r.modules={'FLT.dll':{'sha256':'f'},'TDB.dll':{'sha256':'t'}};r.version='26.5.0.89'
+        r.manager=lambda:0x100;r.primary_vtable=lambda name:0x200;r.match_pool=lambda:0x300;r.display_cache=lambda entry:0x88
+        return r
+    def test_list_right_after_the_vector_as_up_to_26_0(self):
+        self.assertEqual(self.resolver(bytes.fromhex('8b8130020000c3')).complete_static('').named_map,0x228)
+    def test_list_moved_further_down_as_in_26_5(self):
+        profile=self.resolver(bytes.fromhex('8b8140020000c3')).complete_static('')
+        self.assertEqual((profile.named_map,profile.named_vector,profile.count_bytes),(0x238,False,bytes.fromhex('8b8140020000c3')))
+    def test_implausible_places_are_refused(self):
+        for raw in ('8b8124020000c3','8b8128020000c3','8b8110090000c3'):   # misaligned, inside the vector, too far
+            with self.assertRaisesRegex(ValueError,'命名参数映射位置不合理'):self.resolver(bytes.fromhex(raw)).complete_static('')
 
 # Avoid repeating the base class tests through inheritance during discovery.
 for _name in list(fixtures.AnalysisTests.__dict__):
@@ -108,6 +133,43 @@ class RegistryOffsetTests(fixtures.AnalysisTests):
         with self.assertRaisesRegex(CatalogMismatch,'1 个内部标识对应不同的名称（例如 B：Beta / Beta 2）.*删掉多余的一份') as caught:
             registry_offset(self.process,self.profile,self.host)
         self.assertEqual(caught.exception.details['conflicts'],1)
+    def add_unnamed(self,at=0x400200,name='渐变色调',key=b''):
+        # An effect AE lists with matchName '': empty in memory, or bytes this build cannot read.
+        data=bytearray(160);struct.pack_into('<Q',data,0,0x100200);raw=name.encode();data[16:16+len(raw)]=raw;data[64:64+len(key)]=key;data[96:100]=b'Test';self.memory[at]=bytes(data)
+        self.memory[0x300000]+=struct.pack('<QQ',at,0);self.memory[0x200020]=struct.pack('<QQ',0x300000,0x300000+16*(len(self.memory[0x300000])//16))
+        self.host.append({'matchName':'','displayName':name,'category':'Test'})
+    def test_effects_without_an_internal_name_are_counted_not_compared(self):
+        self.add_unnamed();self.add_unnamed(0x400300,'聚光灯');self.add_unnamed(0x400400,'稳定器')
+        self.assertEqual(registry_offset(self.process,self.profile,self.host),32)
+    def test_unreadable_internal_names_pair_with_what_ae_reports_as_empty(self):
+        # Memory holds bytes AE 2021 could not read (it reported ''): paired with AE's nameless rows by exact name.
+        gbk='渐变'.encode('gbk')+b'\xff'
+        self.add_unnamed(key=gbk);self.add_unnamed(0x400300,'聚光灯',key=b'\xfe\xfe')
+        self.assertEqual(registry_offset(self.process,self.profile,self.host),32)
+    def test_unnamed_pairing_is_exact(self):
+        from adapter_resolver import CatalogMismatch
+        self.add_unnamed(key=b'\xff\xfe');self.host[-1]['displayName']='别的名字'
+        with self.assertRaises(CatalogMismatch) as caught:registry_offset(self.process,self.profile,self.host)
+        utf8=caught.exception.details['candidates'][0]['utf8']
+        self.assertEqual((utf8['unnamedInMemory'],[e['field'] for e in utf8['examples']]),(1,['unnamed','unnamedMissing']))
+        self.assertEqual(utf8['examples'][0]['matchNameHex'],'fffe')
+    def test_internal_names_read_in_the_system_code_page_as_ae_2021_does(self):
+        # AE 2021 (18.0): names in UTF-8, internal names in the system code page -- the UTF-8 Chinese internal name
+        # of a localized plugin comes back from scripts as GBK mojibake, and as '' where GBK cannot decode it.
+        from adapter_resolver import registry_layout
+        key='B双色'.encode('utf8');self.rename(0x400100,key=key);self.host[1]['matchName']=key.decode('mbcs')
+        bad=next(t.encode('utf8') for t in ('渐变色调','聚光灯','稳定器','选择色调','油','画中画') if not _decodes(t.encode('utf8'),'mbcs'))
+        self.add_unnamed(key=b'NWBL '+bad)
+        self.assertEqual(registry_layout(self.process,self.profile,self.host),{'offset':32,'matchEncoding':'mbcs'})
+    def test_ordinary_catalogs_keep_one_encoding(self):
+        from adapter_resolver import registry_layout
+        self.assertEqual(registry_layout(self.process,self.profile,self.host),{'offset':32,'matchEncoding':''})
+    def test_unnamed_entries_must_match_in_number(self):
+        from adapter_resolver import CatalogMismatch
+        self.add_unnamed();self.host.append({'matchName':'','displayName':'聚光灯','category':'Test'})
+        with self.assertRaises(CatalogMismatch) as caught:registry_offset(self.process,self.profile,self.host)
+        self.assertEqual((caught.exception.details['unnamedCount'],caught.exception.details['unnamed']),(2,['渐变色调','聚光灯']))
+        self.assertIn('AE 报告 4 个效果',str(caught.exception))
     def test_too_few_effects_is_a_diagnosed_mismatch(self):
         from adapter_resolver import CatalogMismatch
         with self.assertRaisesRegex(CatalogMismatch,'效果数量异常（1 个）'):registry_offset(self.process,self.profile,self.host[:1])

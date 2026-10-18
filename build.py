@@ -10,12 +10,26 @@ native_source=root/"native"/"ae_probe.c";native_dll=root/"native"/"ae_probe.dll"
 parameter_source=root/"native"/"ae_parameters.c";parameter_dll=root/"native"/"ae_parameters_v8.dll"
 dynamic_dll=root/"native"/"ae_parameters_v9.dll"
 scan_source=root/"native"/"ae_scan.c";scan_dll=root/"native"/"ae_scan_v1.dll"
+import os,time
+# A helper an AE run from the source tree still has loaded cannot be overwritten, but Windows lets a loaded DLL be
+# renamed: the new build goes to a temporary file, the loaded one is moved aside (AE keeps using it until it
+# restarts) and the new one takes its name. Set-aside copies are removed once nothing holds them any more.
+for stale in (root/"native").glob("*.locked-*.dll"):
+    try:stale.unlink()
+    except OSError:pass
+def compile_dll(target,args):
+    fresh=target.with_name(target.stem+".new.dll")
+    subprocess.run([sys.executable,"-m","ziglang","cc",*args,"-o",str(fresh)],check=True,cwd=root)
+    try:os.replace(fresh,target)
+    except PermissionError:
+        os.replace(target,target.with_name(f"{target.stem}.locked-{time.strftime('%Y%m%d%H%M%S')}.dll"));os.replace(fresh,target)
+        print(f"{target.name} 正被 AE 加载，已改名保留旧文件，新文件已就位（AE 重启后生效）")
 if not scan_dll.exists() or scan_dll.stat().st_mtime<scan_source.stat().st_mtime:
-    subprocess.run([sys.executable,"-m","ziglang","cc","-shared","-O3","-std=c11",str(scan_source),"-o",str(scan_dll)],check=True,cwd=root)
+    compile_dll(scan_dll,["-shared","-O3","-std=c11",str(scan_source)])
 if not dynamic_dll.exists() or dynamic_dll.stat().st_mtime<parameter_source.stat().st_mtime:
-    subprocess.run([sys.executable,"-m","ziglang","cc","-shared","-O2","-std=c11","-DAE_DYNAMIC=1",str(parameter_source),"-o",str(dynamic_dll),"-lbcrypt"],check=True,cwd=root)
+    compile_dll(dynamic_dll,["-shared","-O2","-std=c11","-DAE_DYNAMIC=1",str(parameter_source),"-lbcrypt"])
 if not parameter_dll.exists() or parameter_dll.stat().st_mtime<parameter_source.stat().st_mtime:
-    subprocess.run([sys.executable,"-m","ziglang","cc","-shared","-O2","-std=c11",str(parameter_source),"-o",str(parameter_dll),"-lbcrypt"],check=True,cwd=root)
+    compile_dll(parameter_dll,["-shared","-O2","-std=c11",str(parameter_source),"-lbcrypt"])
 # Retain the preceding helpers for existing portable sessions. Never rewrite
 # an old DLL that AE may still have loaded; current calls use v8/v9.
 import shutil
@@ -23,7 +37,7 @@ legacy_parameter=root/'native'/'ae_parameters_v6.dll';legacy_dynamic=root/'nativ
 for current,legacy in ((parameter_dll,legacy_parameter),(dynamic_dll,legacy_dynamic)):
     if not legacy.exists():shutil.copy2(current,legacy)
 if not native_dll.exists() or native_dll.stat().st_mtime<native_source.stat().st_mtime or "--native-only" in sys.argv:
-    subprocess.run([sys.executable,"-m","ziglang","cc","-shared","-O2","-std=c11",str(native_source),"-o",str(native_dll),"-lpsapi","-lversion"],check=True,cwd=root)
+    compile_dll(native_dll,["-shared","-O2","-std=c11",str(native_source),"-lpsapi","-lversion"])
 def sign_bridge():
     """The background CEP extension (cep/ plus scripts/parameter_bridge.jsx), signed for AE with Adobe's ZXPSignCmd
     (set ZXPSIGNCMD, or put it at build/tools/zxpsign/ZXPSignCmd.exe) and a self-signed certificate kept in

@@ -3,7 +3,7 @@ from dataclasses import replace
 from pathlib import Path
 import json,shutil,uuid,threading
 from ae_profiles import trial_adapter
-from adapter_resolver import CatalogMismatch,Resolver,registry_offset
+from adapter_resolver import CatalogMismatch,Resolver,registry_layout
 from adapter_host import HostBridge
 from parameter_names import bridge_root,ParameterSession,ParameterCatalog,identity,_host_names,run_native
 from live_names import NameSession,read_live,_save
@@ -64,9 +64,10 @@ class ValidationRun:
             if status.get('project') or status.get('items'):raise RuntimeError('请先自行保存并关闭当前工程，使所选 AE 保持空工程')
             profile=resolver.complete_static(status['hostVersion']);host=self.bridge.call('catalog')['effects']
             with self.bridge.process() as p:
-                try:offset=registry_offset(p,profile,host)
+                try:layout=registry_layout(p,profile,host)
                 except CatalogMismatch as error:raise RuntimeError(str(error)+self._catalog_diagnostic(error.details)) from None
-            self.profile=replace(profile,registry_vector=offset)
+            # How AE reads internal names is kept with the profile (AE 2021: system code page, unlike its names).
+            self.profile=replace(profile,registry_vector=layout['offset'],match_encoding=layout['matchEncoding'])
             resolver.verify_files()
         finally:resolver.close()
         self.notify(progress,'创建软件自有 QA 工程……')
@@ -82,7 +83,8 @@ class ValidationRun:
                 if problem:raise RuntimeError(problem)
             with trial_adapter(self.profile,self.projects):
                 self.bridge.assert_owned();live=read_live(expected_image=self.exe)['effects'];host=self.bridge.call('catalog')['effects']
-                mapping=lambda rows:{r['matchName']:(r['displayName'],r['category']) for r in rows}
+                # Effects without an internal name are left out of the live read, so they are left out here too.
+                mapping=lambda rows:{r['matchName']:(r['displayName'],r['category']) for r in rows if r['matchName']}
                 self.check('catalogMatches',mapping(live)==mapping(host))
                 self.before=self.bridge.call('snapshot')['rows']
                 self.notify(progress,'核对参数标识池与当前参数树……')
@@ -210,9 +212,9 @@ def recover_pending(exe):
         try:
             fresh=resolver.complete_static(profile.host_version)
             for key,value in profile_data(fresh).items():
-                if key not in ('registry_vector','encoding','enabled') and profile_data(profile)[key]!=value:raise RuntimeError('恢复配置与模块不匹配，已保留记录')
+                if key not in ('registry_vector','encoding','match_encoding','enabled') and profile_data(profile)[key]!=value:raise RuntimeError('恢复配置与模块不匹配，已保留记录')
         finally:resolver.close()
-        if profile.encoding not in ('utf8','mbcs') or type(profile.registry_vector) is not int or profile.registry_vector not in range(0,129,8):raise RuntimeError('恢复配置字段不符')
+        if profile.encoding not in ('utf8','mbcs') or profile.match_encoding not in ('','utf8','mbcs') or type(profile.registry_vector) is not int or profile.registry_vector not in range(0,129,8):raise RuntimeError('恢复配置字段不符')
         identity=data.get('identity')
         if not isinstance(identity,list) or len(identity)!=2 or not all(type(i) is int and i>0 for i in identity):raise RuntimeError('恢复会话身份损坏')
         run=ValidationRun.__new__(ValidationRun);run.exe=Path(exe);run.folder=folder;run.report=None;run.profile=profile;run.bridge=HostBridge(exe,folder);run.bridge.identity=tuple(identity);run.bridge.host_version=profile.host_version

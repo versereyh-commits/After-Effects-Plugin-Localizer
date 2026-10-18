@@ -180,14 +180,16 @@ class TransportTests(unittest.TestCase):
 
 class TimeoutDiagnosticTests(unittest.TestCase):
     """A request AE never answers says why as far as can be told, and leaves a diagnostic file (no paths)."""
-    def run_timeout(self,poll=lambda:0,enter=False,mismatch='',bridge=False):
+    def run_timeout(self,poll=lambda:0,enter=False,mismatch='',bridge=False,native=None):
         import ae_ui,win_process
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup);root=Path(self.tmp.name)
         (root/'native').mkdir();(root/'native'/'ae_parameters_v8.dll').touch();(root/'scripts').mkdir()
         (root/'scripts'/'parameter_bridge.jsx').write_text('var request=@@REQUEST@@,result=0;',encoding='utf8')
         stopped=[]
+        (root/'temp').mkdir()
         def launch(args,**kwargs):
             if enter:(Path(args[-1]).parent/names.STARTED).write_text(enter if isinstance(enter,str) else 'start',encoding='ascii')   # AE entered the script, then stalled
+            if native:(root/'temp'/names.NATIVE_STEP).write_text(native,encoding='ascii')   # the helper's own breadcrumb
             return SimpleNamespace(pid=8,poll=poll,terminate=lambda:stopped.append(8),wait=lambda timeout:0)
         class Keeper:
             def __init__(self,pid):pass
@@ -196,7 +198,8 @@ class TimeoutDiagnosticTests(unittest.TestCase):
         patches=[patch.object(names,'asset_root',lambda:root),patch.object(names,'bridge_root',lambda:root/'ipc'),patch.object(names.subprocess,'Popen',launch),
                  patch.object(names,'file_version',return_value='26.0.0.67'),patch.object(ae_ui,'WindowKeeper',Keeper),patch.object(cep_bridge,'_appdata',lambda:root/'appdata'),
                  patch.object(win_process,'elevation_mismatch',return_value=mismatch),patch.object(win_process,'elevated',return_value=False),
-                 patch.object(cep_bridge,'connected',return_value=bridge),patch.object(cep_bridge,'withdraw',return_value=False),patch.object(cep_bridge,'CLAIM_WAIT',.05)]
+                 patch.object(cep_bridge,'connected',return_value=bridge),patch.object(cep_bridge,'withdraw',return_value=False),patch.object(cep_bridge,'CLAIM_WAIT',.05),
+                 patch.dict(os.environ,{'TEMP':str(root/'temp')})]
         for handle in patches:handle.start();self.addCleanup(handle.stop)
         with self.assertRaises(TimeoutError) as caught:names.run_native(SimpleNamespace(pid=3,image='AfterFX.exe'),[],timeout=.3,action='selection',scope='selected')
         message=str(caught.exception);path=Path(message.split('诊断记录：',1)[1]);details=json.loads(path.read_text(encoding='utf-8'))
@@ -222,6 +225,21 @@ class TimeoutDiagnosticTests(unittest.TestCase):
         self.assertIn('停在“核对 AE 模块与名称编码”这一步：这个 AE 版本可能与参数辅助模块不兼容',message)
         message,details,_=self.run_timeout(enter='odd stage <x>')   # anything unexpected is not echoed into the diagnostic
         self.assertIn('“未知步骤”',message);self.assertEqual(details['lastStage'],'other')
+    def test_the_helpers_own_step_is_named_inside_configure(self):
+        message,details,_=self.run_timeout(enter='configure',native='codecCall')
+        self.assertIn('停在“核对 AE 模块与名称编码（辅助模块停在：调用 AE 的名称编码转换函数）”这一步：AE 的编码转换函数没有返回',message)
+        self.assertEqual(details['nativeStep'],'codecCall')
+        message,details,_=self.run_timeout(enter='configure',native='hashFLT:read')
+        self.assertIn('辅助模块停在：读取 FLT.dll 计算哈希（读取文件内容））”这一步：读取 AE 自身模块文件时没有返回',message);self.assertEqual(details['nativeStep'],'hashFLT:read')
+        message,details,_=self.run_timeout(enter='configure',native='hashFLT:other')
+        self.assertIsNone(details['nativeStep'])
+        message,details,_=self.run_timeout(enter='configure',native='not a step <x>')
+        self.assertNotIn('辅助模块停在',message);self.assertIsNone(details['nativeStep'])
+        message,details,_=self.run_timeout(enter='collect',native='hashFLT')   # only read inside configure
+        self.assertIsNone(details['nativeStep'])
+    def test_native_steps_match_the_helper(self):
+        source=(Path(names.__file__).parent/'native'/'ae_parameters.c').read_text(encoding='utf8')
+        self.assertEqual(set(re.findall(r'step\("(\w+)"\)',source))|set(re.findall(r'"(codec\w+)"',source)),set(names.NATIVE_STEPS))
     def test_the_bridge_script_marks_each_step(self):
         source=(Path(names.__file__).parent/'scripts'/'parameter_bridge.jsx').read_text(encoding='utf8')
         marked=set(re.findall(r"stage\('(\w+)'\)",source))
@@ -232,6 +250,16 @@ class TimeoutDiagnosticTests(unittest.TestCase):
     def test_extension_took_the_request(self):
         message,details,_=self.run_timeout(bridge=True)
         self.assertIn('后台扩展已接收请求',message);self.assertEqual((details['route'],details['relayLaunched']),('extension',False))
+
+class UnnamedEffectParameterTests(unittest.TestCase):
+    def test_parameters_of_effects_without_an_internal_name_are_left_out(self):
+        key=names.identity('CC Drizzle','CC Drizzle-0001')
+        rows=[{'id':key,'name':'Drip Rate'},{'id':json.dumps(['','P-0001']),'name':'强度'}]
+        with patch.object(names,'run_native',return_value={'projectToken':'t','parameters':rows}),patch.dict(names._project_context,{},clear=True):
+            self.assertEqual(names._host_names(SimpleNamespace(pid=91,creation_time=92)),{key:['Drip Rate']})
+        for bad in (json.dumps(['A','']),'{"x":1}'):
+            with patch.object(names,'run_native',return_value={'projectToken':'t','parameters':[{'id':bad,'name':'n'}]}),patch.dict(names._project_context,{},clear=True):
+                with self.assertRaisesRegex(ValueError,'参数标识格式错误'):names._host_names(SimpleNamespace(pid=91,creation_time=92))
 
 class RelayPathTests(unittest.TestCase):
     """AE runs nothing handed over with -r from a path with a space (checked on AE 2024), so the script moves."""

@@ -29,6 +29,42 @@ class FakeRegistry:
     def read_record(self,address):return next(x for x in self.records() if x['address']==address)
     unchanged=live.Registry.unchanged
 
+class UnnamedEffectTests(unittest.TestCase):
+    """The real Registry leaves out effects a plugin registered without an internal name (seen on AE 2021)."""
+    def registry(self,effects):
+        from types import SimpleNamespace
+        import struct
+        memory={0x1000:struct.pack('<QQ',0x2000,0x2000+16*len(effects))};vector=b''
+        for i,(key,name) in enumerate(effects):
+            at=0x3000+i*0x100;data=bytearray(160);struct.pack_into('<Q',data,0,0x900);data[16:16+len(name.encode())]=name.encode()
+            key=key if isinstance(key,bytes) else key.encode()
+            data[64:64+len(key)]=key;data[96:100]=b'Test';memory[at]=bytes(data);vector+=struct.pack('<QQ',at,0)
+        memory[0x2000]=vector
+        registry=live.Registry.__new__(live.Registry)
+        registry.p=SimpleNamespace(read=lambda a,n:memory[a][:n]);registry.base=0x800;registry.manager=0x1000
+        registry.profile=SimpleNamespace(registry_vector=0,fc_vtable=0x100,encoding='utf8');return registry
+    def test_unnamed_effects_are_left_out_and_listed(self):
+        registry=self.registry([('S_Glow','S_Glow'),('','渐变色调'),('','聚光灯'),('tc Shine','Shine')])
+        self.assertEqual([r['matchName'] for r in registry.records()],['S_Glow','tc Shine']);self.assertEqual(registry.unnamed,['渐变色调','聚光灯'])
+    def test_internal_names_follow_the_profiles_match_encoding(self):
+        # A profile validated on AE 2021 reads internal names in the system code page, as AE's scripting does.
+        registry=self.registry([('S_Glow','S_Glow'),('NWBL 双色','双色')]);registry.profile.match_encoding='mbcs'
+        rows=registry.records();self.assertEqual(rows[1]['matchName'],'NWBL 双色'.encode('utf8').decode('mbcs'));self.assertEqual(rows[1]['displayName'],'双色')
+    def test_internal_names_this_build_cannot_read_count_as_unnamed(self):
+        # AE 2021 reported '' to scripts for seven effects whose internal-name bytes were not empty.
+        registry=self.registry([('S_Glow','S_Glow'),('渐变'.encode('gbk')+b'X','渐变色调'),('S_中文','中文标识')])
+        self.assertEqual([r['matchName'] for r in registry.records()],['S_Glow','S_中文']);self.assertEqual(registry.unnamed,['渐变色调'])
+    def test_writing_others_is_not_blocked(self):
+        process=FakeProcess();temp=tempfile.TemporaryDirectory();self.addCleanup(temp.cleanup)
+        class WithUnnamed(FakeRegistry):
+            def records(self):
+                rows=FakeRegistry.records(self)+[{'address':9000,'displayName':'渐变色调','matchName':'','category':'X','guard':b'g'}]*2
+                self.unnamed=[r['displayName'] for r in rows if not r['matchName']];return [r for r in rows if r['matchName']]
+        for target,value in [('data_root',lambda:Path(temp.name)),('current_process',lambda **kw:process),('Registry',WithUnnamed),('main_window',lambda pid:1),
+                             ('native_probe',lambda:{'processes':[{'pid':123}]}),('_mutex_name','Local\\AEPluginNameLocalizer.Test.'+Path(temp.name).name)]:
+            handle=patch.object(live,target,value);handle.start();self.addCleanup(handle.stop)
+        self.assertEqual(live.NameSession().apply({'S_Glow':'辉光'})['applied'],{'S_Glow':'辉光'})
+
 class LegacyEncodingTests(unittest.TestCase):
     """An mbcs build stores names in the system code page (GBK on a Chinese system): names it cannot hold are
     left out and named, with a diagnostic; the rest are written."""

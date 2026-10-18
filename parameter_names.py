@@ -28,6 +28,12 @@ def split_identity(key):
     value=json.loads(key)
     if not isinstance(value,list) or len(value)!=2 or not all(isinstance(x,str) and x for x in value):raise ValueError('参数标识格式错误')
     return value
+def _unnamed_effect(key)->bool:
+    """A parameter of an effect a plugin registered without an internal name: it cannot be identified, so it is
+    left out of every read (any other malformed identity still stops the read)."""
+    try:value=json.loads(key)
+    except (TypeError,ValueError):return False
+    return isinstance(value,list) and len(value)==2 and value[0]=='' and isinstance(value[1],str)
 def validate_label(name):
     if not isinstance(name,str):raise ValueError('参数名称必须是文字')
     name=name.strip()
@@ -240,17 +246,45 @@ STAGES={'1':('进入脚本',''),'start':('进入脚本',''),'instances':('读取
         'configure':('核对 AE 模块与名称编码','这个 AE 版本可能与参数辅助模块不兼容，请把诊断文件发给开发者；'),
         'labels':('写入参数名称',''),'result':('写回结果','')}
 
+# Inside "configure" the helper itself leaves a breadcrumb (native/ae_parameters.c step()), read on a timeout.
+NATIVE_STEP='AE-Localizer-native-step.txt'
+NATIVE_STEPS={'hashFLT':('读取 FLT.dll 计算哈希','读取 AE 自身模块文件时没有返回，可能被安全软件或其他程序拦截了文件读取；'),
+              'hashTDB':('读取 TDB.dll 计算哈希','读取 AE 自身模块文件时没有返回，可能被安全软件或其他程序拦截了文件读取；'),
+              'hashU':('读取 U.dll 计算哈希','读取 AE 自身模块文件时没有返回，可能被安全软件或其他程序拦截了文件读取；'),
+              'checks':('核对模块结构与指令',''),'codecCall':('调用 AE 的名称编码转换函数','AE 的编码转换函数没有返回，这个 AE 版本暂不兼容；'),
+              'codecReturned':('编码核对完成',''),'codecRefused':('编码核对未通过','')}
+
+# Inside a module hash the helper also marks opening and reading the file ("hashFLT:read").
+NATIVE_SUBSTEPS={'open':'打开文件','read':'读取文件内容'}
+
+def _native_step(since:float)->str|None:
+    """The helper's last step, when it was written during this request (and is one of the known names)."""
+    path=Path(os.environ.get('TEMP') or os.environ.get('TMP') or '.')/NATIVE_STEP
+    try:
+        if path.stat().st_mtime<since-1:return None
+        text=path.read_text(encoding='ascii',errors='replace').strip()
+    except OSError:return None
+    base,_,sub=text.partition(':')
+    return text if base in NATIVE_STEPS and (not sub or sub in NATIVE_SUBSTEPS) else None
+
+def _native_detail(step:str)->tuple[str,str]:
+    base,_,sub=step.partition(':');detail,hint=NATIVE_STEPS[base]
+    return (f'{detail}（{NATIVE_SUBSTEPS[sub]}）' if sub else detail),hint
+
 def _stage(folder)->str|None:
     try:return (folder/STARTED).read_text(encoding='ascii',errors='replace').strip()[:32] or 'start'
     except OSError:return None
 
-def _timeout_message(p,folder,request,timeout,use_bridge,launcher)->str:
+def _timeout_message(p,folder,request,timeout,use_bridge,launcher,since=0.0)->str:
     """Why a request timed out, as far as can be told from outside AE, and a diagnostic file beside it (versions,
     route, whether AE entered the script, administrator rights; no paths, projects or names)."""
     import cep_bridge
     from win_process import elevated,elevation_mismatch
     stage=_stage(folder);started=stage is not None;exit_code=launcher.poll() if launcher is not None else None
     step,hint=STAGES.get(stage,('未知步骤',''))
+    native=_native_step(since) if stage=='configure' else None
+    if native:
+        detail,native_hint=_native_detail(native);step+=f'（辅助模块停在：{detail}）';hint=native_hint or hint
     route='extension' if use_bridge and launcher is None else 'relay'   # the relay runs only when the extension did not take it
     mismatch='' if started else elevation_mismatch(p.pid)
     if started:cause=f'AE 已开始执行脚本，但 {timeout} 秒内没有完成，停在“{step}”这一步：{hint}AE {"也" if hint else ""}可能正忙或显示了对话框，请关闭 AE 中的对话框后重试'
@@ -259,7 +293,7 @@ def _timeout_message(p,folder,request,timeout,use_bridge,launcher)->str:
     else:cause=('AE 没有执行转交的脚本'+('' if launcher is None else '（转交进程仍未退出）' if exit_code is None else f'（转交进程已退出，退出码 {exit_code}）')+
                 '。请关闭 AE 中可能弹出的对话框，并确认“编辑 → 首选项 → 脚本和表达式 → 允许脚本写入文件和访问网络”已勾选后重试')
     details={'schemaVersion':1,'kind':'parameter-timeout','action':request.get('action'),'readScope':request.get('readScope'),'aeVersion':request.get('hostVersion'),
-             'timeoutSeconds':timeout,'route':route,'extensionStatus':cep_bridge.status(),'extensionClaimed':(folder/'claimed.json').exists(),'scriptStarted':started,'lastStage':stage if stage in STAGES else ('other' if started else None),
+             'timeoutSeconds':timeout,'route':route,'extensionStatus':cep_bridge.status(),'extensionClaimed':(folder/'claimed.json').exists(),'scriptStarted':started,'lastStage':stage if stage in STAGES else ('other' if started else None),'nativeStep':native,
              'relayLaunched':launcher is not None,'relayExitCode':exit_code,'folderPathHasSpace':' ' in str(folder),'aeElevated':elevated(p.pid),'selfElevated':elevated(os.getpid())}
     note=''
     try:write_json_atomic(folder/'timeout-diagnostic.json',details,ensure_ascii=False,indent=1);note='；诊断记录：'+str(folder/'timeout-diagnostic.json')
@@ -309,7 +343,7 @@ def run_native(p,operations,timeout=25,action='labels',project_token=None,scope=
     claim_by=None
     if use_bridge:cep_bridge.submit(folder,request);claim_by=time.monotonic()+cep_bridge.CLAIM_WAIT
     else:relay()
-    until=time.monotonic()+timeout;finished=False
+    until=time.monotonic()+timeout;finished=False;submitted=time.time()
     try:
         while time.monotonic()<until:
             if keeper:keeper.check()
@@ -328,7 +362,7 @@ def run_native(p,operations,timeout=25,action='labels',project_token=None,scope=
                     claim_by=None
                     if cep_bridge.withdraw(folder):relay()
             time.sleep(.1)
-        raise TimeoutError(_timeout_message(p,folder,request,timeout,use_bridge,launcher))
+        raise TimeoutError(_timeout_message(p,folder,request,timeout,use_bridge,launcher,submitted))
     finally:
         permit.unlink(missing_ok=True)
         # Only the secondary CLI relay may be terminated; never the primary AE.
@@ -364,6 +398,7 @@ def _selected_names(p,action='catalog'):
     elif not layers:info['emptyReason']='noSelectedLayers'
     names={}
     for row in result.get('parameters',[]):
+        if _unnamed_effect(row['id']):continue
         split_identity(row['id'])
         if not isinstance(row['name'],str):raise RuntimeError('AE 参数名称回读格式错误')
         names.setdefault(row['id'],[]).append(row['name'])
@@ -384,6 +419,7 @@ def _host_names(p,strict=True):
     _project_context[key]=token
     names={}
     for row in result.get('parameters',[]):
+        if _unnamed_effect(row['id']):continue
         split_identity(row['id'])
         if not isinstance(row['name'],str):raise RuntimeError('AE 参数名称回读格式错误')
         names.setdefault(row['id'],[]).append(row['name'])

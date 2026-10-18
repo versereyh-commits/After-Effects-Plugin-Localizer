@@ -25,7 +25,7 @@ from ui_kit import confirm,choose,inform,ask_text,SchemeDelegate,SchemeRow,Schem
 from ui_kit import (SHADOW,STATUS_MARK,Banner,DiamondDelegate,Breather,EmptyState,FadeStack,Legend,LoaderButton,MetricTile,UsageTile,NavRail,Pill,SearchField,Spinner,StatusTag,Surface,
                     button,divider,elastic,fade_in,icon,label,logo,menu_button,page_head,repolish,soft_path,table_style)
 
-APP_VERSION='1.1.5'
+APP_VERSION='1.1.6'
 APP_NAME='AE汉化工具'
 # Installed copies: the current folder name, and the folder older versions used (an upgrade keeps it).
 INSTALL_FOLDERS=('AE汉化工具','AE插件名称汉化')
@@ -1298,6 +1298,10 @@ class Window(QMainWindow):
         self.status.setText('正在核对 AE 路径、构建版本和实际效果目录……');self.work(lambda progress:read_live(expected_image=self.space.exe),self.show_live)
     def show_live(self,report):
         self.live=report;self.toast.notify(f'{self.space.label} 已连接');self.update_names();self.update_pill();self.status.setText(f"已连接 AE，读取 {len(report['effects'])} 个实际效果")
+        if (unnamed:=report.get('unnamedEffects')) and getattr(self,'unnamed_noted',None)!=(report.get('pid'),report.get('creationTime')):
+            # Once per AE process: effects registered without an internal name cannot be localized and are left alone.
+            self.unnamed_noted=(report.get('pid'),report.get('creationTime'))
+            self.log.appendPlainText(f"{len(unnamed)} 个效果没有内部标识，无法区分和汉化，已忽略（不影响其他效果）：{'、'.join(unnamed[:10])}{' 等' if len(unnamed)>10 else ''}")
         QTimer.singleShot(0,self.auto_reapply)
     # AE reads effect names from the plug-in files every time it starts, so the palette is English again after a
     # restart. The names last applied here (per AE version, minus later restores) are written back once per AE process.

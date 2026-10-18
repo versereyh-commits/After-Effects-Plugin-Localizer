@@ -85,6 +85,11 @@ class GuiMappingTests(GuiCase):
     def test_nothing_selected_asks_for_a_row(self):
         self.table.clearSelection()
         with self.assertRaises(ValueError):self.window.translations_selected()
+    def test_effects_without_an_internal_name_are_noted_once_per_ae(self):
+        report={'pid':1,'creationTime':2,'effects':[{'matchName':'S_Glow','displayName':'S_Glow','category':'c'}],'unnamedEffects':['渐变色调','聚光灯','稳定器']}
+        self.window.show_live(report);self.window.show_live(report)
+        log=self.window.log.toPlainText()
+        self.assertEqual(log.count('3 个效果没有内部标识，无法区分和汉化，已忽略（不影响其他效果）：渐变色调、聚光灯、稳定器'),1)
     def test_live_names_follow_identity_after_sorting(self):
         self.table.sortItems(0,Qt.SortOrder.DescendingOrder)
         self.window.show_live({'pid':1,'effects':[{'matchName':'S_Glow','displayName':'辉光','category':'c'},{'matchName':'tc Shine','displayName':'Shine','category':'c'}]})
