@@ -112,6 +112,30 @@ class AdapterDialogTests(GuiCase):
         with patch('adapter_validation.recover_pending',return_value=pending),patch.object(self.window,'work') as work:
             self.dialog.start_code();work.assert_not_called()
         self.assertIs(self.dialog.validation,pending);self.assertFalse(self.dialog.start_btn.isEnabled())
+    def test_background_connection_is_the_recommended_fourth_step(self):
+        from PySide6.QtWidgets import QLabel
+        texts=[l.text() for l in self.dialog.findChildren(QLabel)]
+        self.assertEqual(len(self.dialog.step_badges),4);self.assertIn('AE 后台连接',texts);self.assertIn('推荐安装',texts)
+        self.assertTrue(any('看不见的扩展' in t and '带空格的文件夹' in t for t in texts))
+        # The settings page keeps its own controls.
+        self.assertTrue(hasattr(self.window,'bridge_btn') and hasattr(self.window,'bridge_remove'))
+    def test_fourth_step_follows_the_extension_state(self):
+        import cep_bridge
+        for state,install,remove,badge in (('missing',True,False,'todo'),('outdated',True,True,'todo'),('installed',False,True,'done'),('connected',False,True,'done')):
+            with self.subTest(state),patch.object(cep_bridge,'status',return_value=state):
+                self.dialog.update_bridge()
+                self.assertEqual(self.dialog.bridge_note.text(),self.dialog.BRIDGE_STATE[state])
+                self.assertEqual((self.dialog.bridge_install.isVisibleTo(self.dialog),self.dialog.bridge_remove.isVisibleTo(self.dialog)),(install,remove))
+                self.assertEqual(self.dialog.step_badges[3].property('state'),badge)
+    def test_fourth_step_installs_through_the_main_window_with_the_dialog_as_parent(self):
+        import cep_bridge
+        with patch.object(cep_bridge,'status',return_value='missing'):self.dialog.update_bridge()
+        with patch.object(self.window,'install_bridge',return_value=True) as install,patch.object(cep_bridge,'status',return_value='installed'):
+            self.dialog.bridge_install.click()
+        install.assert_called_once_with(self.dialog);self.assertEqual(self.dialog.bridge_state,'installed')
+        with patch.object(self.window,'remove_bridge') as remove,patch.object(cep_bridge,'status',return_value='missing'):
+            self.dialog.bridge_remove.click()
+        remove.assert_called_once_with(self.dialog);self.assertEqual(self.dialog.bridge_state,'missing')
     def test_supported_connect_never_calls_analysis(self):
         self.window.space.live=True
         with patch.object(self.window,'work') as work,patch.object(self.window,'analyze_adapter') as ai:

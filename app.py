@@ -42,7 +42,8 @@ PALETTES={
 }
 
 def apply_theme(app,extra='',dark=False):
-    """Light (or, when asked, dark) Fusion palette for every widget, whatever the Windows colour scheme, plus the given stylesheet."""
+    """Light (or, when asked, dark) Fusion palette for every widget, whatever the Windows colour scheme, plus the given
+    stylesheet. extra=None keeps the application's stylesheet as it is (a theme switch restyles the windows instead)."""
     app.styleHints().setColorScheme(Qt.ColorScheme.Dark if dark else Qt.ColorScheme.Light)
     palette=QPalette();colors=PALETTES[bool(dark)]
     for group in (QPalette.ColorGroup.Active,QPalette.ColorGroup.Inactive,QPalette.ColorGroup.Disabled):
@@ -55,4 +56,4 @@ def apply_theme(app,extra='',dark=False):
     app.setPalette(palette)
     # Setting the style again rebuilds and re-polishes every widget, so it is done only once.
     if app.style().name().lower()!='fusion':app.setStyle('Fusion')
-    app.setStyleSheet(extra)
+    if extra is not None:app.setStyleSheet(extra)

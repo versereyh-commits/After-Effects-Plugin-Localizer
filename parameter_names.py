@@ -254,8 +254,10 @@ NATIVE_STEPS={'hashFLT':('读取 FLT.dll 计算哈希','读取 AE 自身模块�
               'checks':('核对模块结构与指令',''),'codecCall':('调用 AE 的名称编码转换函数','AE 的编码转换函数没有返回，这个 AE 版本暂不兼容；'),
               'codecReturned':('编码核对完成',''),'codecRefused':('编码核对未通过','')}
 
-# Inside a module hash the helper also marks opening and reading the file ("hashFLT:read").
-NATIVE_SUBSTEPS={'open':'打开文件','read':'读取文件内容'}
+# Inside a module hash the helper also marks opening, mapping and hashing the file ("hashFLT:map"); "+timeout" after
+# it means the helper gave the read up after 10 s instead of holding AE ("hashFLT:hash+timeout"). "read" is 1.1.6's.
+NATIVE_SUBSTEPS={'open':'打开文件','map':'映射文件','hash':'计算哈希','read':'读取文件内容'}
+NATIVE_TIMEOUT='+timeout'
 
 def _native_step(since:float)->str|None:
     """The helper's last step, when it was written during this request (and is one of the known names)."""
@@ -264,12 +266,22 @@ def _native_step(since:float)->str|None:
         if path.stat().st_mtime<since-1:return None
         text=path.read_text(encoding='ascii',errors='replace').strip()
     except OSError:return None
-    base,_,sub=text.partition(':')
+    base,_,sub=text.removesuffix(NATIVE_TIMEOUT).partition(':')
     return text if base in NATIVE_STEPS and (not sub or sub in NATIVE_SUBSTEPS) else None
 
 def _native_detail(step:str)->tuple[str,str]:
-    base,_,sub=step.partition(':');detail,hint=NATIVE_STEPS[base]
-    return (f'{detail}（{NATIVE_SUBSTEPS[sub]}）' if sub else detail),hint
+    gave_up=step.endswith(NATIVE_TIMEOUT);base,_,sub=step.removesuffix(NATIVE_TIMEOUT).partition(':');detail,hint=NATIVE_STEPS[base]
+    notes=[NATIVE_SUBSTEPS[sub]] if sub else []
+    if gave_up:notes.append('等待 10 秒后已放弃')
+    if notes:detail+='（'+'，'.join(notes)+'）'
+    return detail,hint
+
+def module_read_blocked(since:float)->str:
+    """A sentence when the helper gave up reading one of AE's own module files during this request, else ''."""
+    step=_native_step(since)
+    if not step or not step.endswith(NATIVE_TIMEOUT):return ''
+    return ('辅助模块在 AE 里'+_native_detail(step)[0]+'：AE 进程里读取它自己的模块文件被拦截了（常见于安全软件或破解补丁），'
+            '因此无法核对这个 AE 版本，自动适配不能继续')
 
 def _stage(folder)->str|None:
     try:return (folder/STARTED).read_text(encoding='ascii',errors='replace').strip()[:32] or 'start'
@@ -285,6 +297,12 @@ def _timeout_message(p,folder,request,timeout,use_bridge,launcher,since=0.0)->st
     native=_native_step(since) if stage=='configure' else None
     if native:
         detail,native_hint=_native_detail(native);step+=f'（辅助模块停在：{detail}）';hint=native_hint or hint
+    # Stalled while loading or checking the helper: look, from outside, for code in AE that rewrote the file APIs.
+    environment=None;found=''
+    if stage in ('loadHelper','configure'):
+        import ae_environment
+        environment=ae_environment.scan(p);found=ae_environment.summary(environment)
+        if found:hint=found+'；'+hint
     route='extension' if use_bridge and launcher is None else 'relay'   # the relay runs only when the extension did not take it
     mismatch='' if started else elevation_mismatch(p.pid)
     if started:cause=f'AE 已开始执行脚本，但 {timeout} 秒内没有完成，停在“{step}”这一步：{hint}AE {"也" if hint else ""}可能正忙或显示了对话框，请关闭 AE 中的对话框后重试'
@@ -293,7 +311,7 @@ def _timeout_message(p,folder,request,timeout,use_bridge,launcher,since=0.0)->st
     else:cause=('AE 没有执行转交的脚本'+('' if launcher is None else '（转交进程仍未退出）' if exit_code is None else f'（转交进程已退出，退出码 {exit_code}）')+
                 '。请关闭 AE 中可能弹出的对话框，并确认“编辑 → 首选项 → 脚本和表达式 → 允许脚本写入文件和访问网络”已勾选后重试')
     details={'schemaVersion':1,'kind':'parameter-timeout','action':request.get('action'),'readScope':request.get('readScope'),'aeVersion':request.get('hostVersion'),
-             'timeoutSeconds':timeout,'route':route,'extensionStatus':cep_bridge.status(),'extensionClaimed':(folder/'claimed.json').exists(),'scriptStarted':started,'lastStage':stage if stage in STAGES else ('other' if started else None),'nativeStep':native,
+             'timeoutSeconds':timeout,'route':route,'extensionStatus':cep_bridge.status(),'extensionClaimed':(folder/'claimed.json').exists(),'scriptStarted':started,'lastStage':stage if stage in STAGES else ('other' if started else None),'nativeStep':native,'environment':environment,
              'relayLaunched':launcher is not None,'relayExitCode':exit_code,'folderPathHasSpace':' ' in str(folder),'aeElevated':elevated(p.pid),'selfElevated':elevated(os.getpid())}
     note=''
     try:write_json_atomic(folder/'timeout-diagnostic.json',details,ensure_ascii=False,indent=1);note='；诊断记录：'+str(folder/'timeout-diagnostic.json')

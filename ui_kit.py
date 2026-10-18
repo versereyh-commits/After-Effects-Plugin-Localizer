@@ -158,18 +158,20 @@ class Crossfade(QWidget):
     """Covers a widget with a snapshot of its old look and fades into a snapshot of the new one.
     Only two pixmaps are drawn per frame, so nothing underneath repaints while it runs; clicks pass through."""
     def __init__(self,target:QWidget,old:QPixmap):
-        super().__init__(target);self.old=old;self.new=None;self.progress=0.0;self.animation=None;self.halfway=None;self.done=False
+        super().__init__(target);self.old=old;self.new=None;self.progress=0.0;self.animation=None;self.halfway=None;self.frame=None;self.done=False
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent);self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.setGeometry(target.rect());self.show();self.raise_();target.installEventFilter(self)
-    def start(self,duration=300,halfway=None):
-        """Takes the new look (with itself hidden) and starts fading; halfway runs once at the midpoint."""
-        self.hide();self.new=self.parentWidget().grab();self.show();self.raise_();self.halfway=halfway
+    def start(self,duration=300,halfway=None,frame=None):
+        """Takes the new look (with itself hidden) and starts fading; halfway runs once at the midpoint, frame(progress)
+        on every step and once more with 1.0 at the end (the title bars fade with it)."""
+        self.hide();self.new=self.parentWidget().grab();self.show();self.raise_();self.halfway=halfway;self.frame=frame
         animation=QVariantAnimation(self);animation.setStartValue(0.0);animation.setEndValue(1.0);animation.setDuration(duration)
         animation.setEasingCurve(QEasingCurve.Type.InOutQuad);animation.valueChanged.connect(self.step);animation.finished.connect(self.finish)
         self.animation=animation;animation.start()
     def step(self,value):
         self.progress=float(value)
         if self.progress>=.5:self.run_halfway()
+        if self.frame:self.frame(self.progress)
         self.update()
     def run_halfway(self):
         task,self.halfway=self.halfway,None
@@ -178,6 +180,8 @@ class Crossfade(QWidget):
         """Ends at once (also when interrupted): the real widgets underneath already show the new look."""
         if self.done:return
         self.done=True;self.run_halfway()
+        frame,self.frame=self.frame,None
+        if frame:frame(1.0)
         if self.animation is not None:self.animation.stop()
         parent=self.parentWidget()
         if parent is not None:parent.removeEventFilter(self)
@@ -190,10 +194,38 @@ class Crossfade(QWidget):
         if self.new is not None:painter.drawPixmap(0,0,self.new)
         painter.setOpacity(1.0-self.progress);painter.drawPixmap(0,0,self.old)
 
+WINDOW_SHEET=None   # after the first theme switch: the stylesheet every parentless window carries
+def restyle(app,sheet:str):
+    """A theme switch puts the new stylesheet on every parentless window -- the main window (its menus, popups and
+    dialogs inherit it) and the tooltip -- instead of on the application. app.setStyleSheet re-resolves fonts and
+    palettes for every widget and took ~225 ms with this window even for an unchanged sheet; the windows take ~100 ms.
+    The sheet is always set, never cleared: clearing it (to fall back on the application's) cost ~400 ms. The
+    application keeps the startup sheet; a parentless window made later gets the current one when first polished."""
+    global WINDOW_SHEET
+    WINDOW_SHEET=sheet
+    for widget in app.topLevelWidgets():
+        if widget.parentWidget() is None and widget.styleSheet()!=sheet:widget.setStyleSheet(sheet)
+
+def sheet_in_effect(widget:QWidget)->str:
+    """The stylesheet that styles `widget`: its parentless window's own, else the application's."""
+    while widget.parentWidget() is not None:widget=widget.parentWidget()
+    return widget.styleSheet() or QApplication.instance().styleSheet()
+
 TEXT_ROLES=('INK','INK_2','MUTED','FAINT')
 def tint_windows(app):
     for widget in app.topLevelWidgets():
         if widget.isVisible() and isinstance(widget,(QMainWindow,QDialog)):tint_title_bar(widget)
+
+def mix(a,b,t:float)->QColor:
+    a,b=QColor(a),QColor(b)
+    return QColor(round(a.red()+(b.red()-a.red())*t),round(a.green()+(b.green()-a.green())*t),round(a.blue()+(b.blue()-a.blue())*t))
+
+def tint_between(app,old:dict,new:dict,t:float,dark:bool):
+    """Title bars `t` of the way from one palette to the other: Windows cannot fade them, so a theme switch sets them
+    frame by frame alongside the window's crossfade. The caption buttons (light or dark only) turn at the midpoint."""
+    for widget in app.topLevelWidgets():
+        if widget.isVisible() and isinstance(widget,(QMainWindow,QDialog)):
+            tint_title_bar(widget,mix(old['PAPER'],new['PAPER'],t),mix(old['INK'],new['INK'],t),mix(old['LINE'],new['LINE'],t),dark if t>=.5 else not dark)
 def retheme(app,previous:dict,tint=True):
     """After set_theme(): redraws remembered icons, recolours table text set from the old palette, tints title bars."""
     from PySide6.QtWidgets import QListWidget as _List,QTableWidget as _Table
@@ -397,6 +429,7 @@ QLabel#statusLine {{ color:{MUTED}; font-size:12px; }}
 QLabel#stepIndex {{ color:{ON_INK}; background:{INK}; border-radius:11px; font-size:12px; font-weight:600; }}
 QLabel#stepIndex[state="todo"] {{ color:{INK_2}; background:{SELECT}; }}
 QLabel#stepIndex[state="done"] {{ background:{INK_2}; }}
+QLabel#stepTag {{ color:{INK}; border:1px solid {LINE}; border-radius:9px; padding:0 8px; font-size:11px; font-weight:600; }}
 QCheckBox#check {{ color:{INK_2}; }}
 QLabel#legend {{ color:{MUTED}; font-size:12px; }}
 QLabel#tipText {{ color:{ON_INK}; font-size:12px; background:transparent; }}
@@ -429,13 +462,14 @@ def round_window(widget,small=False,border=None)->bool:
         dwm.DwmSetWindowAttribute(hwnd,34,ctypes.byref(colorref),4);return ok
     except Exception:return False
 
-def tint_title_bar(window,caption=None,text=None,border=None)->bool:
-    """Windows 11: the native title bar takes the paper colour so the window reads as one piece."""
+def tint_title_bar(window,caption=None,text=None,border=None,dark=None)->bool:
+    """Windows 11: the native title bar takes the paper colour so the window reads as one piece. `dark` (default:
+    the current theme) picks light or dark caption buttons, which cannot take a colour of their own."""
     if sys.platform!='win32':return False
     caption=caption or PAPER;text=text or INK;border=border or LINE
     try:
         hwnd=int(window.winId());dwm=ctypes.windll.dwmapi;ok=True
-        dark=ctypes.c_int(1 if DARK_MODE else 0);dwm.DwmSetWindowAttribute(hwnd,20,ctypes.byref(dark),4)    # caption buttons
+        dark=ctypes.c_int(1 if (DARK_MODE if dark is None else dark) else 0);dwm.DwmSetWindowAttribute(hwnd,20,ctypes.byref(dark),4)    # caption buttons
         for attribute,value in ((35,caption),(36,text),(34,border)):
             color=QColor(value);ref=ctypes.c_uint(color.red()|color.green()<<8|color.blue()<<16)
             ok=dwm.DwmSetWindowAttribute(hwnd,attribute,ctypes.byref(ref),4)==0 and ok
@@ -500,6 +534,9 @@ class PopupStyler(QObject):
         if kind not in self.WATCH:return False
         if kind==QEvent.Type.Polish:
             if isinstance(obj,QComboBox) and not obj.property('styledItems'):obj.setProperty('styledItems',True);obj.setItemDelegate(QStyledItemDelegate(obj))
+            # A parentless window made after a theme switch would otherwise keep the startup theme (see restyle).
+            elif WINDOW_SHEET is not None and isinstance(obj,QWidget) and obj.isWindow() and obj.parentWidget() is None and not obj.styleSheet():
+                obj.setStyleSheet(WINDOW_SHEET)
             return False
         if kind==QEvent.Type.Show:
             if isinstance(obj,QWidget) and obj.isWindow() and obj is not self.tip:

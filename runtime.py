@@ -88,9 +88,12 @@ def write_diagnostic(kind: str, details: dict) -> Path | None:
     folder = data_root()/"diagnostics"
     try:
         folder.mkdir(parents=True, exist_ok=True)
-        path = folder/f"{kind}-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}.json"
+        # The clock is coarse on Windows (milliseconds or worse): a random tail keeps two quick diagnostics apart.
+        import uuid
+        path = folder/f"{kind}-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}-{uuid.uuid4().hex[:6]}.json"
         write_json_atomic(path, {"schemaVersion": 1, "kind": kind, "codePage": code_page(), **details}, ensure_ascii=False, indent=1)
-        for old in sorted(folder.glob("*.json"), key=lambda p: p.stat().st_mtime)[:-20]:old.unlink(missing_ok=True)
+        for old in sorted(folder.glob("*.json"), key=lambda p: (p.stat().st_mtime_ns, p.name))[:-20]:
+            if old != path:old.unlink(missing_ok=True)
     except OSError:return None
     return path
 

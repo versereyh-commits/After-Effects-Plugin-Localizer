@@ -71,7 +71,7 @@
 
 ## 从源码构建
 
-需要 Python 3.12（Windows x64）。原生模块用 pip 安装的 Zig 编译，不需要另装编译器。
+需要 Python 3.12（Windows x64）。原生模块用 pip 安装的 Zig 编译，不需要另装编译器。编译时固定按通用 x86-64 指令集（`-mcpu=baseline`），不随编译机器的 CPU 变化。`make_installer.py` 打包前会用 `cpu_check.py` 检查一遍，模块里有新指令（GFNI、AVX 等）就拒绝打包。1.2.0 以前的模块按开发机 CPU 编译，在 AMD Zen 1～3 和较早的 Intel CPU 上会让自检卡住或 AE 崩溃。
 
 ```bash
 python -m venv .venv

@@ -55,6 +55,13 @@ def scan(folder:Path):
             if any(p.search(data) for p in patterns):hits.append(path.relative_to(folder))
     if hits:raise RuntimeError('安装包内容含本机信息，已停止：'+'、'.join(map(str,hits[:10])))
 
+def check_cpu(folder:Path):
+    """Our native helpers must run on any x86-64 CPU: a build for the build machine's own CPU once shipped GFNI/AVX2
+    code that crashed AE on AMD Zen 1-3 and older Intel CPUs."""
+    from cpu_check import extended_instructions
+    bad={p.name:found for p in (folder/'_internal'/'native').glob('*.dll') if (found:=extended_instructions(p))}
+    if bad:raise RuntimeError('原生模块含部分 CPU 不支持的指令，已停止：'+'；'.join(f'{name} {found}' for name,found in bad.items()))
+
 GUIDE='''AE汉化工具 {version} 使用说明
 
 这是什么
@@ -84,9 +91,9 @@ GUIDE='''AE汉化工具 {version} 使用说明
 深色模式
   “设置与日志 → 界面”里的“深色模式”默认关闭，勾选后整个窗口以短暂渐变换成深色（关闭界面动效时直接切换），下次启动保持。
 
-无感读写（可选）
+AE后台连接（可选）
   读取或应用参数名称时，软件要把一段脚本交给 AE 执行。默认方式会让最大化的 AE 窗口被还原一下（软件会立即恢复）。
-  在“设置与日志 → 适配范围 → 无感读写”点“安装后台连接”，再重启一次 AE：之后读写都在 AE 后台进行，不再启动第二个
+  在“设置与日志 → 适配范围 → AE后台连接”点“安装后台连接”，再重启一次 AE：之后读写都在 AE 后台进行，不再启动第二个
   AE 进程，AE 窗口和焦点保持不变。扩展装在你的用户目录（%APPDATA%\\Adobe\\CEP\\extensions），不需要管理员权限。
   安装时会同时开启 Adobe 扩展调试模式（让 AE 一定加载这个扩展；调试模式下 AE 不检查扩展签名，对所有 Adobe 扩展生效）。
   可随时在同一处移除，移除时本软件开启的调试模式会恢复原样，原来就开着的不动。
@@ -293,7 +300,7 @@ def main():
     guide=support/'使用说明.txt';guide.write_text(GUIDE.format(version=version_),encoding='utf-8-sig')
     notice=support/'第三方组件说明';notices(notice)
     ico=support/'app.ico';icon(ico)
-    scan(app);scan(support)
+    scan(app);scan(support);check_cpu(app)
     script=stage/'installer.iss';script.write_text(iss(version_,app,guide,notice,ico),encoding='utf-8-sig')
     release.mkdir(exist_ok=True)
     subprocess.run([str(compiler),'/Q',str(script)],check=True)

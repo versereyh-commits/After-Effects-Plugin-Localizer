@@ -21,11 +21,11 @@ from ae_profiles import is_supported,supported_text
 import cep_bridge,release_notes,ui_kit,token_usage,updater
 from PySide6.QtWidgets import QStackedWidget
 from shortcuts import Keymap,ShortcutDialog,PAGES,local_shortcut
-from ui_kit import confirm,choose,inform,ask_text,SchemeDelegate,SchemeRow,SchemeSwitcher,CheckHeader,CheckDragger,TrashDelegate,check_state
+from ui_kit import confirm,choose,inform,ask_text,Prompt,SchemeDelegate,SchemeRow,SchemeSwitcher,CheckHeader,CheckDragger,TrashDelegate,check_state
 from ui_kit import (SHADOW,STATUS_MARK,Banner,DiamondDelegate,Breather,EmptyState,FadeStack,Legend,LoaderButton,MetricTile,UsageTile,NavRail,Pill,SearchField,Spinner,StatusTag,Surface,
                     button,divider,elastic,fade_in,icon,label,logo,menu_button,page_head,repolish,soft_path,table_style)
 
-APP_VERSION='1.1.6'
+APP_VERSION='1.2.0'
 APP_NAME='AE汉化工具'
 # Installed copies: the current folder name, and the folder older versions used (an upgrade keeps it).
 INSTALL_FOLDERS=('AE汉化工具','AE插件名称汉化')
@@ -458,6 +458,8 @@ def pick_parameters(parent,rows)->list[str]:return pick_effects(parent,rows,'参
 class Window(QMainWindow):
     def __init__(self):
         super().__init__();self.setWindowTitle(f'{APP_NAME} {APP_VERSION}');self.resize(1400,880);self.setMinimumSize(1200,720)
+        # The theme's stylesheet goes on before any child exists (ui_kit.restyle keeps it on the windows).
+        if ui_kit.WINDOW_SHEET is not None:self.setStyleSheet(ui_kit.WINDOW_SHEET)
         # Someone who used an earlier version (before anything below writes a file): only they get the update notice.
         self.returning=(data_root()/'ui.json').is_file() or (data_root()/'versions').is_dir()
         self.session=NameSession();self.settings=Settings();self.live=None;self.job=None;self.plugins=[];self.pending={};self._fill=False;self.close_after=False
@@ -515,7 +517,21 @@ class Window(QMainWindow):
         entries=release_notes.newer(seen,APP_VERSION) if seen or self.returning else []
         # Remembered before showing, so the notice never comes back for this version whatever happens next.
         self.save_ui_preference('seenVersion',APP_VERSION)
-        if entries:inform(self,f'{APP_NAME} {APP_VERSION} 更新内容',release_notes.html(entries))
+        if entries:
+            inform(self,f'{APP_NAME} {APP_VERSION} 更新内容',release_notes.html(entries))
+            self.suggest_bridge()
+    def suggest_bridge(self):
+        """After an update (the what's-new notice was just shown), once ever: recommends the background connection
+        when it is not installed. Remembered before asking, so it never comes back whatever the answer."""
+        if self.ui_preferences().get('bridgeSuggested'):return
+        try:state=cep_bridge.status()
+        except OSError:return
+        if state!='missing':return    # installed, connected, being updated, or not shipped with this build
+        self.save_ui_preference('bridgeSuggested',True)
+        prompt=Prompt(self,'推荐安装 AE 后台连接','你还没有安装 AE 后台连接。它让读写参数直接在 AE 后台进行，更稳定，'
+                      '软件放在带空格的文件夹里也能正常读写。\n\n'+self.bridge_install_text()+
+                      '\n\n以后也可以在“设置与日志 → 适配范围”或“AE 版本 → 自动识别与适配”中安装。','安装后台连接',cancel=False,extra=['以后再说'])
+        if prompt.exec()==QDialog.DialogCode.Accepted and prompt.choice is None:self.install_bridge(confirmed=True)
     def show_current_notes(self):
         inform(self,f'{APP_NAME} {APP_VERSION} 更新内容',release_notes.html(release_notes.newer(None,APP_VERSION)))
     # Preferences that only concern the interface.
@@ -532,17 +548,21 @@ class Window(QMainWindow):
         if on==ui_kit.is_dark():return
         app=QApplication.instance();fading=getattr(self,'theme_fade',None)
         if fading is not None:fading.finish()
-        # With motion on, a snapshot of the old look covers the window while Qt restyles every widget (~0.2 s),
-        # then fades into a snapshot of the new look; the title bar changes at the midpoint.
+        # With motion on, a snapshot of the old look covers the window while Qt restyles every widget,
+        # then fades into a snapshot of the new look, the title bars fading with it frame by frame.
         central=self.centralWidget();fade=ui_kit.motion() and central is not None and central.isVisible()
         cover=self.theme_fade=ui_kit.Crossfade(central,central.grab()) if fade else None
-        previous=dict(ui_kit.DARK if ui_kit.is_dark() else ui_kit.LIGHT);ui_kit.set_theme(on)
+        previous=dict(ui_kit.DARK if ui_kit.is_dark() else ui_kit.LIGHT);ui_kit.set_theme(on);current=dict(ui_kit.DARK if on else ui_kit.LIGHT)
         # Recolour first, before the new stylesheet lets the window repaint and refill cells with the new colours.
-        ui_kit.retheme(app,previous,tint=not fade);apply_theme(app,ui_kit.stylesheet(),on)
+        # The palette goes to the application, the stylesheet to the windows (ui_kit.restyle: about a third of the time).
+        ui_kit.retheme(app,previous,tint=False);apply_theme(app,None,on);ui_kit.restyle(app,ui_kit.stylesheet())
         self.status.setText('已切换为深色模式' if on else '已切换为浅色模式')
-        if cover is not None:
-            app.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)    # settle layouts under the cover
-            if not cover.done:cover.start(300,lambda:ui_kit.tint_windows(app))
+        app.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)    # settle layouts (under the cover, if any)
+        if cover is None:
+            # No fade: the window shows the new look first, then the title bars follow in the same moment.
+            self.repaint();ui_kit.tint_windows(app)
+        elif not cover.done:cover.start(300,frame=lambda t:ui_kit.tint_between(app,previous,current,t,on))
+        else:ui_kit.tint_windows(app)
     # Bilingual writing: AE gets "English (中文)" instead of the Chinese alone; off unless the user turns it on.
     @property
     def bilingual(self)->bool:
@@ -944,7 +964,7 @@ class Window(QMainWindow):
         self.scope_info=label('','field',True);col.addWidget(self.scope_info)
         col.addWidget(label(f'候选、勾选、方案和恢复记录保存在：\n{data_root()}','muted',True));col.addSpacing(6)
         # The background extension (cep_bridge): parameter reads and writes without a second AfterFX.exe.
-        col.addWidget(label('无感读写','cardTitle'));self.bridge_info=label('','muted',True);col.addWidget(self.bridge_info);col.addStretch()
+        col.addWidget(label('AE后台连接','cardTitle'));self.bridge_info=label('','muted',True);col.addWidget(self.bridge_info);col.addStretch()
         row=QHBoxLayout();row.setSpacing(8)
         self.bridge_btn=button('安装后台连接');self.bridge_btn.clicked.connect(self.install_bridge);row.addWidget(self.bridge_btn)
         self.bridge_remove=button('移除','quiet');self.bridge_remove.clicked.connect(self.remove_bridge);row.addWidget(self.bridge_remove);row.addStretch();col.addLayout(row)
@@ -1046,17 +1066,22 @@ class Window(QMainWindow):
         self.bridge_info.setText(self.BRIDGE_TEXT[state])
         self.bridge_btn.setVisible(state in ('missing','outdated'));self.bridge_btn.setText('重新安装' if state=='outdated' else '安装后台连接')
         self.bridge_remove.setVisible(state in ('outdated','installed','connected'))
-    def install_bridge(self):
-        if not confirm(self,'安装后台连接？',f'把 AE 后台扩展（看不见的 CEP 扩展，不需要管理员权限）复制到：\n{cep_bridge.installed()}\n\n'
-                       '同时开启 Adobe 扩展调试模式（当前用户注册表 Software\\Adobe\\CSXS.10～13 的 PlayerDebugMode），让 AE 一定加载这个扩展。'
-                       '调试模式下 AE 不再检查扩展签名，对你所有 Adobe 扩展都生效；移除后台连接时，本软件改过的值会恢复原样。\n\n'
-                       '安装后需要重启一次 AE 才会生效；之后读写参数不再启动第二个 AE 进程，AE 窗口和焦点保持不变。没有加载时软件自动改用原来的方式。','安装'):return
+    def bridge_install_text(self)->str:
+        """What installing does, shown before every install (the debug-mode change in particular)."""
+        return (f'把 AE 后台扩展（看不见的 CEP 扩展，不需要管理员权限）复制到：\n{cep_bridge.installed()}\n\n'
+                '同时开启 Adobe 扩展调试模式（当前用户注册表 Software\\Adobe\\CSXS.10～13 的 PlayerDebugMode），让 AE 一定加载这个扩展。'
+                '调试模式下 AE 不再检查扩展签名，对你所有 Adobe 扩展都生效；移除后台连接时，本软件改过的值会恢复原样。\n\n'
+                '安装后需要重启一次 AE 才会生效；之后读写参数不再启动第二个 AE 进程，AE 窗口和焦点保持不变。没有加载时软件自动改用原来的方式。')
+    def install_bridge(self,parent=None,confirmed=False):
+        """`parent`: the window asking (the settings page, or step 4 of the adapter dialog) owns the confirmation.
+        `confirmed`: the caller already showed bridge_install_text and the user agreed. True once installed."""
+        if not confirmed and not confirm(parent or self,'安装后台连接？',self.bridge_install_text(),'安装'):return
         try:cep_bridge.install(debug_mode=True)
         except Exception as error:self.error('安装后台连接失败：'+str(error));return
         self.log.appendPlainText(f'已安装后台连接扩展：{cep_bridge.installed()}；Adobe 扩展调试模式已开启');self.update_bridge_info()
-        self.toast.notify('后台连接已安装','重启 AE 后生效')
-    def remove_bridge(self):
-        if not confirm(self,'移除后台连接？','删除 AE 后台扩展，并把本软件开启的 Adobe 扩展调试模式恢复原样（原来就开着的不动）。重启 AE 后读写参数改回命令行转交（AE 窗口可能被还原，软件会立即恢复）。','移除',danger=True):return
+        self.toast.notify('后台连接已安装','重启 AE 后生效');return True
+    def remove_bridge(self,parent=None):
+        if not confirm(parent or self,'移除后台连接？','删除 AE 后台扩展，并把本软件开启的 Adobe 扩展调试模式恢复原样（原来就开着的不动）。重启 AE 后读写参数改回命令行转交（AE 窗口可能被还原，软件会立即恢复）。','移除',danger=True):return
         try:cep_bridge.remove()
         except Exception as error:self.error('移除后台连接失败：'+str(error));return
         self.log.appendPlainText('已移除后台连接扩展');self.update_bridge_info()
@@ -2251,6 +2276,8 @@ def ui_prefs()->dict:
 
 def main():
     app=QApplication(sys.argv);ui_kit.set_theme(ui_prefs().get('darkMode') is True)    # before any widget, so there is no light flash
-    apply_theme(app,ui_kit.stylesheet(),ui_kit.is_dark());ui_kit.install(app)
+    # The stylesheet lives on the windows, not the application (ui_kit.restyle): a theme switch then restyles in a
+    # fraction of the time. The application keeps no sheet at all -- one on both makes every restyle slower still.
+    apply_theme(app,'',ui_kit.is_dark());ui_kit.install(app);ui_kit.restyle(app,ui_kit.stylesheet())
     window=Window();window.show();sys.exit(app.exec())
 if __name__=='__main__':main()

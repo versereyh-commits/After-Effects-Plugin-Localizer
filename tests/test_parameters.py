@@ -1,4 +1,4 @@
-import copy,json,os,re,tempfile,unittest
+import copy,json,os,re,tempfile,time,unittest
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -231,8 +231,28 @@ class TimeoutDiagnosticTests(unittest.TestCase):
         self.assertEqual(details['nativeStep'],'codecCall')
         message,details,_=self.run_timeout(enter='configure',native='hashFLT:read')
         self.assertIn('辅助模块停在：读取 FLT.dll 计算哈希（读取文件内容））”这一步：读取 AE 自身模块文件时没有返回',message);self.assertEqual(details['nativeStep'],'hashFLT:read')
+        message,details,_=self.run_timeout(enter='configure',native='hashTDB:map+timeout')
+        self.assertIn('辅助模块停在：读取 TDB.dll 计算哈希（映射文件，等待 10 秒后已放弃））',message);self.assertEqual(details['nativeStep'],'hashTDB:map+timeout')
         message,details,_=self.run_timeout(enter='configure',native='hashFLT:other')
         self.assertIsNone(details['nativeStep'])
+    def test_code_injected_into_ae_is_named_when_the_helper_stalls(self):
+        import ae_environment
+        found={'hooks':[{'function':'ntdll.dll!NtReadFile','state':'rewritten','target':'hook.dll','company':'Crack Team'}],'foreignModules':[]}
+        with patch.object(ae_environment,'scan',return_value=found) as scan:
+            message,details,_=self.run_timeout(enter='configure',native='hashFLT:map')
+        self.assertIn('检测到 AE 里的文件函数 NtReadFile 被 hook.dll（Crack Team）改动',message);self.assertEqual(details['environment'],found);scan.assert_called_once()
+        with patch.object(ae_environment,'scan') as scan:
+            message,details,_=self.run_timeout(enter='collect')   # a stall elsewhere does not look inside AE
+        scan.assert_not_called();self.assertIsNone(details['environment'])
+    def test_a_module_read_the_helper_gave_up_is_named(self):
+        with tempfile.TemporaryDirectory() as tmp,patch.dict(os.environ,{'TEMP':tmp}):
+            since=time.time();self.assertEqual(names.module_read_blocked(since),'')
+            (Path(tmp)/names.NATIVE_STEP).write_text('hashFLT:hash',encoding='ascii');self.assertEqual(names.module_read_blocked(since),'')   # still going, not given up
+            (Path(tmp)/names.NATIVE_STEP).write_text('hashFLT:hash+timeout',encoding='ascii')
+            self.assertIn('读取 FLT.dll 计算哈希（计算哈希，等待 10 秒后已放弃）：AE 进程里读取它自己的模块文件被拦截了',names.module_read_blocked(since))
+            self.assertEqual(names.module_read_blocked(since+60),'')   # written before this request
+            (Path(tmp)/names.NATIVE_STEP).write_text('hashU+timeout',encoding='ascii')   # given up before the worker marked a sub-step
+            self.assertIn('读取 U.dll 计算哈希（等待 10 秒后已放弃）',names.module_read_blocked(since))
         message,details,_=self.run_timeout(enter='configure',native='not a step <x>')
         self.assertNotIn('辅助模块停在',message);self.assertIsNone(details['nativeStep'])
         message,details,_=self.run_timeout(enter='collect',native='hashFLT')   # only read inside configure

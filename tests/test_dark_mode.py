@@ -20,7 +20,8 @@ def solid_colours(pixmap):
 class DarkModeCase(GuiCase):
     def setUp(self):
         super().setUp()
-        self.addCleanup(lambda:(ui_kit.set_theme(False),apply_theme(self.app,ui_kit.stylesheet())))
+        # As main() sets up: no application sheet, the windows carry it (ui_kit.restyle). Both at once is slow.
+        self.addCleanup(lambda:(ui_kit.set_theme(False),apply_theme(self.app,''),setattr(ui_kit,'WINDOW_SHEET',None)))
     def prefs(self):return json.loads((Path(self.temp.name)/'ui.json').read_text(encoding='utf8'))
 
 class DarkModeTests(DarkModeCase):
@@ -28,13 +29,14 @@ class DarkModeTests(DarkModeCase):
         w=self.window;self.assertFalse(w.dark_box.isChecked());self.assertFalse(ui_kit.is_dark());self.assertEqual(ui_kit.INK,'#18181b')
         self.assertEqual(w.dark_box.text(),'深色模式')
     def test_switching_recolours_everything_and_is_remembered(self):
-        w=self.window;apply_theme(self.app,ui_kit.stylesheet());light=self.app.styleSheet()
+        w=self.window;apply_theme(self.app,'');ui_kit.restyle(self.app,ui_kit.stylesheet());light=ui_kit.sheet_in_effect(w)
         row=self.rows_for('tc Shine')[0];self.assertEqual(self.table.item(row,ORIGINAL).foreground().color().name(),ui_kit.LIGHT['INK'])
         self.assertEqual(self.table.item(row,KEY).foreground().color().name(),ui_kit.LIGHT['MUTED'])
         w.dark_box.setChecked(True)
         self.assertTrue(ui_kit.is_dark());self.assertEqual(ui_kit.INK,ui_kit.DARK['INK']);self.assertIs(self.prefs()['darkMode'],True)
         self.assertEqual(self.app.palette().color(QPalette.ColorRole.Window).name(),'#131316')
-        sheet=self.app.styleSheet();self.assertIn(ui_kit.DARK['CANVAS'],sheet)
+        sheet=ui_kit.sheet_in_effect(w);self.assertIn(ui_kit.DARK['CANVAS'],sheet)
+        self.assertEqual(self.app.styleSheet(),'')    # the application never carries the sheet (ui_kit.restyle)
         # No light colour is left behind in the stylesheet: every literal comes from the dark palette.
         dark_values={value for value in ui_kit.DARK.values() if isinstance(value,str)}
         self.assertEqual({c for c in re.findall(r'#[0-9a-fA-F]{6}\b',sheet) if c not in dark_values},set())
@@ -50,9 +52,23 @@ class DarkModeTests(DarkModeCase):
         current=w.nav_buttons[w.pages.currentIndex()];self.assertEqual(solid_colours(current.glyph.pixmap()),{ui_kit.DARK['ON_INK']})
         # And back: the light stylesheet is exactly what it was.
         w.dark_box.setChecked(False)
-        self.assertFalse(ui_kit.is_dark());self.assertEqual(self.app.styleSheet(),light);self.assertIs(self.prefs()['darkMode'],False)
+        self.assertFalse(ui_kit.is_dark());self.assertEqual(ui_kit.sheet_in_effect(w),light);self.assertIs(self.prefs()['darkMode'],False)
         self.assertEqual(self.table.item(row,ORIGINAL).foreground().color().name(),ui_kit.LIGHT['INK'])
         self.assertEqual(w.refresh_btn.icon().pixmap(16).toImage(),ui_kit.icon('refresh',ui_kit.LIGHT['INK_2'],16).pixmap(16).toImage())
+    def test_restyle_puts_the_sheet_on_parentless_windows_only(self):
+        # A theme switch restyles the windows, not the application (about a third of the time).
+        from PySide6.QtWidgets import QDialog,QLabel,QWidget
+        before=self.app.styleSheet();loose=QWidget();child=QLabel(loose);self.addCleanup(loose.deleteLater)
+        sheet=ui_kit.stylesheet();ui_kit.restyle(self.app,sheet)
+        self.assertEqual(self.app.styleSheet(),before);self.assertEqual(loose.styleSheet(),sheet);self.assertEqual(child.styleSheet(),'')
+        self.assertEqual(self.window.styleSheet(),sheet);self.assertEqual(ui_kit.sheet_in_effect(child),sheet)
+        # A parentless window made afterwards takes the current sheet when first polished; one with a parent inherits.
+        styler=ui_kit.PopupStyler(self.app);self.app.installEventFilter(styler);self.addCleanup(lambda:self.app.removeEventFilter(styler))
+        late=QDialog();owned=QDialog(self.window);self.addCleanup(late.deleteLater);self.addCleanup(owned.deleteLater)
+        late.ensurePolished();owned.ensurePolished()
+        self.assertEqual(late.styleSheet(),sheet);self.assertEqual(owned.styleSheet(),'')
+        # A new main window carries it from the start.
+        again=app_live.Window();self.addCleanup(again.deleteLater);self.assertEqual(again.styleSheet(),sheet)
     def test_each_cell_is_recoloured_once_in_a_sorted_table(self):
         # Recolouring re-sorts the table; a cell must not be mapped twice (light FAINT -> dark FAINT == light MUTED -> dark MUTED).
         w=self.window;w.show_live({'pid':1,'effects':[{'matchName':'S_Glow','displayName':'S_Glow','category':'c'}]});self.assertTrue(self.table.isSortingEnabled())
@@ -88,15 +104,32 @@ class CrossfadeTests(DarkModeCase):
     def test_old_look_fades_into_the_new_one(self):
         w=self.window;tints=[]
         from unittest.mock import patch
-        with patch.object(ui_kit,'tint_windows',side_effect=lambda app:tints.append(ui_kit.is_dark())):
+        # The title bars fade with the picture: every frame tints them part of the way, in step with its progress.
+        with patch.object(ui_kit,'tint_between',side_effect=lambda app,old,new,t,dark:tints.append((round(t,2),old['PAPER'],new['PAPER'],dark))),\
+             patch.object(ui_kit,'tint_windows',side_effect=lambda app:self.fail('title bars must not jump during the fade')):
             w.dark_box.setChecked(True);fade=w.theme_fade
             self.assertIsInstance(fade,ui_kit.Crossfade);self.assertIs(fade.parentWidget(),w.centralWidget());self.assertEqual(fade.geometry(),w.centralWidget().rect())
             self.assertFalse(fade.old.isNull());self.assertFalse(fade.new.isNull());self.assertTrue(fade.isVisible())
             self.assertTrue(fade.testAttribute(app_live.Qt.WidgetAttribute.WA_TransparentForMouseEvents))
-            self.assertEqual(tints,[])    # the title bar waits for the midpoint
-            fade.step(.6);self.assertEqual(tints,[True]);fade.step(.8);self.assertEqual(tints,[True])
-            fade.finish();self.assertFalse(fade.isVisible());self.assertTrue(fade.done)
+            fade.step(.25);fade.step(.6);fade.finish();self.assertFalse(fade.isVisible());self.assertTrue(fade.done)
+        light,dark=ui_kit.LIGHT['PAPER'],ui_kit.DARK['PAPER']
+        self.assertEqual(tints[-3:],[(.25,light,dark,True),(.6,light,dark,True),(1.0,light,dark,True)])
         self.assertTrue(ui_kit.is_dark())
+    def test_title_bar_colours_are_mixed_part_of_the_way(self):
+        from unittest.mock import patch
+        self.assertEqual(ui_kit.mix('#000000','#ffffff',.5).name(),'#808080');self.assertEqual(ui_kit.mix('#102030','#102030',.7).name(),'#102030')
+        calls=[]
+        with patch.object(ui_kit,'tint_title_bar',side_effect=lambda w,caption,text,border,dark:calls.append((QColor(caption).name(),dark)) if w is self.window else None):
+            ui_kit.tint_between(self.app,ui_kit.LIGHT,ui_kit.DARK,0.0,True);ui_kit.tint_between(self.app,ui_kit.LIGHT,ui_kit.DARK,1.0,True)
+        # Caption buttons can only be light or dark: they turn at the midpoint.
+        self.assertEqual(calls,[(QColor(ui_kit.LIGHT['PAPER']).name(),False),(QColor(ui_kit.DARK['PAPER']).name(),True)])
+    def test_without_fade_the_title_bars_follow_the_repainted_window(self):
+        from unittest.mock import patch
+        order=[]
+        with patch.object(ui_kit,'motion',return_value=False),patch.object(self.window,'repaint',side_effect=lambda:order.append('window')),\
+             patch.object(ui_kit,'tint_windows',side_effect=lambda app:order.append('title bars')):
+            self.window.dark_box.setChecked(True)
+        self.assertEqual(order,['window','title bars'])
     def test_switching_again_ends_the_running_fade(self):
         w=self.window;w.dark_box.setChecked(True);first=w.theme_fade
         w.dark_box.setChecked(False);self.assertTrue(first.done);self.assertIsNot(w.theme_fade,first);self.assertFalse(ui_kit.is_dark())

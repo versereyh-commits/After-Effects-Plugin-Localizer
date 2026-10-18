@@ -8,6 +8,7 @@ __pycache__/
 native/*.dll
 native/*.lib
 native/*.pdb
+native/build-target.json
 
 # Local credentials and session state; never include these in source history.
 .env

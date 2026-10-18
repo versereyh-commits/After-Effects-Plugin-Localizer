@@ -81,26 +81,65 @@ static void sha_final(Sha256 *s,unsigned char out[32]) {
     sha_block(s,s->block);
     for(int i=0;i<8;i++){out[i*4]=(unsigned char)(s->h[i]>>24);out[i*4+1]=(unsigned char)(s->h[i]>>16);out[i*4+2]=(unsigned char)(s->h[i]>>8);out[i*4+3]=(unsigned char)s->h[i];}
 }
-/* Large buffers are static, not on the stack: the helper runs only on AE's script thread (setLabel checks it), and
-   a newer AE may run scripts on a small stack -- AE 2025 hung (25.6) or crashed (25.0) while the helper loaded. */
-static wchar_t module_path[32768];
-static UCHAR read_buffer[65536];
-static Sha256 module_sha;
-static int module_hash(HMODULE module,const char *expected,const char *label) {
-    char crumb[64];size_t base=strlen(label)+4;if(base>48)return 0;
-    strcpy(crumb,"hash");strcat(crumb,label);
-    wchar_t *path=module_path;if(!GetModuleFileNameW(module,path,32768))return 0;
-    strcpy(crumb+base,":open");step(crumb);
-    HANDLE file=CreateFileW(path,GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,NULL,OPEN_EXISTING,0,NULL);
+/* Hashing a module file runs on a worker thread that reads it through a read-only file mapping (no ReadFile), and is
+   given up after HASH_WAIT. On one AE 2025 25.6, ReadFile on AE's own FLT.dll never returned inside AE (reading the same
+   file from another process worked) -- something in that process intercepts file reads. A mapping usually takes another
+   path; if even that stalls, AE is not held: the step is marked ":timeout" and the check fails as unverified. The job
+   lives on the heap and is deliberately leaked on a timeout (the stuck worker still owns it), and the helper pins itself
+   so it is never unloaded under that worker. Nothing large sits on the script thread's stack. */
+#ifndef HASH_WAIT
+#define HASH_WAIT 10000
+#endif
+typedef struct {wchar_t path[32768];char crumb[64];size_t base;unsigned char digest[32];int ok;volatile LONG abandoned;} HashJob;
+/* A worker that was given up writes no more steps, so the "+timeout" mark stays the last one. */
+static void job_step(HashJob *j,const char *sub){if(InterlockedCompareExchange(&j->abandoned,0,0))return;strcpy(j->crumb+j->base,sub);step(j->crumb);}
+static DWORD WINAPI hash_worker(LPVOID parameter) {
+    HashJob *j=(HashJob*)parameter;
+    job_step(j,":open");
+    HANDLE file=CreateFileW(j->path,GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,NULL,OPEN_EXISTING,0,NULL);
     if(file==INVALID_HANDLE_VALUE)return 0;
-    strcpy(crumb+base,":read");step(crumb);
-    UCHAR digest[32];DWORD read=0;int ok=0;Sha256 *s=&module_sha;sha_init(s);
-    for(;;){if(!ReadFile(file,read_buffer,sizeof(read_buffer),&read,NULL))goto done;if(!read)break;sha_update(s,read_buffer,read);}
-    sha_final(s,digest);
-    char hex[65];static const char digits[]="0123456789abcdef";
-    for(int i=0;i<32;i++){hex[i*2]=digits[digest[i]>>4];hex[i*2+1]=digits[digest[i]&15];}hex[64]=0;ok=!strcmp(hex,expected);
+    LARGE_INTEGER size;HANDLE map=NULL;const unsigned char *view=NULL;
+    job_step(j,":map");
+    if(!GetFileSizeEx(file,&size)||size.QuadPart<=0||(uint64_t)size.QuadPart>(uint64_t)SIZE_MAX)goto done;
+    map=CreateFileMappingW(file,NULL,PAGE_READONLY,0,0,NULL);if(!map)goto done;
+    view=(const unsigned char*)MapViewOfFile(map,FILE_MAP_READ,0,0,0);if(!view)goto done;
+    job_step(j,":hash");
+    Sha256 s;sha_init(&s);sha_update(&s,view,(size_t)size.QuadPart);sha_final(&s,j->digest);j->ok=1;
 done:
-    CloseHandle(file);return ok;
+    if(view)UnmapViewOfFile(view);if(map)CloseHandle(map);CloseHandle(file);return 0;
+}
+/* Waits for the worker while letting messages other threads *send* to this thread through: code injected into AE
+   that stalls the worker until AE's main window answers a SendMessage would otherwise deadlock with this wait.
+   Posted messages stay queued and nothing is dispatched (PM_NOREMOVE | PM_QS_SENDMESSAGE only runs sent ones). */
+static int wait_worker(HANDLE worker,DWORD limit) {
+    ULONGLONG until=GetTickCount64()+limit;
+    for(;;){
+        ULONGLONG now=GetTickCount64();DWORD left=now>=until?0:(DWORD)(until-now);
+        DWORD r=MsgWaitForMultipleObjects(1,&worker,FALSE,left,QS_SENDMESSAGE);
+        if(r==WAIT_OBJECT_0)return 1;
+        if(r!=WAIT_OBJECT_0+1)return 0;   /* timeout or failure */
+        MSG msg;PeekMessageW(&msg,NULL,0,0,PM_NOREMOVE|PM_QS_SENDMESSAGE);
+    }
+}
+static int module_hash(HMODULE module,const char *expected,const char *label) {
+    static int pinned;HMODULE self;
+    if(!pinned&&GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_PIN,(LPCWSTR)(void*)hash_worker,&self))pinned=1;
+    if(!pinned||strlen(label)>40)return 0;
+    HashJob *j=(HashJob*)HeapAlloc(GetProcessHeap(),HEAP_ZERO_MEMORY,sizeof(HashJob));if(!j)return 0;
+    strcpy(j->crumb,"hash");strcat(j->crumb,label);j->base=strlen(j->crumb);
+    if(!GetModuleFileNameW(module,j->path,32768)){HeapFree(GetProcessHeap(),0,j);return 0;}
+    HANDLE worker=CreateThread(NULL,0,hash_worker,j,0,NULL);
+    if(!worker){HeapFree(GetProcessHeap(),0,j);return 0;}
+    if(!wait_worker(worker,HASH_WAIT)){
+        /* The worker may still write into j: it is left to it. The crumb names where it stopped, then ":timeout". */
+        InterlockedExchange(&j->abandoned,1);
+        char crumb[80];strcpy(crumb,j->crumb);strcat(crumb,"+timeout");step(crumb);CloseHandle(worker);return 0;
+    }
+    CloseHandle(worker);
+    int ok=0;
+    if(j->ok){char hex[65];static const char digits[]="0123456789abcdef";
+        for(int i=0;i<32;i++){hex[i*2]=digits[j->digest[i]>>4];hex[i*2+1]=digits[j->digest[i]&15];}hex[64]=0;ok=!strcmp(hex,expected);}
+    HeapFree(GetProcessHeap(),0,j);return ok;
 }
 static int profile(void) {
     HMODULE t=GetModuleHandleW(L"TDB.dll"),f=GetModuleHandleW(L"FLT.dll");

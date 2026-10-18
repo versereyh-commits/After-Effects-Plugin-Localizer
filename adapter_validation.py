@@ -1,16 +1,16 @@
 """The candidate -> independent read check -> owned QA -> local certificate chain."""
 from dataclasses import replace
 from pathlib import Path
-import json,shutil,uuid,threading
+import json,shutil,time,uuid,threading
 from ae_profiles import trial_adapter
 from adapter_resolver import CatalogMismatch,Resolver,registry_layout
 from adapter_host import HostBridge
-from parameter_names import bridge_root,ParameterSession,ParameterCatalog,identity,_host_names,run_native
+from parameter_names import bridge_root,ParameterSession,ParameterCatalog,identity,_host_names,run_native,module_read_blocked
 from live_names import NameSession,read_live,_save
 from local_adapters import save_validated
 from local_adapters import profile_data
 from ae_paths import path_key
-from runtime import legacy_text_problem,write_json_atomic
+from runtime import legacy_text_problem,write_diagnostic,write_json_atomic
 
 EFFECT_LABEL='适配验证效果';PARAMETER_LABEL='适配参数'
 DRIZZLE_LABELS={'0001':'滴落率','0002':'存续时间','0003':'涟漪','0004':'位移','0005':'波纹高度','0006':'扩散','0007':'光照','0015':'明暗'}
@@ -54,6 +54,13 @@ class ValidationRun:
         try:write_json_atomic(path,{'schemaVersion':1,'kind':'catalog-diagnostic','aeVersion':self.bridge.version,**details},ensure_ascii=False,indent=1)
         except OSError:return ''
         return '；诊断记录：'+str(path)
+    def _helper_failure(self,p,asked,codec)->str:
+        """Why the helper's module and encoding check failed: a stalled module read it gave up (after 10 s) is named,
+        and an outside look at AE (rewritten file APIs, foreign modules) is saved as a diagnostic and summarized."""
+        import ae_environment
+        environment=ae_environment.scan(p);found=ae_environment.summary(environment)
+        path=write_diagnostic('ae-environment',{'aeVersion':self.bridge.version,'helperFailed':True,**environment})
+        return (module_read_blocked(asked) or '原生结构或编码核验失败，未开始中文写入')+(f'。{found}' if found else '')+(f'；诊断记录：{path}' if path else '')
     def run(self,progress=None):
         """Requires the selected AE ready with an empty project. No user projects are closed."""
         self.bridge.progress=progress
@@ -75,8 +82,8 @@ class ValidationRun:
         try:
             self.notify(progress,'核对原生接口与实际编码……')
             with trial_adapter(self.profile,self.projects),self.bridge.process() as p:
-                _host_names(p);codec=run_native(p,[],action='codec')
-                if codec.get('error') or codec.get('codec') not in (1,2):raise RuntimeError('原生结构或编码核验失败，未开始中文写入')
+                _host_names(p);asked=time.time();codec=run_native(p,[],action='codec')
+                if codec.get('error') or codec.get('codec') not in (1,2):raise RuntimeError(self._helper_failure(p,asked,codec))
                 self.profile=replace(self.profile,encoding='utf8' if codec['codec']==1 else 'mbcs')
             if self.profile.encoding=='mbcs':
                 problem=legacy_text_problem([EFFECT_LABEL,PARAMETER_LABEL,*DRIZZLE_LABELS.values()])

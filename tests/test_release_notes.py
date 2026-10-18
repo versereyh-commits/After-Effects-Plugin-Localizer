@@ -2,7 +2,7 @@
 import json,unittest
 from pathlib import Path
 from unittest.mock import patch
-from PySide6.QtWidgets import QPushButton
+from PySide6.QtWidgets import QDialog,QLabel,QPushButton
 from test_gui import GuiCase
 import app_live,release_notes,ui_kit,updater
 
@@ -32,6 +32,15 @@ class NotesTests(unittest.TestCase):
             self.assertEqual(release_notes.html([('1.0',['a<b'])]),'<ul style="margin:0 0 0 -24px"><li style="margin-bottom:6px">a&lt;b</li></ul>')
 
 class NoticeTests(GuiCase):
+    def setUp(self):
+        super().setUp()
+        # The background-connection suggestion that may follow a notice must never open a real modal dialog here.
+        self.asked=[];self.answer=None   # None: closed; 0: 以后再说; 'install'
+        def exec_(dialog):
+            self.asked.append(dialog.windowTitle())
+            if self.answer is None:return QDialog.DialogCode.Rejected
+            dialog.choice=0 if self.answer==0 else None;return QDialog.DialogCode.Accepted
+        handle=patch.object(ui_kit.Prompt,'exec',exec_);handle.start();self.addCleanup(handle.stop)
     def prefs(self):return json.loads((Path(self.temp.name)/'ui.json').read_text(encoding='utf-8'))
     def test_fresh_install_is_not_told_what_is_new(self):
         w=self.window;self.assertFalse(w.returning)
@@ -53,6 +62,40 @@ class NoticeTests(GuiCase):
         w=self.window;self.assertFalse(w.notes_btn.isHidden())
         with patch.object(app_live,'inform') as shown:w.notes_btn.click()
         self.assertIn(release_notes.NOTES[0][1][0],shown.call_args.args[2])
+    def test_after_an_update_the_missing_connection_is_suggested_once(self):
+        w=self.window;w.returning=True
+        with patch.object(app_live,'inform'),patch.object(app_live.cep_bridge,'status',return_value='missing'),patch.object(w,'install_bridge') as install:
+            w.show_release_notice()
+            self.assertEqual(self.asked,['推荐安装 AE 后台连接']);install.assert_not_called();self.assertIs(self.prefs()['bridgeSuggested'],True)
+            # Never again, whatever the answer was -- also on a later update.
+            w.save_ui_preference('seenVersion','1.0');w.show_release_notice();w.suggest_bridge()
+        self.assertEqual(self.asked,['推荐安装 AE 后台连接'])
+    def test_accepting_installs_without_a_second_confirmation(self):
+        w=self.window;w.returning=True;self.answer='install'
+        with patch.object(app_live,'inform'),patch.object(app_live.cep_bridge,'status',return_value='missing'),patch.object(w,'install_bridge') as install:
+            w.show_release_notice()
+        install.assert_called_once_with(confirmed=True)
+    def test_later_does_not_install(self):
+        w=self.window;w.returning=True;self.answer=0
+        with patch.object(app_live,'inform'),patch.object(app_live.cep_bridge,'status',return_value='missing'),patch.object(w,'install_bridge') as install:
+            w.show_release_notice()
+        install.assert_not_called();self.assertIs(self.prefs()['bridgeSuggested'],True)
+    def test_no_suggestion_when_installed_or_on_a_fresh_install(self):
+        w=self.window
+        for state in ('installed','connected','outdated','unavailable'):
+            with self.subTest(state),patch.object(app_live.cep_bridge,'status',return_value=state):w.suggest_bridge()
+        self.assertEqual(self.asked,[]);self.assertNotIn('bridgeSuggested',self.prefs() if (Path(self.temp.name)/'ui.json').exists() else {})
+        # A fresh install gets neither the notice nor the suggestion.
+        with patch.object(app_live,'inform'),patch.object(app_live.cep_bridge,'status',return_value='missing'):w.show_release_notice()
+        self.assertEqual(self.asked,[])
+    def test_suggestion_explains_the_install_and_offers_later(self):
+        w=self.window;captured=[]
+        def exec_(dialog):captured.append(dialog);return QDialog.DialogCode.Rejected
+        with patch.object(ui_kit.Prompt,'exec',exec_),patch.object(app_live.cep_bridge,'status',return_value='missing'):w.suggest_bridge()
+        dialog=captured[0];self.addCleanup(dialog.deleteLater)
+        self.assertEqual([b.text() for b in dialog.findChildren(QPushButton)],['以后再说','安装后台连接'])
+        text=' '.join(l.text() for l in dialog.findChildren(QLabel))
+        for part in ('后台进行','看不见的 CEP 扩展','调试模式','PlayerDebugMode','重启一次 AE','以后也可以'):self.assertIn(part,text)
     def test_notice_dialog_has_a_single_button(self):
         dialog=ui_kit.Prompt(self.window,'标题','内容','知道了',cancel=False);self.addCleanup(dialog.deleteLater)
         self.assertEqual([b.text() for b in dialog.findChildren(QPushButton)],['知道了'])

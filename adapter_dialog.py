@@ -17,19 +17,22 @@ FAILURE_GUIDE={
 }
 
 class AdapterAnalysisDialog(QDialog):
-    """Three steps — identify, self-check in a QA project, confirm in AE — with the process log beside them."""
+    """Four steps — identify, self-check in a QA project, confirm in AE, and the recommended background connection —
+    with the process log beside them."""
     def __init__(self,owner,space):
-        super().__init__(owner);self.owner=owner;self.space=space;self.running=False;self.report=None;self.cancel_event=threading.Event();self.validation=None;self.task_kind='code';self.completed=False;self.offline_failure=None
-        self.setWindowTitle('自动识别与适配验证 · '+space.label);self.resize(1120,800)
+        super().__init__(owner);self.owner=owner;self.space=space;self.running=False;self.report=None;self.cancel_event=threading.Event();self.validation=None;self.task_kind='code';self.completed=False;self.offline_failure=None;self.bridge_state='missing'
+        self.setWindowTitle('自动识别与适配验证 · '+space.label);self.resize(1120,840)
         outer=QVBoxLayout(self);outer.setContentsMargins(20,16,20,12);outer.setSpacing(6)
         head=QVBoxLayout();head.setContentsMargins(SHADOW,0,SHADOW,0);head.setSpacing(2);head.addWidget(label('自动识别与适配验证','pageTitle'))
         self.target=label(f'{space.label} · {space.version}\n{soft_path(space.exe)}','pageNote',True);head.addWidget(self.target);outer.addLayout(head)
         body=QHBoxLayout();body.setSpacing(0);steps=QVBoxLayout();steps.setSpacing(0)
         self.step_badges=[]
-        def step(number,title,text):
+        def step(number,title,text,tag=None):
             card=Surface(padding=(18,9,18,9),spacing=6);top=QHBoxLayout();top.setSpacing(10)
             badge=QLabel(str(number));badge.setObjectName('stepIndex');badge.setFixedSize(22,22);badge.setAlignment(Qt.AlignmentFlag.AlignCenter);self.step_badges.append(badge)
-            top.addWidget(badge);top.addWidget(label(title,'cardTitle'));top.addStretch();card.box.addLayout(top)
+            top.addWidget(badge);top.addWidget(label(title,'cardTitle'))
+            if tag:top.addWidget(label(tag,'stepTag'))
+            top.addStretch();card.box.addLayout(top)
             card.box.addWidget(label(text,'muted',True));steps.addWidget(card);return card.box
         box=step(1,'识别候选配置','代码先离线核查模块、名称接口和结构，无需密钥。结构不同时可让 AI 诊断原因，但只能生成报告；候选不会解锁实时汉化。')
         row=QHBoxLayout();row.setSpacing(8)
@@ -54,6 +57,14 @@ class AdapterAnalysisDialog(QDialog):
         self.finish_btn=LoaderButton('完成核对、恢复并启用','primary');self.finish_btn.setEnabled(False);self.finish_btn.clicked.connect(lambda:self.owner.run_with(self.finish_btn,'fill','启用中',self.finish_validation))
         self.restore_qa_btn=LoaderButton('取消验证并恢复原名','danger');self.restore_qa_btn.setEnabled(False);self.restore_qa_btn.clicked.connect(lambda:self.owner.run_with(self.restore_qa_btn,'rewind','恢复中',self.restore_validation))
         row.addWidget(self.finish_btn);row.addWidget(self.restore_qa_btn);row.addStretch();box.addLayout(row)
+        # The same background extension as the settings page offers; installing it here does not depend on the steps above.
+        box=step(4,'AE 后台连接','装进 AE 的看不见的扩展，读写参数时直接在 AE 后台运行：不再另起一个 AE 进程，AE 窗口和焦点保持不变，'
+                 '软件放在带空格的文件夹里也能正常读写。安装后重启一次 AE 生效；设置页也可安装或移除。',tag='推荐安装')
+        row=QHBoxLayout();row.setSpacing(8)
+        self.bridge_install=button('安装后台连接');self.bridge_install.clicked.connect(lambda:self.owner.install_bridge(self) and self.update_bridge())
+        self.bridge_remove=button('移除','quiet');self.bridge_remove.clicked.connect(lambda:(self.owner.remove_bridge(self),self.update_bridge()))
+        self.bridge_note=label('','hint')
+        row.addWidget(self.bridge_install);row.addWidget(self.bridge_remove);row.addWidget(self.bridge_note);row.addStretch();box.addLayout(row)
         steps.addStretch();left=QVBoxLayout();left.addLayout(steps);body.addLayout(left,5)
         log=Surface(padding=(18,9,18,9),spacing=6);log.box.addWidget(label('过程记录','cardTitle'))
         self.output=QPlainTextEdit();self.output.setReadOnly(True);self.output.setPlaceholderText('点击“开始自动识别”。离线识别成功后，再由你启动自检。');log.box.addWidget(self.output,1)
@@ -61,6 +72,18 @@ class AdapterAnalysisDialog(QDialog):
         outer.addLayout(body,1)
         foot=QHBoxLayout();foot.setContentsMargins(SHADOW,4,SHADOW,0);foot.addStretch()
         close=button('关闭');close.clicked.connect(self.reject);foot.addWidget(close);outer.addLayout(foot)
+        self.update_bridge()
+    BRIDGE_STATE={'unavailable':'这个版本没有附带后台连接扩展','missing':'未安装','outdated':'与本软件版本不一致，请重新安装',
+                  'installed':'已安装，重启 AE 后生效','connected':'已连接'}
+    def update_bridge(self):
+        """Step 4 shows the extension's state in a few words (the description above says what it does) and offers
+        install or remove, the same actions as the settings page."""
+        import cep_bridge
+        try:self.bridge_state=cep_bridge.status()
+        except OSError:self.bridge_state='missing'
+        self.bridge_note.setText(self.BRIDGE_STATE[self.bridge_state])
+        self.bridge_install.setVisible(self.bridge_state in ('missing','outdated'));self.bridge_install.setText('重新安装' if self.bridge_state=='outdated' else '安装后台连接')
+        self.bridge_remove.setVisible(self.bridge_state in ('outdated','installed','connected'))
         self.sync_steps()
     def sync_steps(self):
         """Badges show which step is done, current or still ahead."""
@@ -68,7 +91,8 @@ class AdapterAnalysisDialog(QDialog):
         reviewing=self.finish_btn.isEnabled() or self.finish_btn.loading()
         states=('done' if identified or self.completed else 'current',
                 'done' if reviewing or self.completed else 'current' if identified else 'todo',
-                'done' if self.completed else 'current' if reviewing else 'todo')
+                'done' if self.completed else 'current' if reviewing else 'todo',
+                'done' if self.bridge_state in ('installed','connected') else 'current' if self.completed else 'todo')
         for number,(badge,state) in enumerate(zip(self.step_badges,states),1):
             if state=='done':ui_kit.themed_pixmap(badge,'check','ON_INK',12)
             else:badge.setProperty('themeIcon',None);badge.setText(str(number))

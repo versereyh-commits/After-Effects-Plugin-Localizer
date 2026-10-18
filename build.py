@@ -17,26 +17,40 @@ import os,time
 for stale in (root/"native").glob("*.locked-*.dll"):
     try:stale.unlink()
     except OSError:pass
-def compile_dll(target,args):
-    fresh=target.with_name(target.stem+".new.dll")
-    subprocess.run([sys.executable,"-m","ziglang","cc",*args,"-o",str(fresh)],check=True,cwd=root)
+# Plain x86-64 (SSE2) code. Without a target zig builds for this machine's own CPU, and the helpers then carried
+# GFNI/AVX2/BMI instructions that AE on an AMD Zen 1-3 or an older Intel CPU cannot run (cpu_check.py checks).
+CPU=["-target","x86_64-windows-gnu","-mcpu=baseline"]
+import json,shutil
+# Which CPU target each helper was built for: a helper from before this target (or another one) is rebuilt.
+stamp_path=root/"native"/"build-target.json"
+try:stamps=json.loads(stamp_path.read_text(encoding="utf-8"))
+except (OSError,ValueError):stamps={}
+def outdated(target,source):
+    return not target.exists() or target.stat().st_mtime<source.stat().st_mtime or stamps.get(target.name)!=" ".join(CPU)
+def put(fresh,target):
+    """Moves a new file into place, setting a copy AE still has loaded aside."""
     try:os.replace(fresh,target)
     except PermissionError:
         os.replace(target,target.with_name(f"{target.stem}.locked-{time.strftime('%Y%m%d%H%M%S')}.dll"));os.replace(fresh,target)
         print(f"{target.name} 正被 AE 加载，已改名保留旧文件，新文件已就位（AE 重启后生效）")
-if not scan_dll.exists() or scan_dll.stat().st_mtime<scan_source.stat().st_mtime:
+    stamps[target.name]=" ".join(CPU);stamp_path.write_text(json.dumps(stamps,indent=1),encoding="utf-8")
+def compile_dll(target,args):
+    fresh=target.with_name(target.stem+".new.dll")
+    subprocess.run([sys.executable,"-m","ziglang","cc",*CPU,*args,"-o",str(fresh)],check=True,cwd=root)
+    put(fresh,target)
+if outdated(scan_dll,scan_source):
     compile_dll(scan_dll,["-shared","-O3","-std=c11",str(scan_source)])
-if not dynamic_dll.exists() or dynamic_dll.stat().st_mtime<parameter_source.stat().st_mtime:
-    compile_dll(dynamic_dll,["-shared","-O2","-std=c11","-DAE_DYNAMIC=1",str(parameter_source),"-lbcrypt"])
-if not parameter_dll.exists() or parameter_dll.stat().st_mtime<parameter_source.stat().st_mtime:
-    compile_dll(parameter_dll,["-shared","-O2","-std=c11",str(parameter_source),"-lbcrypt"])
-# Retain the preceding helpers for existing portable sessions. Never rewrite
-# an old DLL that AE may still have loaded; current calls use v8/v9.
-import shutil
+if outdated(dynamic_dll,parameter_source):
+    compile_dll(dynamic_dll,["-shared","-O2","-std=c11","-DAE_DYNAMIC=1",str(parameter_source),"-luser32"])
+if outdated(parameter_dll,parameter_source):
+    compile_dll(parameter_dll,["-shared","-O2","-std=c11",str(parameter_source),"-luser32"])
+# The preceding helper names still ship for older portable sessions (no current call loads them). They are copies of
+# the current helpers, refreshed whenever those were built for another CPU target.
 legacy_parameter=root/'native'/'ae_parameters_v6.dll';legacy_dynamic=root/'native'/'ae_parameters_v7.dll'
 for current,legacy in ((parameter_dll,legacy_parameter),(dynamic_dll,legacy_dynamic)):
-    if not legacy.exists():shutil.copy2(current,legacy)
-if not native_dll.exists() or native_dll.stat().st_mtime<native_source.stat().st_mtime or "--native-only" in sys.argv:
+    if not legacy.exists() or stamps.get(legacy.name)!=" ".join(CPU):
+        fresh=legacy.with_name(legacy.stem+".new.dll");shutil.copy2(current,fresh);put(fresh,legacy)
+if outdated(native_dll,native_source) or "--native-only" in sys.argv:
     compile_dll(native_dll,["-shared","-O2","-std=c11",str(native_source),"-lpsapi","-lversion"])
 def sign_bridge():
     """The background CEP extension (cep/ plus scripts/parameter_bridge.jsx), signed for AE with Adobe's ZXPSignCmd
