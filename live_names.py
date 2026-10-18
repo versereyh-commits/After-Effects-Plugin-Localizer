@@ -7,7 +7,7 @@ from ctypes import wintypes as W
 import hashlib,json,os,struct,threading
 from win_process import Process
 from ae_ui import main_window
-from runtime import data_root,native_probe,file_version,write_json_atomic
+from runtime import data_root,native_probe,file_version,write_json_atomic,unencodable,encoding_problem
 from ae_profiles import get_profile,supported_text,PROFILES,runtime_allowed
 
 PROFILE_SHA='68b229950e95dedf630f5d09653715268e8beba4830590433abe7cb58e78a357'
@@ -205,12 +205,22 @@ class NameSession:
             main_window(p.pid)
             registry=Registry(p);records=registry.records();by_key={r['matchName']:r for r in records}
             profile=getattr(registry,'profile',None);encoding=profile.encoding if profile else 'utf8'
-            encoded={key:encode_name(value,encoding) for key,value in translations.items()}
+            # A legacy-encoding build (system code page) cannot hold ™ ® • ² and the like: those names are left out and
+            # named, the rest are written. Nothing writable at all (e.g. a non-Chinese system locale) stops here.
+            encoded={};unwritable=[]
+            for key,value in translations.items():
+                if encoding!='utf8' and unencodable(value.strip(),encoding):unwritable.append((key,value.strip()));continue
+                encoded[key]=encode_name(value,encoding)
+            problem=None
+            if unwritable:
+                message,path=encoding_problem([(by_key[k]['displayName'] if k in by_key else k,v) for k,v in unwritable],encoding,'效果译名')
+                problem={'message':message,'keys':[k for k,_ in unwritable],'diagnostic':str(path) if path else None}
+                if not encoded:raise ValueError(message)
             if len(by_key)!=len(records):raise RuntimeError('效果内部标识不唯一，未执行写入')
             skipped=sorted(key for key in encoded if key not in by_key)
             if skipped and not skip_missing:raise ValueError('当前 AE 未加载此效果：'+skipped[0])
             for key in skipped:del encoded[key]
-            if not encoded:return {'applied':{},'unchanged':[],'skipped':skipped,'pid':p.pid}
+            if not encoded:return {'applied':{},'unchanged':[],'skipped':skipped,'pid':p.pid,'unwritable':problem}
             final={key:encoded[key].split(b'\0',1)[0].decode(encoding) if key in encoded else row['displayName'] for key,row in by_key.items()}
             journal=self._identity(p,self.journal());previous=json.loads(json.dumps(journal));staged=[];unchanged=[]
             original={key:(journal['entries'].get(key) or {}).get('originalName',row['displayName']) for key,row in by_key.items()}
@@ -237,7 +247,7 @@ class NameSession:
                 journal['entries'][key]={'originalHex':entry['originalHex'] if entry else before.hex(),'appliedHex':value.hex(),'originalName':entry['originalName'] if entry else row['displayName'],'newName':final[key]}
                 staged.append((row,before,value))
             applied={key:final[key] for key in encoded}
-            if not staged:return {'applied':applied,'unchanged':unchanged,'skipped':skipped,'pid':p.pid,'sharedNames':shared}
+            if not staged:return {'applied':applied,'unchanged':unchanged,'skipped':skipped,'pid':p.pid,'sharedNames':shared,'unwritable':problem}
             _save(self.journal_path,journal)
             attempted=[]
             try:
@@ -249,7 +259,7 @@ class NameSession:
                 # AE's palette is refreshed only when the user asks for it (the refresh button).
                 verified=registry.records()
                 if {r['matchName']:r['displayName'] for r in verified}!=final:raise RuntimeError('更名后目录校验不一致')
-                return {'applied':applied,'unchanged':unchanged,'skipped':skipped,'pid':p.pid,'sharedNames':shared}
+                return {'applied':applied,'unchanged':unchanged,'skipped':skipped,'pid':p.pid,'sharedNames':shared,'unwritable':problem}
             except Exception as error:
                 failed=[]
                 for row,before in reversed(attempted):

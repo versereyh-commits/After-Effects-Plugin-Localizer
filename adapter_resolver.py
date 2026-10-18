@@ -154,12 +154,34 @@ def _differences(rows,expected,encoding):
     for key in sorted(set(expected)-seen)[:max(0,EXAMPLES-len(examples))]:examples.append({'matchName':key,'field':'missing'})
     return count+len(set(expected)-seen),examples
 
+def _host_entries(host_catalog):
+    """AE's catalog as matchName -> (displayName, category), and the matchNames it lists more than once.
+
+    AE lists a plugin twice when two copies are installed (its own Plug-ins folder and Common\\Plug-ins\\7.0\\
+    MediaCore, or an old and a new version). Copies that agree are one effect and are compared once; the memory
+    vector must still hold each matchName exactly once. Copies whose names differ leave no single truth to compare
+    against, so the check stops and names them."""
+    expected={};variants={};times={}
+    for row in host_catalog:
+        key=row['matchName'];value=(row['displayName'],row['category'])
+        times[key]=times.get(key,0)+1;variants.setdefault(key,[])
+        if value not in variants[key]:variants[key].append(value)
+        expected.setdefault(key,value)
+    duplicates=[{'matchName':k,'times':n,'names':[{'displayName':d,'category':c} for d,c in variants[k]]} for k,n in times.items() if n>1]
+    conflicts=[d for d in duplicates if len(d['names'])>1]
+    if conflicts:
+        first=conflicts[0];shown=' / '.join(v['displayName'] for v in first['names'][:3])
+        raise CatalogMismatch(f'AE 效果列表里有 {len(conflicts)} 个内部标识对应不同的名称（例如 {first["matchName"]}：{shown}），'
+                              '可能同一插件的不同版本装了两份；请删掉多余的一份并重启 AE 后重试',
+                              {'hostCount':len(expected),'hostRows':len(host_catalog),'duplicates':duplicates[:EXAMPLES],'conflicts':len(conflicts)})
+    return expected,duplicates[:EXAMPLES]
+
 def registry_offset(process,profile,host_catalog):
     """Read-only exhaustive cross-check of a small bounded manager header. When no vector matches, raises
     CatalogMismatch telling how the closest ones differed, so a failure on someone else's AE can be read."""
     base=next(m['base'] for m in process.modules() if m['name'].casefold()=='flt.dll');manager=process.u64(base+profile.manager)
-    expected={row['matchName']:(row['displayName'],row['category']) for row in host_catalog}
-    if len(expected)!=len(host_catalog) or not 1<len(expected)<32768:raise ValueError('宿主目录不能作为唯一完整对照')
+    expected,duplicates=_host_entries(host_catalog)
+    if not 1<len(expected)<32768:raise CatalogMismatch(f'AE 报告的效果数量异常（{len(expected)} 个），不能作为对照',{'hostCount':len(expected),'hostRows':len(host_catalog)})
     matches=[];vectors=[];candidates=[]
     for offset in range(0,129,8):
         try:begin,end=struct.unpack('<QQ',process.read(manager+offset,16))
@@ -185,9 +207,10 @@ def registry_offset(process,profile,host_catalog):
             candidate[encoding]={'differences':count,'examples':examples}
             if not count:matches.append(offset);break
     if len(matches)==1:return matches[0]
-    details={'hostCount':len(expected),'vectors':vectors,'candidates':candidates}
-    if matches:raise CatalogMismatch(f'完整效果目录向量未找到唯一证据（{len(matches)} 处都与 AE 目录一致）',details)
-    raise CatalogMismatch('完整效果目录向量未找到唯一证据（'+_summary(details)+'）',details)
+    details={'hostCount':len(expected),'hostRows':len(host_catalog),'duplicates':duplicates,'vectors':vectors,'candidates':candidates}
+    twice=f'；AE 列表里有 {len(duplicates)} 个效果重复出现（例如 {duplicates[0]["matchName"]}），可能同一插件装了两份，已按一份对比' if duplicates else ''
+    if matches:raise CatalogMismatch(f'完整效果目录向量未找到唯一证据（{len(matches)} 处都与 AE 目录一致{twice}）',details)
+    raise CatalogMismatch('完整效果目录向量未找到唯一证据（'+_summary(details)+twice+'）',details)
 
 def _summary(details)->str:
     """One line on the closest candidate, for the error shown to the user."""

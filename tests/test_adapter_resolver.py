@@ -92,6 +92,25 @@ class RegistryOffsetTests(fixtures.AnalysisTests):
     def test_wrong_object_type_is_rejected(self):
         data=bytearray(self.memory[0x400000]);struct.pack_into('<Q',data,0,0);self.memory[0x400000]=bytes(data)
         with self.assertRaises(ValueError):registry_offset(self.process,self.profile,self.host)
+    def test_a_plugin_ae_lists_twice_is_compared_once(self):
+        # Two copies of one plugin (Plug-ins and Common\Plug-ins\7.0\MediaCore): AE lists it twice, memory once.
+        self.host.append(dict(self.host[1]));self.assertEqual(registry_offset(self.process,self.profile,self.host),32)
+    def test_memory_must_still_hold_each_effect_once(self):
+        from adapter_resolver import CatalogMismatch
+        self.host.append(dict(self.host[1]))
+        self.memory[0x300000]=struct.pack('<QQQQ',0x400000,0,0x400000,0)   # the memory vector repeats A instead of holding B
+        with self.assertRaises(CatalogMismatch) as caught:registry_offset(self.process,self.profile,self.host)
+        self.assertIn('AE 列表里有 1 个效果重复出现（例如 B），可能同一插件装了两份',str(caught.exception))
+        self.assertEqual(caught.exception.details['duplicates'],[{'matchName':'B','times':2,'names':[{'displayName':'Beta','category':'Test'}]}])
+    def test_copies_with_different_names_stop_and_are_named(self):
+        from adapter_resolver import CatalogMismatch
+        self.host.append({'matchName':'B','displayName':'Beta 2','category':'Test'})
+        with self.assertRaisesRegex(CatalogMismatch,'1 个内部标识对应不同的名称（例如 B：Beta / Beta 2）.*删掉多余的一份') as caught:
+            registry_offset(self.process,self.profile,self.host)
+        self.assertEqual(caught.exception.details['conflicts'],1)
+    def test_too_few_effects_is_a_diagnosed_mismatch(self):
+        from adapter_resolver import CatalogMismatch
+        with self.assertRaisesRegex(CatalogMismatch,'效果数量异常（1 个）'):registry_offset(self.process,self.profile,self.host[:1])
 
 for _name in list(fixtures.AnalysisTests.__dict__):
     if _name.startswith('test_'):setattr(RegistryOffsetTests,_name,None)

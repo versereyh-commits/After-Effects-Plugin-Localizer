@@ -10,7 +10,7 @@ from ctypes import wintypes as W
 import hashlib,json,os,struct,subprocess,time,uuid,sys,threading
 from pathlib import Path
 from live_names import current_process,Registry,_lock,_process_lock,_save,module_digest
-from runtime import asset_root,data_root,relay_script,write_json_atomic
+from runtime import asset_root,data_root,relay_script,write_json_atomic,unencodable,encoding_problem
 from ae_profiles import get_profile,trial_projects
 from runtime import file_version
 
@@ -419,11 +419,10 @@ class ParameterSession:
         with _lock,_process_lock(),self.process() as p:
             catalog=ParameterCatalog(p)
             encoding=getattr(getattr(catalog,'profile',None),'encoding','utf8')
-            try:
-                if any(len(name.encode(encoding))>31 for name in names.values()):raise ValueError('译名超过当前 AE 名称缓冲区容量')
-            except UnicodeEncodeError:
-                from runtime import LOCALE_HINT
-                raise ValueError('当前 AE 的旧式系统编码无法表示该参数译名，请使用可表示的字符；'+LOCALE_HINT) from None
+            if encoding!='utf8':
+                bad=[('/'.join(split_identity(key)),name) for key,name in names.items() if unencodable(name,encoding)]
+                if bad:raise ValueError(encoding_problem(bad,encoding,'参数译名')[0])
+            if any(len(name.encode(encoding))>31 for name in names.values()):raise ValueError('译名超过当前 AE 名称缓冲区容量')
             actual=_host_names(p);rows=[r for r in catalog.rows(progress=progress) if r['id'] in actual];journal=self.journal()
             if (journal.get('pid'),journal.get('creationTime'))!=(p.pid,p.creation_time):journal={'schemaVersion':1,'entries':{}}
             journal.update(pid=p.pid,creationTime=p.creation_time)

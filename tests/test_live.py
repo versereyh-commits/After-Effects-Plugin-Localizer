@@ -29,6 +29,40 @@ class FakeRegistry:
     def read_record(self,address):return next(x for x in self.records() if x['address']==address)
     unchanged=live.Registry.unchanged
 
+class LegacyEncodingTests(unittest.TestCase):
+    """An mbcs build stores names in the system code page (GBK on a Chinese system): names it cannot hold are
+    left out and named, with a diagnostic; the rest are written."""
+    def setUp(self):
+        import runtime
+        from types import SimpleNamespace
+        self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup);self.process=FakeProcess()
+        class Legacy(FakeRegistry):
+            profile=SimpleNamespace(encoding='mbcs',flt_sha='test')
+            def records(self):return [{**row,'displayName':live.decode_name(self.p.memory[row['address']+16],'mbcs')} for row in FakeRegistry.records(self)]
+        for module,target,value in [(live,'data_root',lambda:Path(self.temp.name)),(runtime,'data_root',lambda:Path(self.temp.name)),(live,'current_process',lambda **kw:self.process),
+                                    (live,'Registry',Legacy),(live,'main_window',lambda pid:1),(live,'native_probe',lambda:{'processes':[{'pid':123}]}),
+                                    (live,'_mutex_name','Local\\AEPluginNameLocalizer.Test.'+Path(self.temp.name).name),(runtime,'code_page',lambda:936)]:
+            handle=patch.object(module,target,value);handle.start();self.addCleanup(handle.stop)
+        self.session=live.NameSession()
+    def test_names_the_code_page_cannot_hold_are_skipped_and_named(self):
+        result=self.session.apply({'S_Glow':'蓝宝石辉光™','tc Shine':'闪耀'},skip_missing=True)
+        self.assertEqual(result['applied'],{'tc Shine':'闪耀'});self.assertEqual(self.process.memory[1016],live.encode_name('S_Glow'))
+        problem=result['unwritable'];self.assertEqual(problem['keys'],['S_Glow'])
+        self.assertIn('S_Glow“蓝宝石辉光™”里的 “™”',problem['message']);self.assertIn('代码页 936',problem['message'])
+        details=json.loads(Path(problem['diagnostic']).read_text(encoding='utf-8'))
+        self.assertEqual((details['kind'],details['codePage'],details['encoding'],details['items']),('name-encoding',936,'mbcs',[{'item':'S_Glow','name':'蓝宝石辉光™','chars':['™ U+2122']}]))
+        self.assertEqual(Path(problem['diagnostic']).parent,Path(self.temp.name)/'diagnostics')
+    def test_nothing_writable_stops_with_the_reason(self):
+        with self.assertRaisesRegex(ValueError,'S_Glow“辉光•”里的 “•”.*诊断记录'):self.session.apply({'S_Glow':'辉光•'},skip_missing=True)
+        self.assertEqual(self.process.writes,[])
+    def test_a_system_that_cannot_hold_chinese_names_the_locale(self):
+        with patch('live_names.unencodable',side_effect=lambda text,encoding:list(text)),patch('runtime.unencodable',side_effect=lambda text,encoding:list(text)):
+            with self.assertRaisesRegex(ValueError,'无法表示中文，2 个效果译名未写入.*更改系统区域设置'):self.session.apply({'S_Glow':'辉光','tc Shine':'闪耀'},skip_missing=True)
+    def test_diagnostics_keep_the_newest_twenty(self):
+        import runtime
+        for _ in range(23):runtime.write_diagnostic('name-encoding',{})
+        self.assertEqual(len(list((Path(self.temp.name)/'diagnostics').glob('*.json'))),20)
+
 class LiveSafetyTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)

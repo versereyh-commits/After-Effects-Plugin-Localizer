@@ -25,7 +25,7 @@ from ui_kit import confirm,choose,inform,ask_text,SchemeDelegate,SchemeRow,Schem
 from ui_kit import (SHADOW,STATUS_MARK,Banner,DiamondDelegate,Breather,EmptyState,FadeStack,Legend,LoaderButton,MetricTile,UsageTile,NavRail,Pill,SearchField,Spinner,StatusTag,Surface,
                     button,divider,elastic,fade_in,icon,label,logo,menu_button,page_head,repolish,soft_path,table_style)
 
-APP_VERSION='1.1.4'
+APP_VERSION='1.1.5'
 APP_NAME='AE汉化工具'
 # Installed copies: the current folder name, and the folder older versions used (an upgrade keeps it).
 INSTALL_FOLDERS=('AE汉化工具','AE插件名称汉化')
@@ -1584,6 +1584,10 @@ class Window(QMainWindow):
         if instance_count:self.toast.notify('图层效果标题已同步',f'已更新 {instance_count} 个实例');self.log.appendPlainText(f'已同步 {instance_count} 个图层效果标题')
         if instances.get('customSkipped'):self.log.appendPlainText(f"保留 {instances['customSkipped']} 个手动命名的效果实例")
         if operation.get('skipped'):self.log.appendPlainText(f"{len(operation['skipped'])} 项当前 AE 未加载，已跳过")
+        if problem:=operation.get('unwritable'):
+            # Names this AE's legacy encoding cannot hold were left out; the rest are written.
+            self.log.appendPlainText(f"{len(problem['keys'])} 项未写入：{problem['message']}")
+            self.toast.notify(f"{len(problem['keys'])} 项译名含无法保存的字符，已跳过",problem['message'],error=True)
         if written:self.needs_refresh=True
         self.update_refresh_hint()
         self.status.setText('名称已写入 AE，图层效果标题已同步；目录请点击“刷新 AE 列表”' if written or instance_count else '没有需要写入的名称')

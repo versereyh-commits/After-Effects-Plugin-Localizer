@@ -81,11 +81,18 @@ static int codec_probe(HMODULE u) {
     /* A short, valid UTF-8 sequence which also forms valid pairs in ACP 936.
        Both interpretations stay in the verified MSVC small-string layout. */
     const char sample[]="\xe4\xb8\xad\xe4\xb8\xad";
-    WideString value;memset(&value,0,sizeof(value));value.capacity=7;
-    if(convert(&value,sample)!=&value||value.capacity>7||value.length>6||value.data.small[value.length])return 0;
-    if(value.length==2&&value.data.small[0]==0x4e2d&&value.data.small[1]==0x4e2d)return 1;
+    /* The string is built in a static block far larger than the verified 32-byte layout, the rest filled with a
+       canary: a build whose string is bigger then writes into our own spare bytes, not over the stack, and is
+       refused as unsupported instead of crashing AE. */
+    static union {WideString value;unsigned char raw[256];} block;
+    memset(block.raw,0xA5,sizeof(block.raw));memset(&block.value,0,sizeof(block.value));block.value.capacity=7;
+    WideString *value=&block.value;
+    if(convert(value,sample)!=value)return 0;
+    for(size_t i=sizeof(WideString);i<sizeof(block.raw);i++)if(block.raw[i]!=0xA5)return 0;
+    if(value->capacity>7||value->length>6||value->data.small[value->length])return 0;
+    if(value->length==2&&value->data.small[0]==0x4e2d&&value->data.small[1]==0x4e2d)return 1;
     wchar_t expected[8];int n=MultiByteToWideChar(CP_ACP,0,sample,-1,expected,8);
-    return n>0&&!wcscmp(value.data.small,expected)?2:0;
+    return n>0&&!wcscmp(value->data.small,expected)?2:0;
 }
 static int configure(TaggedData *a) {
     uintptr_t v[7];char *end=NULL,*pos=a[3].data.string;

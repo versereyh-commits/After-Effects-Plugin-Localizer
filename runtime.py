@@ -66,6 +66,49 @@ def write_json_atomic(path, value, *, ensure_ascii=False, indent=2):
 LOCALE_HINT="若 Windows 系统区域不是中文，请在“设置 → 时间和语言 → 语言和区域 → 管理语言设置 → 更改系统区域设置”中选择“中文(简体，中国)”并重启电脑后再试"
 
 
+def code_page() -> int:
+    try:return ctypes.windll.kernel32.GetACP()
+    except (AttributeError, OSError):return 0
+
+
+def unencodable(text: str, encoding: str) -> list[str]:
+    """The characters of `text` that `encoding` cannot represent (in order, once each). For an mbcs build that is
+    the Windows legacy code page: on a Chinese system GBK, which has no ™ ® © • ² ½ ✓, no non-breaking space."""
+    found = []
+    for char in text:
+        try:char.encode(encoding)
+        except UnicodeEncodeError:
+            if char not in found:found.append(char)
+    return found
+
+
+def write_diagnostic(kind: str, details: dict) -> Path | None:
+    """Saves a diagnostic a user can send (no paths, keys or project data) under the data folder's diagnostics,
+    keeping the newest 20; returns its path, or None when it cannot be written."""
+    folder = data_root()/"diagnostics"
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder/f"{kind}-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}.json"
+        write_json_atomic(path, {"schemaVersion": 1, "kind": kind, "codePage": code_page(), **details}, ensure_ascii=False, indent=1)
+        for old in sorted(folder.glob("*.json"), key=lambda p: p.stat().st_mtime)[:-20]:old.unlink(missing_ok=True)
+    except OSError:return None
+    return path
+
+
+def encoding_problem(items: list[tuple[str, str]], encoding: str, what: str) -> tuple[str, Path | None]:
+    """For names (label, text) the AE build's legacy encoding cannot hold: one sentence naming them and the
+    characters, and a diagnostic file. When even ordinary Chinese does not fit, the system locale is the cause."""
+    rows = [{"item": label, "name": text, "chars": [f"{c} U+{ord(c):04X}" for c in unencodable(text, encoding)]} for label, text in items]
+    path = write_diagnostic("name-encoding", {"encoding": encoding, "what": what, "count": len(rows), "items": rows[:100]})
+    note = f"；诊断记录：{path}" if path else ""
+    if unencodable("中文", encoding):
+        return f"当前 Windows 系统编码（代码页 {code_page()}）无法表示中文，{len(rows)} 个{what}未写入。{LOCALE_HINT}{note}", path
+    shown = "；".join(f"{r['item']}“{r['name']}”里的 " + "、".join(f"“{c.split(' ')[0]}”" for c in r["chars"]) for r in rows[:3])
+    more = f" 等 {len(rows)} 个" if len(rows) > 3 else ""
+    return (f"{shown}{more}{what}含有当前系统编码（代码页 {code_page()}）无法表示的字符，这个 AE 版本按系统编码保存名称，"
+            f"请删掉或换掉这些字符（如 ™ ® © • ² 等）后再应用{note}"), path
+
+
 def legacy_text_problem(texts, encoding="mbcs") -> str | None:
     """None when every text fits the Windows legacy code page used by mbcs AE builds."""
     try:

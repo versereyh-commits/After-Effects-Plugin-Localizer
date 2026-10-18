@@ -22,9 +22,12 @@ try{
   if(new File(q.project).exists||new File(q.second).exists)throw new Error('QA files already exist');
   phase('读取一次效果目录，选择测试效果');
   var ids={},available=app.effects;for(var ai=0;ai<available.length;ai++){if(ai%64===0)requirePermit();ids[available[ai].matchName]=true;}
-  var test=ids.S_Glow?'S_Glow':ids['ADBE Gaussian Blur 2']?'ADBE Gaussian Blur 2':null;
+  // AE's own Gaussian Blur first: every AE has it and it does not depend on a third-party plugin's GPU renderer.
+  var test=ids['ADBE Gaussian Blur 2']?'ADBE Gaussian Blur 2':ids.S_Glow?'S_Glow':null;
   if(!test)throw new Error('No supported QA fixture effect is installed');
   requirePermit();phase('创建自有测试合成');building=true;
+  // The QA project renders on the CPU: graphics drivers that crash AE (seen with AE 25.0 on an AMD card) must not end a self-check.
+  r.softwareRender=false;try{app.project.gpuAccelType=GpuAccelType.SOFTWARE;r.softwareRender=app.project.gpuAccelType===GpuAccelType.SOFTWARE;}catch(gpuError){}
   var c=app.project.items.addComp(q.comp,320,180,1,1,24);
   c.layers.addSolid([0,0,0],'QA Background',320,180,1);c.layers.addSolid([1,1,1],'QA Source',50,30,1);
   var layer=c.layers.addSolid([1,1,1],'QA Effects',320,180,1);layer.adjustmentLayer=true;

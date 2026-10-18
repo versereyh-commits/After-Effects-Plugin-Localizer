@@ -152,7 +152,11 @@ def translate_names(items:list[dict],key:str,base_url='https://api.deepseek.com'
     if len({item['id'] for item in items})!=total:raise TranslationError('待翻译的效果标识重复',result,total)
 
     def run(batch):
-        expected={item['id'] for item in batch};request=build_request(chosen,base_url,key,model,batch,system_prompt=system_prompt);throttled=False
+        # The model sees short numbers, not the plugins' internal identifiers: it tends to "correct" odd ones (CC Composite's
+        # is "CS Composite"), and one changed id used to throw away the whole batch.
+        numbers={str(n):item['id'] for n,item in enumerate(batch,1)};expected=set(numbers.values())
+        sent=[{**item,'id':n} for n,item in zip(numbers,batch)]
+        request=build_request(chosen,base_url,key,model,sent,system_prompt=system_prompt);throttled=False
         for attempt in range(3):
             try:
                 response=urlopen(request,timeout=60)
@@ -184,8 +188,11 @@ def translate_names(items:list[dict],key:str,base_url='https://api.deepseek.com'
             rows=parse_json(content)['translations'];translated={}
             if not isinstance(rows,list):raise ValueError('译文格式错误')
             for row in rows:
-                identity,text=row['id'],row['name']
-                if identity not in expected or identity in translated:raise ValueError('返回了重复或未知标识')
+                raw,text=row['id'],row['name']
+                # 1 as well as "1"; the real identifier is taken too when a model echoes it back.
+                label=str(raw).strip() if isinstance(raw,(str,int)) and not isinstance(raw,bool) else None
+                identity=numbers.get(label) or (label if label in expected else None)
+                if identity is None or identity in translated:raise ValueError(f'返回了重复或未知标识（{str(raw)[:40]}）')
                 encoded=encode_name(text);translated[identity]=encoded.split(b'\0',1)[0].decode('utf8')
             if set(translated)!=expected:raise ValueError('返回的译文不完整')
         except (KeyError,IndexError,TypeError,ValueError,AttributeError) as error:

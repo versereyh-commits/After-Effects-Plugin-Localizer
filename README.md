@@ -59,6 +59,8 @@
 - **自动适配自检失败**（例如“完整效果目录向量未找到唯一证据”）：`<软件目录>\ae-bridge\adapter-qa\<编号>\catalog-diagnostic.json`。
 - **AE 参数操作超时**：`<软件目录>\ae-bridge\<编号>\timeout-diagnostic.json`（装了后台连接时在 `%APPDATA%\AE-Localizer\bridge\<编号>\`）。提示会说明是 AE 根本没执行脚本、执行了没完成，还是 AE 与本软件的管理员权限不同。
 
+- **译名含系统编码无法表示的字符**（AE 2025 等按系统编码保存名称的版本，中文系统为 GBK，没有 ™ ® © • ² 等字符）：这些译名会被跳过并写明是哪一项，诊断在 `%LOCALAPPDATA%\AE名称汉化验证\diagnostics\name-encoding-*.json`。
+
 软件可以放在路径带空格的文件夹里。AE 不会执行从带空格路径转交的脚本，软件会自动改用不含空格的临时位置。
 
 ## 隐私

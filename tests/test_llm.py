@@ -57,6 +57,19 @@ class DeepSeekTests(unittest.TestCase):
     def test_missing_identity_is_rejected(self):
         Handler.reply={'translations':[]}
         with self.assertRaises(RuntimeError):self.call()
+    def test_model_sees_numbers_not_internal_identifiers(self):
+        # A model "corrects" an odd identifier such as CC Composite's "CS Composite"; it now never sees one.
+        items=[{'id':'CS Composite','sourceName':'CC Composite','category':'Channel'},{'id':'Ã¼ber Glow ','sourceName':'Uber Glow','category':'Light'}]
+        Handler.reply={'translations':[{'id':'1','name':'合成'},{'id':2,'name':'超级辉光'}]}   # a number as well as a string
+        self.assertEqual(self.call(items),{'CS Composite':'合成','Ã¼ber Glow ':'超级辉光'})
+        sent=json.loads(Handler.received['messages'][1]['content'])['items']
+        self.assertEqual([item['id'] for item in sent],['1','2']);self.assertEqual([item['sourceName'] for item in sent],['CC Composite','Uber Glow'])
+        self.assertNotIn('CS Composite',json.dumps(Handler.received,ensure_ascii=False))
+    def test_unknown_or_repeated_number_names_the_id(self):
+        items=[{'id':'CS Composite','sourceName':'CC Composite','category':'Channel'}]
+        for reply,shown in (([{'id':'CC Composite','name':'合成'}],'CC Composite'),([{'id':'1','name':'合成'},{'id':1,'name':'合成'}],'1'),([{'id':True,'name':'合成'}],'True')):
+            Handler.reply={'translations':reply}
+            with self.assertRaisesRegex(TranslationError,f'重复或未知标识（{shown}）'):self.call(items)
 
     def test_second_batch_failure_preserves_first(self):
         items,first=self.batches();Handler.responses[1]={'status':400,'body':b'test-only response secret'}
@@ -252,9 +265,11 @@ class ParallelTests(unittest.TestCase):
     def setUp(self):
         self.lock=threading.Lock();self.active=0;self.peak=0;self.starts=[];self.refuse={};self.slow=set()
     def items(self,count):return [{'id':f'E{i:03d}','sourceName':f'Effect {i}','category':'c'} for i in range(count)]
-    def batch_of(self,ids):return int(ids[0][1:])//10
     def opener(self,request,timeout):
-        ids=[item['id'] for item in json.loads(json.loads(request.data)['messages'][1]['content'])['items']];batch=self.batch_of(ids)
+        # The model sees numbers; the source names tell which effects (and so which batch) a request carries.
+        sent=json.loads(json.loads(request.data)['messages'][1]['content'])['items']
+        numbers=[int(item['sourceName'].split()[1]) for item in sent];batch=numbers[0]//10
+        names={item['id']:f'中E{n:03d}' for item,n in zip(sent,numbers)}
         with self.lock:
             self.active+=1;self.peak=max(self.peak,self.active);self.starts.append((batch,self.active))
             code=self.refuse.get(batch,[None]).pop(0) if self.refuse.get(batch) else None
@@ -262,7 +277,7 @@ class ParallelTests(unittest.TestCase):
             if code:raise llm_client.HTTPError(request.full_url,code,'refused',{},None)
             if batch in self.slow:time.sleep(.15)
             else:time.sleep(.03)
-            body=json.dumps({'choices':[{'finish_reason':'stop','message':{'content':json.dumps({'translations':[{'id':i,'name':'中'+i} for i in ids]})}}],'usage':{'total_tokens':7}}).encode()
+            body=json.dumps({'choices':[{'finish_reason':'stop','message':{'content':json.dumps({'translations':[{'id':i,'name':name} for i,name in names.items()]})}}],'usage':{'total_tokens':7}}).encode()
             return io.BytesIO(body)
         finally:
             with self.lock:self.active-=1

@@ -34,6 +34,11 @@ class ParameterTests(unittest.TestCase):
         self.assertEqual(result,{'changed':2,'parameters':1});self.assertEqual({r['value'] for r in self.rows},{1})
         self.assertEqual(self.session.restore(),{'restored':1,'pending':0});self.assertEqual(self.rows,before)
         self.assertEqual(self.session.journal()['entries'],{})
+    def test_legacy_encoding_names_the_parameter_and_character(self):
+        self.catalog.profile=SimpleNamespace(encoding='mbcs')
+        with patch.object(runtime,'data_root',lambda:self.root),patch.object(runtime,'code_page',lambda:936):
+            with self.assertRaisesRegex(ValueError,'CC Drizzle/CC Drizzle-0001“滴落率²”里的 “²”.*代码页 936.*诊断记录') as caught:self.session.apply({self.key:'滴落率²'})
+        self.assertEqual(self.calls,[]);self.assertTrue(list((self.root/'diagnostics').glob('name-encoding-*.json')),str(caught.exception))
     def test_equal_metadata_still_notifies_host_to_sync_stale_ui(self):
         for row in self.rows:row['pfName']='滴落率'
         self.session.apply({self.key:'滴落率'});self.assertEqual(len(self.calls[0]),2)
