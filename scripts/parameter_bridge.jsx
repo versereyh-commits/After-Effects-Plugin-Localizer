@@ -1,7 +1,8 @@
 (function(){
     var request=@@REQUEST@@,result={changed:0},lib=null,done=[],instanceDone=[];
-    // Tells the program AE entered this script, so a timeout can say whether AE ran it at all.
-    try{var mark=new File(new File(request.output).parent.fsName+'/started');if(mark.open('w')){mark.write('1');mark.close();}}catch(markError){}
+    // Tells the program AE entered this script and how far it got, so a timeout can name the step it stopped at.
+    function stage(name){try{var mark=new File(new File(request.output).parent.fsName+'/started');if(mark.open('w')){mark.write(name);mark.close();}}catch(markError){}}
+    stage('start');
     function permitted(){return new File(request.permit).exists&&new Date().getTime()<request.expires;}
     function quoted(s){return '"'+String(s).replace(/\\/g,'\\\\').replace(/"/g,'\\"').replace(/\r/g,'\\r').replace(/\n/g,'\\n').replace(/[\x00-\x1f]/g,function(c){return '\\u'+('0000'+c.charCodeAt(0).toString(16)).slice(-4);})+'"';}
     function projectToken(){var source=app.project.file?app.project.file.fsName:'unsaved',hash=2166136261;for(var i=1;i<=app.project.numItems;i++)source+='|'+app.project.item(i).id;for(var j=0;j<source.length;j++){hash^=source.charCodeAt(j);hash+=(hash<<1)+(hash<<4)+(hash<<7)+(hash<<8)+(hash<<24);}return (hash>>>0).toString(16);}
@@ -31,7 +32,7 @@
         if(request.qaProjects){var owned=false;for(var qi=0;qi<request.qaProjects.length;qi++)if(app.project.file&&app.project.file.fsName.toLowerCase()===new File(request.qaProjects[qi]).fsName.toLowerCase())owned=true;if(!owned)throw new Error('验证只能操作软件自有QA工程');}
         if(app.project.renderQueue.rendering)throw new Error('请停止渲染后再修改参数名称');
         if(request.action==='instanceCatalog'||request.action==='instanceNames'){
-            result.projectToken=projectToken();result.instances=[];
+            stage('instances');result.projectToken=projectToken();result.instances=[];
             for(var ci=1;ci<=app.project.numItems;ci++){
                 if(!permitted())throw new Error('请求已取消');
                 var c=app.project.item(ci);if(!(c instanceof CompItem))continue;
@@ -73,7 +74,7 @@
                 }finally{if(targets.length)app.endUndoGroup();}
             }
         }else if(request.action==='catalog'||request.action==='selection'){
-            result.projectToken=projectToken();
+            stage('collect');result.projectToken=projectToken();
             result.readScope=request.readScope||'project';
             if(result.readScope!=='selected'&&result.readScope!=='project')throw new Error('未知参数读取范围');
             result.parameters=[];
@@ -93,8 +94,10 @@
         }else{
           if(request.action!=='codec'&&(!request.projectToken||request.projectToken!==projectToken()))throw new Error('工程已切换，请重新读取参数后再应用');
           if(request.action==='codec'&&request.operations.length)throw new Error('编码查询不能修改参数');
-          lib=new ExternalObject('lib:'+request.helper);
+          stage('loadHelper');lib=new ExternalObject('lib:'+request.helper);
+          stage('configure');
           if(request.adapter){var a=request.adapter;result.codec=lib.setLabel('configure',a.flt,a.tdb,a.layout,a.codec);if(request.action!=='codec'&&result.codec!==(a.encoding==='utf8'?1:2))throw new Error('编码核验不匹配');}
+          if(request.operations.length)stage('labels');
           for(var i=0;i<request.operations.length;i++){
             if(!permitted())throw new Error('请求已取消');
             var op=request.operations[i];
@@ -108,6 +111,7 @@
         for(var ij=instanceDone.length-1;ij>=0;ij--){var prior=instanceDone[ij];try{var current=String(prior.target.name);if(current!==prior.after&&current!==prior.before)throw new Error('实例回滚守卫不符');prior.target.name=prior.before;if(String(prior.target.name)!==prior.before)throw new Error('实例回滚回读不符');}catch(instanceRollback){result.rollbackFailed++;}}
         for(var j=done.length-1;j>=0;j--){var prev=done[j];try{if(typeof prev.afterPf==='string'&&typeof prev.beforeDisplay==='string')lib.setLabel(prev.address,prev.guid,prev.parent,prev.afterPf,prev.beforeDisplay,prev.before,prev.after);else lib.setLabel(prev.address,prev.guid,prev.parent,prev.after,prev.before);}catch(rollback){result.rollbackFailed++;}}
     }
+    stage('result');
     var file=new File(request.output);file.encoding='UTF-8';
     if(file.open('w')){
         var entries=[];if(result.parameters)for(var r=0;r<result.parameters.length;r++)entries.push('{"id":'+quoted(result.parameters[r].id)+',"name":'+quoted(result.parameters[r].name)+'}');

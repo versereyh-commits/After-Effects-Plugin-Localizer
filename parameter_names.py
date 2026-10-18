@@ -234,22 +234,32 @@ def bridge_root():
     return base/'ae-bridge'
 
 STARTED='started'   # parameter_bridge.jsx writes this into the request folder as soon as AE enters the script
+# ...and rewrites it with each step it reaches; a timeout names the last one and what usually holds AE there.
+STAGES={'1':('进入脚本',''),'start':('进入脚本',''),'instances':('读取效果实例',''),'collect':('读取参数列表',''),
+        'loadHelper':('加载参数辅助模块','安全软件（360、火绒等）可能拦截了这个 DLL 的加载，请留意它们的提示并允许；'),
+        'configure':('核对 AE 模块与名称编码','这个 AE 版本可能与参数辅助模块不兼容，请把诊断文件发给开发者；'),
+        'labels':('写入参数名称',''),'result':('写回结果','')}
+
+def _stage(folder)->str|None:
+    try:return (folder/STARTED).read_text(encoding='ascii',errors='replace').strip()[:32] or 'start'
+    except OSError:return None
 
 def _timeout_message(p,folder,request,timeout,use_bridge,launcher)->str:
     """Why a request timed out, as far as can be told from outside AE, and a diagnostic file beside it (versions,
     route, whether AE entered the script, administrator rights; no paths, projects or names)."""
     import cep_bridge
     from win_process import elevated,elevation_mismatch
-    started=(folder/STARTED).exists();exit_code=launcher.poll() if launcher is not None else None
+    stage=_stage(folder);started=stage is not None;exit_code=launcher.poll() if launcher is not None else None
+    step,hint=STAGES.get(stage,('未知步骤',''))
     route='extension' if use_bridge and launcher is None else 'relay'   # the relay runs only when the extension did not take it
     mismatch='' if started else elevation_mismatch(p.pid)
-    if started:cause=f'AE 已开始执行脚本，但 {timeout} 秒内没有完成：AE 可能正忙或显示了对话框，请关闭 AE 中的对话框后重试'
+    if started:cause=f'AE 已开始执行脚本，但 {timeout} 秒内没有完成，停在“{step}”这一步：{hint}AE {"也" if hint else ""}可能正忙或显示了对话框，请关闭 AE 中的对话框后重试'
     elif mismatch:cause='AE 没有执行脚本：'+mismatch
     elif route=='extension':cause='后台扩展已接收请求，但 AE 没有开始执行：AE 可能正忙或显示了对话框。请关闭 AE 中的对话框后重试；仍不行可在设置页移除后台连接，改用转交方式'
     else:cause=('AE 没有执行转交的脚本'+('' if launcher is None else '（转交进程仍未退出）' if exit_code is None else f'（转交进程已退出，退出码 {exit_code}）')+
                 '。请关闭 AE 中可能弹出的对话框，并确认“编辑 → 首选项 → 脚本和表达式 → 允许脚本写入文件和访问网络”已勾选后重试')
     details={'schemaVersion':1,'kind':'parameter-timeout','action':request.get('action'),'readScope':request.get('readScope'),'aeVersion':request.get('hostVersion'),
-             'timeoutSeconds':timeout,'route':route,'extensionStatus':cep_bridge.status(),'extensionClaimed':(folder/'claimed.json').exists(),'scriptStarted':started,
+             'timeoutSeconds':timeout,'route':route,'extensionStatus':cep_bridge.status(),'extensionClaimed':(folder/'claimed.json').exists(),'scriptStarted':started,'lastStage':stage if stage in STAGES else ('other' if started else None),
              'relayLaunched':launcher is not None,'relayExitCode':exit_code,'folderPathHasSpace':' ' in str(folder),'aeElevated':elevated(p.pid),'selfElevated':elevated(os.getpid())}
     note=''
     try:write_json_atomic(folder/'timeout-diagnostic.json',details,ensure_ascii=False,indent=1);note='；诊断记录：'+str(folder/'timeout-diagnostic.json')

@@ -1,4 +1,4 @@
-import copy,json,os,tempfile,unittest
+import copy,json,os,re,tempfile,unittest
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -182,7 +182,7 @@ class TimeoutDiagnosticTests(unittest.TestCase):
         (root/'scripts'/'parameter_bridge.jsx').write_text('var request=@@REQUEST@@,result=0;',encoding='utf8')
         stopped=[]
         def launch(args,**kwargs):
-            if enter:(Path(args[-1]).parent/names.STARTED).write_text('1',encoding='ascii')   # AE entered the script, then stalled
+            if enter:(Path(args[-1]).parent/names.STARTED).write_text(enter if isinstance(enter,str) else 'start',encoding='ascii')   # AE entered the script, then stalled
             return SimpleNamespace(pid=8,poll=poll,terminate=lambda:stopped.append(8),wait=lambda timeout:0)
         class Keeper:
             def __init__(self,pid):pass
@@ -208,7 +208,19 @@ class TimeoutDiagnosticTests(unittest.TestCase):
         self.assertIn('转交进程仍未退出',message);self.assertIsNone(details['relayExitCode']);self.assertEqual(stopped,[8])
     def test_script_entered_but_did_not_finish(self):
         message,details,_=self.run_timeout(enter=True,mismatch='不应出现')
-        self.assertIn('AE 已开始执行脚本，但 0.3 秒内没有完成',message);self.assertNotIn('不应出现',message);self.assertTrue(details['scriptStarted'])
+        self.assertIn('AE 已开始执行脚本，但 0.3 秒内没有完成，停在“进入脚本”这一步：AE 可能正忙',message);self.assertNotIn('不应出现',message)
+        self.assertEqual((details['scriptStarted'],details['lastStage']),(True,'start'))
+    def test_the_step_it_stopped_at_is_named(self):
+        message,details,_=self.run_timeout(enter='loadHelper')
+        self.assertIn('停在“加载参数辅助模块”这一步：安全软件',message);self.assertIn('AE 也可能正忙',message);self.assertEqual(details['lastStage'],'loadHelper')
+        message,details,_=self.run_timeout(enter='configure')
+        self.assertIn('停在“核对 AE 模块与名称编码”这一步：这个 AE 版本可能与参数辅助模块不兼容',message)
+        message,details,_=self.run_timeout(enter='odd stage <x>')   # anything unexpected is not echoed into the diagnostic
+        self.assertIn('“未知步骤”',message);self.assertEqual(details['lastStage'],'other')
+    def test_the_bridge_script_marks_each_step(self):
+        source=(Path(names.__file__).parent/'scripts'/'parameter_bridge.jsx').read_text(encoding='utf8')
+        marked=set(re.findall(r"stage\('(\w+)'\)",source))
+        self.assertEqual(marked,set(names.STAGES)-{'1'});self.assertLess(source.index("stage('loadHelper')"),source.index('new ExternalObject'))
     def test_different_administrator_rights_are_named(self):
         message,_,_=self.run_timeout(mismatch='AE 与本程序的管理员权限不同')
         self.assertIn('AE 没有执行脚本：AE 与本程序的管理员权限不同',message)
