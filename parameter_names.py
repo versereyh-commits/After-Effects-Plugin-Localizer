@@ -9,7 +9,7 @@ import ctypes as C
 from ctypes import wintypes as W
 import hashlib,json,os,struct,subprocess,time,uuid,sys,threading
 from pathlib import Path
-from live_names import current_process,Registry,_lock,_process_lock,_save,module_digest
+from live_names import current_process,Registry,_lock,_process_lock,_save,module_digest,profile_for
 from runtime import asset_root,data_root,relay_script,write_json_atomic,unencodable,encoding_problem
 from ae_profiles import get_profile,trial_projects
 from runtime import file_version
@@ -77,6 +77,36 @@ def record_read_timing(metrics):
             with path.open('a',encoding='utf8') as f:f.write(json.dumps(safe,ensure_ascii=False)+'\n')
     except OSError:pass
 
+def tree_children(p,container):
+    """(stream, match-name bytes) of a named group kept in an MSVC std::map (AE 26.5): `container` holds the head
+    sentinel then the size. Nodes are _Left, _Parent, _Right, _Color, _Isnil (+0x19), key (+0x20), value (+0x30);
+    walked in order by successor links, no recursion. Every node visited must add up to the stored size."""
+    def node(address):
+        b=p.read(address,0x38)
+        if b[0x19] not in (0,1):raise RuntimeError('参数树结构不符')
+        return b
+    u64=lambda b,at:struct.unpack_from('<Q',b,at)[0]
+    head=p.u64(container);size=p.u64(container+8);top=node(head)
+    if not top[0x19] or size>8192:raise RuntimeError('参数树结构不符')
+    seen=set();steps=0;at=u64(top,0)
+    while at!=head:
+        b=node(at)
+        if b[0x19] or at in seen or len(seen)>=8192:raise RuntimeError('参数列表循环或过大，已停止')
+        seen.add(at);yield u64(b,0x30),b[0x20:0x30]
+        right=u64(b,0x10)
+        if not node(right)[0x19]:
+            at=right
+            while not node(left:=u64(node(at),0))[0x19]:
+                at=left;steps+=1
+                if steps>65536:raise RuntimeError('参数列表循环或过大，已停止')
+        else:
+            child,parent=at,u64(b,8)
+            while not (up:=node(parent))[0x19] and u64(up,0x10)==child:
+                child,parent=parent,u64(up,8);steps+=1
+                if steps>65536:raise RuntimeError('参数列表循环或过大，已停止')
+            at=parent
+    if len(seen)!=size:raise RuntimeError('参数树结构不符')
+
 class ParameterCatalog:
     def __init__(self,p):
         started=time.perf_counter();self.timings={'scanMs':0.0,'scanCount':0};self.p=p;registry=Registry(p);self.profile=registry.profile # independently pins FLT hash/getters
@@ -137,6 +167,8 @@ class ParameterCatalog:
             if end<begin or (end-begin)%8 or end-begin>8192*8:raise RuntimeError('参数向量结构不符')
             for address in struct.unpack('<'+'Q'*((end-begin)//8),p.read(begin,end-begin)):
                 if address:yield address,p.read(address+8,16)
+        elif getattr(self.profile,'named_tree',False):
+            yield from tree_children(p,root+self.profile.named_map)
         else:
             head=p.u64(root+getattr(self.profile,'named_map',0x228));node=p.u64(head);seen=set()
             while node!=head:
@@ -318,6 +350,12 @@ def _timeout_message(p,folder,request,timeout,use_bridge,launcher,since=0.0)->st
     except OSError:pass
     return 'AE 参数操作超时，已撤销执行许可。'+cause+note
 
+def native_layout(profile)->str:
+    """What the dynamic helper's configure checks and then walks: root vtable, indexed vector, named container,
+    its kind (0 list, 1 vector, 2 tree), and the three getters, in hex."""
+    kind=2 if getattr(profile,'named_tree',False) else int(profile.named_vector)
+    return ','.join(format(v,'x') for v in (profile.root_vtable,profile.group_vector,profile.named_map,kind,profile.parent_get,profile.stream_match_get,profile.count_get))
+
 def run_native(p,operations,timeout=25,action='labels',project_token=None,scope=None):
     if scope is not None and (scope not in ('selected','project') or action not in ('catalog','selection')):raise ValueError('读取范围不能用于写入请求')
     # With the background extension loaded in AE (cep_bridge) the request goes through the folder it watches:
@@ -334,14 +372,14 @@ def run_native(p,operations,timeout=25,action='labels',project_token=None,scope=
         if use_bridge:raise RuntimeError('无法写入后台连接目录：'+str(cep_bridge.root())) from e
         raise RuntimeError('软件所在目录不可写，请把完整软件目录放在可写位置后重试') from e
     script=folder/'request.jsx';output=folder/'result.json';permit=folder/'permit';permit.write_text('pending',encoding='ascii')
-    profile=get_profile(file_version(Path(p.image)))
+    profile=profile_for(p,file_version(Path(p.image)))   # the same choice Registry makes for this AE
     helper=asset_root()/'native'/('ae_parameters_v9.dll' if profile.native_dynamic else 'ae_parameters_v8.dll')
     if not helper.is_file():raise RuntimeError('参数辅助模块缺失，请保留完整 EXE 目录')
     request={'action':action,'requestId':folder.name,'hostVersion':profile.host_version,'projectToken':project_token if project_token is not None else _project_context.get((p.pid,getattr(p,'creation_time',None))),'operations':operations,'output':output.as_posix(),'permit':permit.as_posix(),'expires':int((time.time()+timeout-2)*1000),'helper':helper.as_posix()}
     if scope is not None:request['readScope']=scope
     if trial_projects():request['qaProjects']=list(trial_projects())
     if profile.native_dynamic:
-        request['adapter']={'flt':profile.flt_sha,'tdb':profile.tdb_sha,'codec':profile.codec_sha,'layout':','.join(format(v,'x') for v in (profile.root_vtable,profile.group_vector,profile.named_map,int(profile.named_vector),profile.parent_get,profile.stream_match_get,profile.count_get)),'encoding':profile.encoding}
+        request['adapter']={'flt':profile.flt_sha,'tdb':profile.tdb_sha,'codec':profile.codec_sha,'layout':native_layout(profile),'encoding':profile.encoding}
     launcher=keeper=None
     def relay():
         nonlocal launcher,keeper,script

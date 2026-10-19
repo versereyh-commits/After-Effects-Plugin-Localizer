@@ -18,6 +18,7 @@ from llm_client import translate_names,TranslationError,PROVIDERS,list_models
 from parameter_names import ParameterSession,identity,split_identity,validate_label
 from effect_instances import EffectInstanceSession
 from ae_profiles import is_supported,supported_text
+from ae_paths import installed_flt_sha
 import cep_bridge,release_notes,ui_kit,token_usage,updater
 from PySide6.QtWidgets import QStackedWidget
 from shortcuts import Keymap,ShortcutDialog,PAGES,local_shortcut
@@ -25,7 +26,7 @@ from ui_kit import confirm,choose,inform,ask_text,Prompt,SchemeDelegate,SchemeRo
 from ui_kit import (SHADOW,STATUS_MARK,Banner,DiamondDelegate,Breather,EmptyState,FadeStack,Legend,LoaderButton,MetricTile,UsageTile,NavRail,Pill,SearchField,Spinner,StatusTag,Surface,
                     button,divider,elastic,fade_in,icon,label,logo,menu_button,page_head,repolish,soft_path,table_style)
 
-APP_VERSION='1.2.0'
+APP_VERSION='1.2.1'
 APP_NAME='AE汉化工具'
 # Installed copies: the current folder name, and the folder older versions used (an upgrade keeps it).
 INSTALL_FOLDERS=('AE汉化工具','AE插件名称汉化')
@@ -62,7 +63,8 @@ def discover_spaces(installs:list[dict],version_of,root:Path)->list[VersionSpace
     for item in installs:
         try:version=str(version_of(Path(item['exe'])))
         except Exception:version='版本未知'
-        live=is_supported(version)
+        # A built-in version whose FLT.dll differs (and has no validation on this machine) needs adapting first.
+        live=is_supported(version,installed_flt_sha(item['exe']))
         key=item.get('key',item['name'])
         folder=root if version==SUPPORTED_BUILD and not any(s.version==SUPPORTED_BUILD for s in spaces) else root/'versions'/(re.sub(r'[^0-9A-Za-z]+','_',key).strip('_') or 'AE')
         spaces.append(VersionSpace(key,item['name'].replace('Adobe After Effects','AE').strip() or item['name'],version,Path(item['plugins']),live,folder,Path(item['exe'])))

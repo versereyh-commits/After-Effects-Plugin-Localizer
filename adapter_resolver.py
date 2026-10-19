@@ -93,6 +93,28 @@ class Resolver(ModuleTools):
                 mem=operands[1].mem
                 if ins.reg_name(mem.base) in aliases and not mem.index and 0x80<=mem.disp<=0x800:result.append(mem.disp)
         return unique(result,'参数显示缓存')
+    def named_container(self)->bool:
+        """Whether the named group keeps its streams in a std::map (AE 26.5) rather than an unordered_map's list:
+        every exported LookupStream returns that container's iterator, so its type is spelled in their names."""
+        symbols=getattr(getattr(self.module('TDB.dll')['pe'],'DIRECTORY_ENTRY_EXPORT',None),'symbols',[])
+        kinds={'tree' if '_Tree_' in n else 'list' if '_List_' in n else None for n in (s.name.decode('ascii','replace') for s in symbols if s.name and not s.forwarder) if n.startswith('?LookupStream@TDB_NamedStreamGroup@@')}
+        if kinds not in ({'tree'},{'list'}):raise ValueError('尚未识别命名参数容器')
+        return kinds=={'tree'}
+    def tree_evidence(self,named_map):
+        """The const LookupStream must itself read the map's head at `named_map` and use MSVC's tree node: _Isnil
+        at +0x19, the key (the parameter's match name) at +0x20 and the stream pointer at +0x30."""
+        entry=self.symbol('TDB.dll','?LookupStream@TDB_NamedStreamGroup@@AEBA?AV?$_Tree_const_iterator@')
+        seen=set()
+        for ins in self.instructions('TDB.dll',entry,512):
+            operands=ins.operands
+            for index,o in enumerate(operands):
+                if o.type!=capstone.CS_OP_MEM or o.mem.base in (0,capstone.x86_const.X86_REG_RIP) or o.mem.index:continue
+                disp=o.mem.disp
+                if disp==named_map and ins.mnemonic in ('mov','lea','cmp'):seen.add('head')
+                if disp==0x19 and ins.mnemonic=='cmp' and index==0 and o.size==1 and len(operands)==2 and operands[1].type==capstone.CS_OP_IMM and operands[1].imm==0:seen.add('nil')
+                if disp==0x20 and ins.mnemonic=='lea' and index==1:seen.add('key')
+                if disp==0x30 and ins.mnemonic=='mov' and index==1 and o.size==8:seen.add('value')
+        if seen!={'head','nil','key','value'}:raise ValueError('命名参数树结构不匹配')
     def complete_static(self,host_version):
         fields={e['field']:e['value'] for e in self.getters()}
         missing=[k for k in ('name_get','match_get','category_get','parent_get','stream_match_get','count_get','display_get','group_vector') if k not in fields]
@@ -102,13 +124,19 @@ class Resolver(ModuleTools):
         count=fields['count_get'];raw=self.span('TDB.dll',count,19,code=True)
         if raw.startswith(bytes.fromhex('488b81')):
             if raw[7:10]!=bytes.fromhex('482b81') or raw[14:19]!=bytes.fromhex('48c1f803c3'):raise ValueError('命名参数向量指令不匹配')
-            named=True;count_bytes=raw[:14];named_map=fields['group_vector']+8
+            named=True;tree=False;count_bytes=raw[:14];named_map=fields['group_vector']+8
         elif raw[:2]==bytes.fromhex('8b81') and raw[6]==0xc3:
             named=False;count_bytes=raw[:7];named_map=struct.unpack_from('<I',raw,2)[0]-8
-            # The named group's stream list (head, then its size, which the count getter reads). Up to 26.0 it sat
-            # right after the indexed vector's begin (group_vector+8); AE 26.5 moved it further down. Its place is
-            # taken from the getter's own instruction; the self-check then walks every real parameter tree with it.
-            if named_map%8 or not fields['group_vector']<named_map<=0x800:raise ValueError('命名参数映射位置不合理（%#x）'%named_map)
+            # The named group's container (its head, then its size, which the count getter reads). Up to 26.0 it is
+            # an unordered_map whose list sits right after the indexed vector's begin (group_vector+8); AE 26.5 made
+            # it a std::map at the start of the class's own members — the same offset as the indexed group's vector,
+            # which is a different class. Which one it is comes from LookupStream's exported type; the self-check
+            # then walks every real parameter tree with it.
+            tree=self.named_container()
+            if tree:
+                if named_map%8 or not 0x80<=named_map<=0x800:raise ValueError('命名参数映射位置不合理（%#x）'%named_map)
+                self.tree_evidence(named_map)
+            elif named_map%8 or not fields['group_vector']<named_map<=0x800:raise ValueError('命名参数映射位置不合理（%#x）'%named_map)
         else:raise ValueError('尚未识别命名参数容器')
         codec=self.exe.parent/'U.dll'
         if codec.is_symlink() or not codec.is_file():raise ValueError('名称编码模块缺失或是链接')
@@ -116,7 +144,8 @@ class Resolver(ModuleTools):
             manager=self.manager(),registry_vector=0,fc_vtable=self.primary_vtable('.?AVFLT_FCSpec@@'),root_vtable=self.primary_vtable('.?AVFLT_FCSeqSpec@@'),
             name_get=fields['name_get'],match_get=fields['match_get'],category_get=fields['category_get'],parent_get=fields['parent_get'],stream_match_get=fields['stream_match_get'],
             count_get=count,count_bytes=count_bytes,display_get=fields['display_get'],match_pool=self.match_pool(),display_cache=self.display_cache(fields['display_get']),group_vector=fields['group_vector'],
-            named_vector=named,named_map=named_map,codec_sha=hashlib.sha256(codec.read_bytes()).hexdigest(),native_dynamic=True,enabled=False)
+            named_vector=named,named_map=named_map,codec_sha=hashlib.sha256(codec.read_bytes()).hexdigest(),native_dynamic=True,enabled=False,
+            named_tree=tree)
 
 def _readings(raw:bytes,encoding:str)->set[str]:
     """How AE's scripting may report a name field: in the build's encoding, or — only for bytes that encoding

@@ -119,13 +119,26 @@ def remember(path,exe):
     write_json_atomic(path,{'schemaVersion':1,'paths':saved})
     return item
 
+_flt_digests={}
+def installed_flt_sha(exe)->str|None:
+    """SHA-256 of an installation's Support Files\\FLT.dll (None if unreadable), cached while the file's path,
+    size, modification time and file ID stay the same."""
+    path=Path(exe).parent/'FLT.dll'
+    try:
+        st=path.stat();key=(path_key(path),st.st_size,st.st_mtime_ns,st.st_ino)
+        if key not in _flt_digests:
+            with path.open('rb') as file:_flt_digests[key]=hashlib.file_digest(file,'sha256').hexdigest()
+        return _flt_digests[key]
+    except OSError:return None
+
 def compatibility(item,version_of):
     """Static file evidence only; never grants a new runtime adapter."""
-    from ae_profiles import PROFILES,LOCAL_PROFILES
+    from ae_profiles import get_profile
     exe=Path(item['exe']);report={'name':item['name'],'exe':str(exe),'plugins':item['plugins'],'sources':item.get('sources',[]),'modules':{},'effects':False,'parameters':False}
     try:report['version']=version_of(exe)
     except Exception:report['version']='无法读取'
-    profile=PROFILES.get(report['version']) or LOCAL_PROFILES.get(report['version'])
+    try:profile=get_profile(report['version'],installed_flt_sha(exe))   # the built-in or this machine's, by the file
+    except RuntimeError:profile=None
     for name,expected in (('FLT.dll',profile.flt_sha if profile else None),('TDB.dll',profile.tdb_sha if profile else None)):
         path=exe.parent/name
         try:

@@ -15,9 +15,12 @@ typedef struct {union {wchar_t small[8];wchar_t *pointer;} data;uint64_t length,
 #define API __declspec(dllexport)
 static DWORD script_thread;
 static int profile_ok;
-/* map: where a named group's stream list starts (its head; the count getter reads the size 8 bytes later).
-   It was vector+8 up to AE 26.0; AE 26.5 moved it, so a dynamic adapter passes it explicitly. */
-typedef struct {const char *flt,*tdb;uintptr_t root,vector;int named_vector,legacy;uintptr_t map;} Adapter;
+/* map: where a named group's streams start (the container's head; the count getter reads the size 8 bytes later).
+   Up to AE 26.0 an unordered_map whose list sits at vector+8; AE 26.5 made it a std::map (tree) at the class's
+   first own member, so a dynamic adapter passes both the place and the kind. */
+typedef struct {const char *flt,*tdb;uintptr_t root,vector;int named_vector,legacy;uintptr_t map;int tree;} Adapter;
+/* Exported only when the named group's container is a std::map: its iterator type is part of the name. */
+#define TREE_LOOKUP "?LookupStream@TDB_NamedStreamGroup@@AEBA?AV?$_Tree_const_iterator@V?$_Tree_val@U?$_Tree_simple_types@U?$pair@$$CBVTDB_MatchName@@PEAVTDB_StreamBase@@@std@@@std@@@std@@@std@@AEBVTDB_MatchName@@W4IfMissing@TDB_StreamGroup@@@Z"
 static const Adapter adapters[]={
  {"68b229950e95dedf630f5d09653715268e8beba4830590433abe7cb58e78a357","8e1ea3d5e08d91dd25e899d43e0ad69a525b161716bb4c29250e3711b2591c80",0xc8e80,0x220,0,0,0x228},
  {"a4896d34e20f1fb08ba9afd0fc6e428081bd51dba6abb39e87aa6342c973a183","6d8f80729ef02538415bb6578399cee667101b6c218ea73d85d74357558b660e",0xce2f0,0x220,0,1,0x228},
@@ -206,8 +209,8 @@ static int configure(TaggedData *a) {
         if(i<6){if(*end!=',')return 0;pos=end+1;}else if(*end)return 0;
     }
     uintptr_t root=v[0],vector=v[1],map=v[2],named=v[3],parent_get=v[4],match_get=v[5],count_get=v[6];
-    if(vector<0x80||vector>0x800||vector%8||named>1)return 0;
-    if(named?map!=vector+8:(map%8||map<=vector||map>0x800))return 0;
+    if(vector<0x80||vector>0x800||vector%8||named>2)return 0;
+    if(named==1?map!=vector+8:named==2?(map%8||map<0x80||map>0x800):(map%8||map<=vector||map>0x800))return 0;
     HMODULE f=GetModuleHandleW(L"FLT.dll"),t=GetModuleHandleW(L"TDB.dll"),u=GetModuleHandleW(L"U.dll");
     if(strlen(a[1].data.string)!=64||strlen(a[2].data.string)!=64||strlen(a[4].data.string)!=64)return 0;
     step("hashFLT");if(!module_hash(f,a[1].data.string,"FLT"))return 0;
@@ -219,12 +222,13 @@ static int configure(TaggedData *a) {
     UCHAR *indexed=(UCHAR*)GetProcAddress(t,"?GetNumStreams@TDB_IndexedStreamGroup@@UEBAIXZ");
     if(!indexed||!readable(indexed,19)||memcmp(indexed,"\x48\x8b\x81",3)||memcmp(indexed+7,"\x48\x2b\x81",3)||
         *(uint32_t*)(indexed+3)!=vector+8||*(uint32_t*)(indexed+10)!=vector||memcmp(indexed+14,"\x48\xc1\xf8\x03\xc3",5))return 0;
-    if(!module_range(t,count_get,named?19:7))return 0;
+    if(named==2&&!GetProcAddress(t,TREE_LOOKUP))return 0;
+    if(!module_range(t,count_get,named==1?19:7))return 0;
     UCHAR *count=(UCHAR*)((uintptr_t)t+count_get);
-    if(named){if(memcmp(count,indexed,19))return 0;}
+    if(named==1){if(memcmp(count,indexed,19))return 0;}
     else if(memcmp(count,"\x8b\x81",2)||*(uint32_t*)(count+2)!=map+8||count[6]!=0xc3)return 0;
     step("codecCall");int codec=codec_probe(u);step(codec?"codecReturned":"codecRefused");if(!codec)return 0;
-    dynamic_adapter.root=root;dynamic_adapter.vector=vector;dynamic_adapter.map=map;dynamic_adapter.named_vector=(int)named;dynamic_adapter.legacy=codec==2;
+    dynamic_adapter.root=root;dynamic_adapter.vector=vector;dynamic_adapter.map=map;dynamic_adapter.named_vector=named==1;dynamic_adapter.tree=named==2;dynamic_adapter.legacy=codec==2;
     adapter=&dynamic_adapter;profile_ok=1;return codec;
 }
 #endif
@@ -233,11 +237,41 @@ static int pf_encode(const wchar_t *text,char *out,int size) {
     int n=WideCharToMultiByte(adapter->legacy?CP_ACP:CP_UTF8,adapter->legacy?WC_NO_BEST_FIT_CHARS:0,text,-1,out,size,NULL,adapter->legacy?&fallback:NULL);
     return n>0&&!fallback;
 }
+static int tree_node(uintptr_t node){return readable((void*)node,0x38)&&((UCHAR*)node)[0x19]<=1;}
 static int child_attached(uintptr_t parent,uintptr_t address,const UCHAR *guid) {
     if(adapter->named_vector){
         uintptr_t begin=*(uintptr_t*)(parent+adapter->vector),end=*(uintptr_t*)(parent+adapter->vector+8);
         if(end<begin||(end-begin)%8||end-begin>8192*8||!readable((void*)begin,end-begin))return 0;
         for(uintptr_t at=begin;at<end;at+=8)if(*(uintptr_t*)at==address)return 1;
+    }else if(adapter->tree){
+        /* MSVC tree node: _Left, _Parent, _Right, _Color, _Isnil (+0x19), key (+0x20), value (+0x30). In order by
+           successor links, so no recursion or stack. */
+        uintptr_t head=*(uintptr_t*)(parent+adapter->map);
+        if(!tree_node(head)||!((UCHAR*)head)[0x19])return 0;
+        uintptr_t node=*(uintptr_t*)head;unsigned seen=0,steps=0;
+        while(node!=head){
+            if(!tree_node(node)||((UCHAR*)node)[0x19]||++seen>8192)return 0;
+            if(*(uintptr_t*)(node+0x30)==address&&!memcmp((void*)(node+0x20),guid,16))return 1;
+            uintptr_t right=*(uintptr_t*)(node+0x10);
+            if(!tree_node(right))return 0;
+            if(!((UCHAR*)right)[0x19]){
+                node=right;
+                for(;;){
+                    uintptr_t left=*(uintptr_t*)node;
+                    if(!tree_node(left))return 0;
+                    if(((UCHAR*)left)[0x19])break;
+                    node=left;if(++steps>65536)return 0;
+                }
+            }else{
+                uintptr_t child=node,up=*(uintptr_t*)(node+8);
+                for(;;){
+                    if(!tree_node(up))return 0;
+                    if(((UCHAR*)up)[0x19]||*(uintptr_t*)(up+0x10)!=child)break;
+                    child=up;up=*(uintptr_t*)(up+8);if(++steps>65536)return 0;
+                }
+                node=up;
+            }
+        }
     }else{
         uintptr_t head=*(uintptr_t*)(parent+adapter->map);
         if(!readable((void*)head,40))return 0;
@@ -266,6 +300,7 @@ API long setLabel(TaggedData *a,long count,TaggedData *out) {
     /* The stream must still be attached to a currently published effect root.
        A stale undo/copy-on-write object is not a valid mutation target. */
     SIZE_T root_size=adapter->vector+24>0x240?adapter->vector+24:0x240;
+    if(adapter->map+16>root_size)root_size=adapter->map+16;
     if(!readable((void*)parent,root_size)||*(uintptr_t*)parent!=(uintptr_t)GetModuleHandleW(L"FLT.dll")+adapter->root)return 45;
     uintptr_t parade=*(uintptr_t*)(parent+0x20);
     if(!readable((void*)parade,adapter->vector+24))return 45;

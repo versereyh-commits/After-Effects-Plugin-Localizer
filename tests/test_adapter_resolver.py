@@ -42,8 +42,9 @@ class ResolverTests(fixtures.AnalysisTests):
         with self.assertRaises(ValueError):self.resolver.primary_vtable('.?AVFLT_FCSeqSpec@@')
 
 class NamedListPlacementTests(unittest.TestCase):
-    """Where the named group's stream list sits comes from the count getter's instruction (AE 26.5 moved it)."""
-    def resolver(self,count_instruction):
+    """Where the named group's container sits comes from the count getter's instruction; whether it is a list or
+    (AE 26.5) a std::map comes from LookupStream's exported type."""
+    def resolver(self,count_instruction,tree=False):
         import tempfile
         from pathlib import Path
         folder=tempfile.TemporaryDirectory();self.addCleanup(folder.cleanup);(Path(folder.name)/'U.dll').write_bytes(b'u')
@@ -53,15 +54,44 @@ class NamedListPlacementTests(unittest.TestCase):
         r.getters=lambda:[{'field':k,'value':v} for k,v in fields.items()];r.span=lambda module,rva,size,code=False:count_instruction.ljust(size,b'\xcc')
         r.exe=Path(folder.name)/'AfterFX.exe';r.modules={'FLT.dll':{'sha256':'f'},'TDB.dll':{'sha256':'t'}};r.version='26.5.0.89'
         r.manager=lambda:0x100;r.primary_vtable=lambda name:0x200;r.match_pool=lambda:0x300;r.display_cache=lambda entry:0x88
+        r.named_container=lambda:tree;r.tree_evidence=lambda named_map:None
         return r
     def test_list_right_after_the_vector_as_up_to_26_0(self):
-        self.assertEqual(self.resolver(bytes.fromhex('8b8130020000c3')).complete_static('').named_map,0x228)
-    def test_list_moved_further_down_as_in_26_5(self):
+        profile=self.resolver(bytes.fromhex('8b8130020000c3')).complete_static('')
+        self.assertEqual((profile.named_map,profile.named_tree),(0x228,False))
+    def test_list_further_down_is_accepted(self):
         profile=self.resolver(bytes.fromhex('8b8140020000c3')).complete_static('')
         self.assertEqual((profile.named_map,profile.named_vector,profile.count_bytes),(0x238,False,bytes.fromhex('8b8140020000c3')))
     def test_implausible_places_are_refused(self):
         for raw in ('8b8124020000c3','8b8128020000c3','8b8110090000c3'):   # misaligned, inside the vector, too far
             with self.assertRaisesRegex(ValueError,'命名参数映射位置不合理'):self.resolver(bytes.fromhex(raw)).complete_static('')
+    def test_26_5_tree_shares_the_offset_of_the_other_class_vector(self):
+        profile=self.resolver(bytes.fromhex('8b8128020000c3'),tree=True).complete_static('')
+        self.assertEqual((profile.named_map,profile.group_vector,profile.named_tree,profile.named_vector),(0x220,0x220,True,False))
+        for raw in ('8b8124020000c3','8b8140000000c3','8b8110090000c3'):   # misaligned, inside the base object, too far
+            with self.assertRaisesRegex(ValueError,'命名参数映射位置不合理'):self.resolver(bytes.fromhex(raw),tree=True).complete_static('')
+
+class NamedContainerTests(unittest.TestCase):
+    """26.5's container type is read from LookupStream's own export names and instructions."""
+    LOOKUP='?LookupStream@TDB_NamedStreamGroup@@AEBA?AV?$_%s_const_iterator@V?$_%s_val@@Z'
+    def resolver(self,names,code=b''):
+        import capstone
+        r=Resolver.__new__(Resolver);r.dis=capstone.Cs(capstone.CS_ARCH_X86,capstone.CS_MODE_64);r.dis.detail=True
+        symbols=[SimpleNamespace(name=n.encode(),forwarder=None,address=0x1000) for n in names]
+        r.module=lambda name:{'pe':SimpleNamespace(DIRECTORY_ENTRY_EXPORT=SimpleNamespace(symbols=symbols))}
+        r.instructions=lambda module,rva,size=256:list(r.dis.disasm(code,rva))
+        return r
+    def test_export_names_decide_list_or_tree(self):
+        self.assertTrue(self.resolver([self.LOOKUP%('Tree','Tree')]).named_container())
+        self.assertFalse(self.resolver([self.LOOKUP%('List','List')]).named_container())
+        for names in ([self.LOOKUP%('Tree','Tree'),self.LOOKUP%('List','List')],[],['?LookupStream@TDB_NamedStreamGroup@@AEBAXZ']):
+            with self.assertRaisesRegex(ValueError,'尚未识别命名参数容器'):self.resolver(names).named_container()
+    def test_tree_needs_head_and_node_fields_in_lookup(self):
+        # 26.5: mov rdi,[rbp+0x220]; cmp byte [rsi+0x19],0; lea rcx,[rsi+0x20]; mov rsi,[rdi+0x30]; ret
+        code=bytes.fromhex('488bbd20020000'+'807e1900'+'488d4e20'+'488b7730'+'c3')
+        self.resolver([self.LOOKUP%('Tree','Tree')],code).tree_evidence(0x220)
+        with self.assertRaisesRegex(ValueError,'命名参数树结构不匹配'):self.resolver([self.LOOKUP%('Tree','Tree')],code).tree_evidence(0x228)
+        with self.assertRaisesRegex(ValueError,'命名参数树结构不匹配'):self.resolver([self.LOOKUP%('Tree','Tree')],code[:11]+code[15:]).tree_evidence(0x220)
 
 # Avoid repeating the base class tests through inheritance during discovery.
 for _name in list(fixtures.AnalysisTests.__dict__):

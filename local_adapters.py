@@ -47,7 +47,10 @@ def load_validated(exe,root=None):
         for key,value in asdict(fresh).items():
             if key not in ('registry_vector','encoding','match_encoding','enabled') and getattr(stored,key)!=value:raise ValueError('本机证书与重新解析的结构不符：'+key)
         if not stored.enabled or not stored.native_dynamic:raise ValueError('本机证书未启用')
-        if stored.version not in PROFILES:LOCAL_PROFILES[stored.version]=stored
+        # Also for a built-in version whose installed files differ from the built-in build (patched, slimmed or
+        # repackaged AE): the running FLT.dll's hash then picks this one. Identical files keep the built-in.
+        built=PROFILES.get(stored.version)
+        if not built or (built.flt_sha,built.tdb_sha)!=(stored.flt_sha,stored.tdb_sha):LOCAL_PROFILES[stored.version]=stored
         return stored
     finally:resolver.close()
 

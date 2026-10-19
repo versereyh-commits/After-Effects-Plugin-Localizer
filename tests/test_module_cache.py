@@ -30,7 +30,7 @@ class CodecTests(unittest.TestCase):
         self.profile=replace(PROFILES['26.0.0.67'],version='99.0.0.1',native_dynamic=True,codec_sha='c'*64,encoding='utf8')
         getters={self.profile.name_get:bytes.fromhex('488d4110c3'),self.profile.match_get:bytes.fromhex('488d4140c3'),self.profile.category_get:bytes.fromhex('488d4160c3')}
         digests={'FLT.dll':self.profile.flt_sha,'TDB.dll':self.profile.tdb_sha,'U.dll':self.profile.codec_sha}
-        for target,value in (('get_profile',lambda version:self.profile),('file_version',lambda path:'99.0.0.1'),('module_digest',lambda p,path:digests[path])):
+        for target,value in (('get_profile',lambda version,flt_sha=None:self.profile),('file_version',lambda path:'99.0.0.1'),('module_digest',lambda p,path:digests[path])):
             h=patch.object(live_names,target,value);h.start();self.addCleanup(h.stop)
         self.host=lambda created:SimpleNamespace(pid=5,creation_time=created,image='AfterFX.exe',modules=lambda:[{'name':n,'base':0x1000,'path':n} for n in digests],read=lambda a,s:getters[a-0x1000],u64=lambda a:0)
     def test_encoding_is_asked_once_per_ae_process(self):

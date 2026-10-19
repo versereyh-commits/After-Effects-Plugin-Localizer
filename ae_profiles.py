@@ -38,10 +38,22 @@ class Profile:
     # How AE reads the internal-name field, when that differs from the names: AE 2021 (18.0) reads names as UTF-8
     # but internal names in the system code page. '' means the same as `encoding`.
     match_encoding:str=''
+    # The named group keeps its streams in a std::map (AE 26.5) instead of an unordered_map's list; named_map is
+    # then the tree's head, and its size is the count getter's field.
+    named_tree:bool=False
 
 def match_encoding(profile)->str:return getattr(profile,'match_encoding','') or profile.encoding
 
 PROFILES={
+    # Built in from this build's own automatic adaptation (static resolution + full owned-QA self-check with all
+    # restores, 2026-10-19). Its named group is a std::map, which only the dynamic helper (v9) walks, so it keeps
+    # the dynamic path: v9 re-checks the FLT/TDB/U hashes, getters, tree export and encoding before any write.
+    '26.5.0.89':Profile('26.5.0.89','26.5x89',
+        '9a1afe7700229cd0bc39dd37a146b1d3871fc84a8e6f991a7ef56390f21378d3',
+        'ef851c3ccbc43da4e0d4899a52baa05a7a71a3cef3a4fdb09abbb0263960ccb5',
+        0x12d998,0x20,0xbf0b0,0xbf110,0x66750,0x67790,0x65ab0,
+        0x38d30,0x389f0,0x2ab70,bytes.fromhex('8b8128020000c3'),0x36fb0,0x8dcd0,0xf0,0x220,enabled=True,named_map=0x220,
+        codec_sha='1a465b53deac7a3d14187ed175ba85498dbf5b5463259dec1f202a3393050fd0',native_dynamic=True,named_tree=True),
     '26.0.0.67':Profile('26.0.0.67','26.0x67',
         '68b229950e95dedf630f5d09653715268e8beba4830590433abe7cb58e78a357',
         '8e1ea3d5e08d91dd25e899d43e0ad69a525b161716bb4c29250e3711b2591c80',
@@ -75,15 +87,28 @@ def trial_adapter(profile,projects):
 
 def trial_projects():return _trial.get()[1] if _trial.get() else ()
 
-def get_profile(version):
+def _candidates(version):
+    """The built-in profile of this version first, then this machine's validated one. Both can exist when the
+    installed files differ from the built-in build's (patched, slimmed or repackaged AE with the same version)."""
+    return [p for p in (PROFILES.get(version),LOCAL_PROFILES.get(version)) if p]
+
+def ambiguous(version)->bool:
+    """Whether choosing needs the running FLT.dll's hash (otherwise the only candidate is checked as before)."""
+    trial=_trial.get()
+    return not (trial and trial[0].version==version) and len(_candidates(version))>1
+
+def get_profile(version,flt_sha=None):
+    """The profile for `version`; with `flt_sha`, the one validated for that FLT.dll (else the first, whose own
+    hash check then stops the operation)."""
     trial=_trial.get()
     if trial and trial[0].version==version:return trial[0]
-    try:return PROFILES.get(version) or LOCAL_PROFILES[version]
-    except KeyError:raise RuntimeError('此 AE 构建尚未适配实时写入：'+str(version)) from None
+    found=_candidates(version)
+    if not found:raise RuntimeError('此 AE 构建尚未适配实时写入：'+str(version))
+    return next((p for p in found if flt_sha and p.flt_sha==flt_sha),found[0])
 
-def is_supported(version):
-    profile=PROFILES.get(version) or LOCAL_PROFILES.get(version)
-    return bool(profile and profile.enabled)
+def is_supported(version,flt_sha=None):
+    """Enabled for this version; with `flt_sha`, only if one enabled profile was validated for that FLT.dll."""
+    return any(p.enabled and (flt_sha is None or p.flt_sha==flt_sha) for p in _candidates(version))
 
 def runtime_allowed(version):
     trial=_trial.get()
@@ -98,4 +123,11 @@ def nameless(raw:bytes,encoding:str)->bool:
     try:raw.decode(encoding);return False
     except UnicodeDecodeError:return True
 
-def supported_text():return '、'.join([*(p.version for p in PROFILES.values() if p.enabled),*(p.version+'（本机验证）' for key,p in LOCAL_PROFILES.items() if p.enabled and key not in PROFILES)])
+def supported_text():return '、'.join([*(p.version for p in PROFILES.values() if p.enabled),*(p.version+'（本机验证）' for key,p in LOCAL_PROFILES.items() if p.enabled and (key not in PROFILES or p.flt_sha!=PROFILES[key].flt_sha))])
+
+def mismatch_text(version)->str:
+    """Why nothing is written when the running FLT.dll is not the one any profile of this version was validated
+    for: the same version number with different files (patched, slimmed or repackaged AE, or a broken install)."""
+    return (f'当前 AE 的效果模块（FLT.dll）与已验证的 {version} 不同，未执行写入。常见原因是 AE 文件被补丁、精简版或重新打包修改过'
+            '（可右键 Support Files\\FLT.dll → 属性 → 数字签名，查看是否为有效的 Adobe Inc. 签名）。'
+            '请在“AE 版本”页点“自动识别与适配”，自检通过后即可在这台电脑上使用')

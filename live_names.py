@@ -8,7 +8,7 @@ import hashlib,json,os,struct,threading
 from win_process import Process
 from ae_ui import main_window
 from runtime import data_root,native_probe,file_version,write_json_atomic,unencodable,encoding_problem
-from ae_profiles import get_profile,supported_text,PROFILES,runtime_allowed,nameless,match_encoding
+from ae_profiles import get_profile,supported_text,PROFILES,runtime_allowed,nameless,match_encoding,ambiguous,mismatch_text
 
 PROFILE_SHA='68b229950e95dedf630f5d09653715268e8beba4830590433abe7cb58e78a357'
 MANAGER_RVA=0x14dee0
@@ -88,16 +88,26 @@ def module_digest(p,path):
         with _verify_lock:_digests[key]=digest
     return digest
 
+def profile_for(p:Process,version=None):
+    """The profile this running AE uses, chosen as Registry does. Only a version with both a built-in and a
+    machine-validated profile needs the loaded FLT.dll's hash (one module listing; the digest is cached)."""
+    version=version or file_version(Path(p.image))
+    if not ambiguous(version):return get_profile(version)
+    module=next((m for m in p.modules() if m['name'].lower()=='flt.dll'),None)
+    return get_profile(version,module_digest(p,module['path']) if module else None)
+
 class Registry:
     def __init__(self,p:Process):
         self.p=p
-        self.profile=get_profile(file_version(Path(p.image)))
+        version=file_version(Path(p.image));self.profile=get_profile(version)   # stops for builds never adapted
         self.modules=p.modules() # one enumeration (~80 ms) per read, shared with ParameterCatalog
         module=next((m for m in self.modules if m['name'].lower()=='flt.dll'),None)
         if not module:raise RuntimeError('AE 尚未加载效果模块，请等待启动完成')
         self.base=module['base'];self.path=module['path']
-        if module_digest(p,self.path)!=self.profile.flt_sha:
-            raise RuntimeError('当前 AE 效果模块哈希与该构建的适配器不匹配，未执行写入')
+        # A built-in version may also have this machine's own validated profile (its files differ from the
+        # built-in build's); the running FLT.dll decides which one, and must match it exactly.
+        digest=module_digest(p,self.path);self.profile=get_profile(version,digest)
+        if digest!=self.profile.flt_sha:raise RuntimeError(mismatch_text(version))
         if self.profile.native_dynamic:
             for name,digest in (('tdb.dll',self.profile.tdb_sha),('u.dll',self.profile.codec_sha)):
                 other=next((m for m in self.modules if m['name'].casefold()==name),None)
@@ -176,7 +186,7 @@ def current_process(write=False,expected_image=None):
 def read_live(expected_image=None):
     with (current_process(expected_image=expected_image) if expected_image else current_process()) as p:
         registry=Registry(p);records=registry.records()
-        profile=get_profile(file_version(Path(p.image)))
+        profile=registry.profile
         return {'pid':p.pid,'creationTime':p.creation_time,'image':p.image,'version':profile.version,'profileSha256':profile.flt_sha,'effects':[{k:v for k,v in r.items() if k not in ('address','guard')} for r in records],
                 'unnamedEffects':list(getattr(registry,'unnamed',[]))}
 
