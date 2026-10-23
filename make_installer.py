@@ -55,6 +55,16 @@ def scan(folder:Path):
             if any(p.search(data) for p in patterns):hits.append(path.relative_to(folder))
     if hits:raise RuntimeError('安装包内容含本机信息，已停止：'+'、'.join(map(str,hits[:10])))
 
+def check_version(folder:Path,version_:str):
+    """The packed program must be this version. --skip-build reuses build/installer from the last run, and 1.2.1 was
+    first shipped with the 1.2.0 program inside an installer named 1.2.1."""
+    from PyInstaller.archive.readers import CArchiveReader
+    import marshal
+    script=CArchiveReader(str(folder/f'{NAME}.exe')).extract('app_live')   # the entry script's module code object
+    if isinstance(script,bytes):script=marshal.loads(script)
+    if version_ not in script.co_consts:   # APP_VERSION is a module-level string constant
+        raise RuntimeError(f'构建目录里的程序不是 {version_}（可能是 --skip-build 用了旧构建），已停止：{folder}')
+
 def check_cpu(folder:Path):
     """Our native helpers must run on any x86-64 CPU: a build for the build machine's own CPU once shipped GFNI/AVX2
     code that crashed AE on AMD Zen 1-3 and older Intel CPUs."""
@@ -73,7 +83,8 @@ GUIDE='''AE汉化工具 {version} 使用说明
   2. 打开本软件，在左下角选择你的 AE 版本，点“连接 AE”。
   3. 在“效果名称”页选中或勾选效果，在右侧详情里点“翻译所选项 / 翻译勾选项”（需要先在“设置与日志”里
      配置翻译服务和自己的 API Key），确认中文后点“应用到 AE”。有勾选时只处理勾选项，没有勾选时处理所选行。
-     完成后在 AE 的“效果和预设”面板菜单里点“刷新列表”。
+     完成后点击软件的刷新按钮，或在 AE 的“效果和预设”面板菜单里点“刷新列表”。若软件无法定位菜单，先展开面板，
+     再用“更多 → 校准刷新菜单按钮”，在 5 秒内把鼠标停在 AE 的菜单按钮上即可；本次会话有效，布局或缩放变化需重校准。
   4. 参数名称在“参数名称”页读取、翻译并应用。读取范围默认是 AE 当前合成里选中的图层，也可以改为整个工程；
      每次启动 AE 后的第一次读取较慢（需要识别结构），之后切换图层或范围通常一秒左右。
   5. “翻译方案”页可以保存、切换、编辑和导入 / 导出整套汉化。
@@ -301,7 +312,7 @@ def main():
     guide=support/'使用说明.txt';guide.write_text(GUIDE.format(version=version_),encoding='utf-8-sig')
     notice=support/'第三方组件说明';notices(notice)
     ico=support/'app.ico';icon(ico)
-    scan(app);scan(support);check_cpu(app)
+    scan(app);scan(support);check_cpu(app);check_version(app,version_)
     script=stage/'installer.iss';script.write_text(iss(version_,app,guide,notice,ico),encoding='utf-8-sig')
     release.mkdir(exist_ok=True)
     subprocess.run([str(compiler),'/Q',str(script)],check=True)

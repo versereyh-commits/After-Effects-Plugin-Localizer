@@ -15,7 +15,7 @@ from ui_kit import SHADOW,Banner,SearchField,Surface,button,confirm,icon,label,t
 
 PORTABLE=QKeySequence.SequenceFormat.PortableText
 NATIVE=QKeySequence.SequenceFormat.NativeText
-PAGES=('效果名称','参数名称','翻译方案','AE 版本','设置与日志')
+PAGES=('效果名称','参数名称','翻译方案','AE 版本','设置与日志','快速搜索')   # by page number (app_live.QUICK came last)
 
 class Command(NamedTuple):
     id:str
@@ -23,6 +23,7 @@ class Command(NamedTuple):
     group:str
     default:str
     local:bool=False    # Works only while its list or table has focus.
+    over_ae:bool=False  # A global key that works only while AE is the foreground window (quick_search.AeHotkey).
 
 COMMANDS=(
     Command('translate','翻译所选项 / 勾选项','效果名称','Ctrl+T'),
@@ -34,6 +35,9 @@ COMMANDS=(
     Command('uncheck_all','取消全部勾选','效果名称',''),
     Command('connect','连接 / 重新读取 AE','AE','F5'),
     Command('restore_all','一键恢复全部默认（含参数）','AE',''),
+    Command('quick_search','在 AE 中快速搜索并添加效果（只在 AE 窗口在前台时）','AE','Ctrl+Space',over_ae=True),
+    # Ctrl+Shift+Space (the user's choice, 2026-10-21): Shift+Space is one of AE's own preview keys.
+    Command('layer_parameters','在 AE 中把选中图层的全部参数改成中文（只在 AE 窗口在前台时）','AE','Ctrl+Shift+Space',over_ae=True),
     Command('save_scheme','保存更改到当前方案','翻译方案','Ctrl+S'),
     Command('save_as','新建方案 / 另存勾选项为新方案','翻译方案','Ctrl+Shift+S'),
     Command('import','从文件导入方案','翻译方案',''),
@@ -74,6 +78,8 @@ def problem(command_id:str,seq:QKeySequence)->str:
     if key==Qt.Key.Key_Escape:return 'Esc 用于关闭窗口和取消录制，不能设置为快捷键'
     if key==Qt.Key.Key_Tab or key==Qt.Key.Key_Backtab:return 'Tab 用于切换输入焦点，不能设置为快捷键'
     if mods&HELD or key in FKEYS:return ''
+    # Over AE only: Shift+Space too (FX Console's habit); Shift with a letter would take capitals from AE's text fields.
+    if BY_ID[command_id].over_ae and key==Qt.Key.Key_Space and mods==Qt.KeyboardModifier.ShiftModifier:return ''
     if BY_ID[command_id].local and key in LOCAL_KEYS:return ''
     return '需要搭配 Ctrl 或 Alt（F1–F12 除外），以免打字时误触'+('；列表类操作也可以用 Delete、Enter、Space' if BY_ID[command_id].local else '')
 

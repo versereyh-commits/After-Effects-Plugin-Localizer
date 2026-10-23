@@ -9,10 +9,11 @@ const request={action:'labels',hostVersion:'24.2.1x2',projectToken:(hash>>>0).to
 {address:'good',guid:'g',parent:'p',before:' ',after:'边缘重复',afterPf:'边缘重复',beforeDisplay:'重复边缘像素'},
 {address:'bad',guid:'g',parent:'p',before:'x',after:'y',afterPf:'y',beforeDisplay:'x'}]};
 function File(path){this.fsName=path;this.exists=path==='permit';this.open=()=>true;this.write=text=>files[path]=text;this.close=()=>{};}
-function ExternalObject(){return {setLabel:(address,guid,parent,before,after,afterPf,displayBefore)=>{
+function ExternalObject(path){if(path==='lib:identity')return {identity:()=>JSON.stringify(request.targetHost)};return {setLabel:(address,guid,parent,before,after,afterPf,displayBefore)=>{
 calls.push([address,before,after,afterPf,displayBefore]);if(address==='bad')throw Error('controlled failure');
 if(state.pf!==before||state.display!==displayBefore)throw Error('guard mismatch');state={pf:afterPf,display:after};}};}
 const app={version:'24.2.1x2',project:{file:{fsName:path},numItems:0,renderQueue:{rendering:false}}};
+request.targetHost={pid:3,creationTime:'0000000000000004',image:'C:/AE/AfterFX.exe'};request.identityHelper='identity';
 vm.runInNewContext(source.replace('@@REQUEST@@',JSON.stringify(request)),{app,File,ExternalObject},{timeout:3000});
 process.stdout.write(JSON.stringify({state,calls,result:JSON.parse(files.output)}));
 '''

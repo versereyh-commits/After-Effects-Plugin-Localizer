@@ -33,6 +33,22 @@ def elevation_mismatch(pid:int)->str:
     side=lambda value:'以管理员身份运行' if value else '普通权限'
     return f'AE 与本程序的管理员权限不同（AE：{side(host)}，本程序：{side(own)}），Windows 可能拦截了脚本转交。请让两者用相同权限运行（建议都不要“以管理员身份运行”）后重试'
 
+def window_process(hwnd:int)->tuple[int,str]|None:
+    """(pid, full executable path) of the process owning a window, or None. Query rights only."""
+    if not hwnd:return None
+    u=C.WinDLL('user32',use_last_error=True);k=C.WinDLL('kernel32',use_last_error=True)
+    u.GetWindowThreadProcessId.argtypes=[W.HWND,C.POINTER(W.DWORD)];u.GetWindowThreadProcessId.restype=W.DWORD
+    k.OpenProcess.argtypes=[W.DWORD,W.BOOL,W.DWORD];k.OpenProcess.restype=C.c_void_p;k.CloseHandle.argtypes=[C.c_void_p]
+    k.QueryFullProcessImageNameW.argtypes=[C.c_void_p,W.DWORD,W.LPWSTR,C.POINTER(W.DWORD)];k.QueryFullProcessImageNameW.restype=W.BOOL
+    pid=W.DWORD()
+    if not u.GetWindowThreadProcessId(W.HWND(hwnd),C.byref(pid)) or not pid.value:return None
+    handle=k.OpenProcess(0x1000,False,pid.value)   # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:return None
+    try:
+        size=W.DWORD(1024);buffer=C.create_unicode_buffer(size.value)
+        return (pid.value,buffer.value) if k.QueryFullProcessImageNameW(handle,0,buffer,C.byref(size)) else None
+    finally:k.CloseHandle(handle)
+
 class Process:
     def __init__(self,pid:int,write:bool=False):
         self.pid=pid;self.k=C.WinDLL('kernel32',use_last_error=True)

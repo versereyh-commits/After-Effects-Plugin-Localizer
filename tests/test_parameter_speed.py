@@ -7,7 +7,7 @@ import parameter_names as n
 
 class SpeedTests(unittest.TestCase):
     def setUp(self):
-        for name in ('_cache','_project_context','_shape_context','_scan_reason','_unsupported'):
+        for name in ('_cache','_project_context','_shape_context','_scan_reason','_unsupported','_scan_kind'):
             h=patch.dict(getattr(n,name),{},clear=True);h.start();self.addCleanup(h.stop)
         self.p=SimpleNamespace(pid=11,creation_time=22);self.key=(11,22);self.param=n.identity('fx','p')
     def host(self,rows,token='project'):
@@ -54,6 +54,36 @@ class SpeedTests(unittest.TestCase):
         self.assertEqual(c.roots(),[400]);c._scan_parades.assert_called_once();self.assertEqual(n._cache[self.key],{100})
     def test_new_process_creation_does_not_reuse_old_pointers(self):
         c=self.catalog();n._cache[(11,21)]={999};self.assertEqual(c.roots(),[400,600]);c._scan_parades.assert_called_once()
+    def heap_catalog(self,found):
+        c=self.catalog()
+        def scan(full):c.timings['scanTarget']='full' if full else 'heap';return {100,200} if full else found
+        c._scan_parades=Mock(side_effect=scan);return c
+    def test_heap_structure_is_replaced_by_a_full_scan_for_writes(self):
+        c=self.heap_catalog({100});self.assertEqual(c.roots(),[400]);self.assertEqual(n._scan_kind[self.key],'heap')
+        self.assertEqual(c.roots(full=True),[400,600]);self.assertEqual([x.args[0] for x in c._scan_parades.call_args_list],[False,True])
+        self.assertEqual(n._scan_kind[self.key],'full');self.assertEqual(c.timings['scanHeapMissed'],1)
+        # A full structure serves both reads and writes without scanning again.
+        c.roots();c.roots(full=True);self.assertEqual(c._scan_parades.call_count,2)
+    def read_with(self,c,host):
+        with patch.object(n,'current_process',return_value=nullcontext(self.p)),patch.object(n,'_process_lock',return_value=nullcontext()),patch.object(n,'_host_names',return_value=host),patch.object(n,'ParameterCatalog',return_value=c),patch.object(n,'record_read_timing'):
+            return n.read_parameters()
+    def scanning_mock(self,heap_parents):
+        """First read scans the heap (finds heap_parents), a full scan finds parents 1 and 2."""
+        c=Mock();c.timings={'modulesMs':1,'matchPoolMs':2,'scanMs':0,'scanCount':0,'mode':'scan'}
+        row=lambda parent:{'id':self.param,'effectMatchName':'fx','matchName':'p','name':'x','address':parent,'parent':parent,'guid':'g','pfName':'x'}
+        def rows(rescan,progress,full=False):
+            c.timings['scanCount']+=1;n._scan_kind[self.key]='full' if full else 'heap';n._cache[self.key]={1}
+            return [row(x) for x in ((1,2) if full else heap_parents)]
+        c.rows.side_effect=rows;return c
+    def test_heap_scan_short_of_visible_instances_escalates_to_full(self):
+        c=self.scanning_mock((1,));r=self.read_with(c,{self.param:['A','B']})
+        self.assertEqual([x.kwargs.get('full',False) for x in c.rows.call_args_list],[False,True]);self.assertEqual(r['timings']['scanEscalated'],1)
+    def test_complete_heap_scan_is_trusted_for_reads(self):
+        c=self.scanning_mock((1,2));r=self.read_with(c,{self.param:['A','B']})
+        self.assertEqual(c.rows.call_count,1);self.assertNotIn('scanEscalated',r['timings']);self.assertEqual(r['parameters'][0]['instances'],2)
+    def test_heap_scan_missing_an_effect_type_escalates_to_full(self):
+        c=self.scanning_mock(());self.read_with(c,{self.param:['A']})
+        self.assertEqual([x.kwargs.get('full',False) for x in c.rows.call_args_list],[False,True])
     def test_empty_host_skips_module_pool_and_memory_scan(self):
         with patch.object(n,'current_process',return_value=nullcontext(self.p)),patch.object(n,'_process_lock',return_value=nullcontext()),patch.object(n,'_host_names',return_value={}),patch.object(n,'ParameterCatalog') as catalog,patch.object(n,'record_read_timing'):
             r=n.read_parameters();catalog.assert_not_called();self.assertEqual(r['parameters'],[]);self.assertEqual(r['timings']['scanCount'],0)

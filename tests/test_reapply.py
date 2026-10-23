@@ -57,11 +57,11 @@ class AutoReapplyTests(GuiCase):
         w=self.window;self.assertTrue(w.reapply_box.isChecked());w.reapply_box.setChecked(False)
         self.assertIs(json.loads((Path(self.temp.name)/'ui.json').read_text(encoding='utf8'))['reapplyNames'],False)
         self.connect(1,{'S_Glow':'S_Glow'});self.assertEqual(self.calls,[])
-    def test_failure_is_reported_and_not_retried_for_the_same_process(self):
+    def test_failure_can_be_retried_on_explicit_reconnect(self):
         w=self.window;errors=[]
         with patch.object(w,'work',lambda work,done,failure=None:failure('AE 有对话框打开')),patch.object(w,'error',errors.append):
             self.connect(1,{'S_Glow':'S_Glow'});self.connect(1,{'S_Glow':'S_Glow'})
-        self.assertEqual(errors,['自动重新应用效果名称未完成：AE 有对话框打开'])
+        self.assertEqual(errors,['自动重新应用效果名称未完成：AE 有对话框打开']*2)
 
 class SettingsTextTests(GuiCase):
     def test_limits_and_wording(self):

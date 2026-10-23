@@ -96,7 +96,7 @@ class ValidationRun:
                 self.before=self.bridge.call('snapshot')['rows']
                 self.notify(progress,'核对参数标识池与当前参数树……')
                 with self.bridge.process() as p:
-                    actual=_host_names(p);rows=ParameterCatalog(p).rows(rescan=True,progress=progress)
+                    actual=_host_names(p);rows=ParameterCatalog(p).rows(rescan=True,progress=progress,full=True)
                     self.check('parameterNamesMatch',bool(rows) and all(row['id'] in actual and row['name'] in actual[row['id']] for row in rows))
                 self.labels=self.parameter_labels({row['id'] for row in rows});self.effect_names={self.fixture['testEffect']:EFFECT_LABEL}
                 self.notify(progress,'验证有效渲染对照……');self.baseline=self.render('baseline');disabled=self.render('disabled',disabled=True)

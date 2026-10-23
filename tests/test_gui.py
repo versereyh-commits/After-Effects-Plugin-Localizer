@@ -34,6 +34,9 @@ class GuiCase(unittest.TestCase):
         # Nor Adobe's real registry settings (the extension debug mode).
         for name,value in (('_registry_get',lambda version:None),('_registry_set',lambda version,value:None)):
             handle=patch.object(app_live.cep_bridge,name,value);handle.start();self.addCleanup(handle.stop)
+        # Nor the real Run key (start with Windows).
+        for name,value in (('_registry_get',lambda:None),('_registry_set',lambda value:None)):
+            handle=patch.object(app_live.autostart,name,value);handle.start();self.addCleanup(handle.stop)
         self.window=app_live.Window();self.addCleanup(self.window.deleteLater)
         # Same effect installed for two AE versions gives two rows with one identity.
         self.window.show_scan(([plugin('S_Glow','S_Glow','Sapphire Lighting','a/S_Glow.aex'),plugin('Shine','tc Shine','RG Blurs and Glows','b/Shine.aex'),
@@ -398,12 +401,16 @@ class NavigationTests(GuiCase):
         self.assertIn('提示：1 组中文名称与其他效果相同',w.log.toPlainText());self.assertIn('S_TriTone / 三色调',w.log.toPlainText())
     def test_state_chips_filter_rows_and_show_counts(self):
         w=self.window;self.check('tc Shine')
-        w.chips['checked'].click();self.assertEqual(self.shown(),{'tc Shine'})
-        self.assertNotIn('todo',w.chips)
+        # 已勾选 is no tile any more: the check menu's 只看勾选项 filters the same way, together with the tiles.
+        w.only_checked_action.trigger();self.assertEqual(self.shown(),{'tc Shine'});self.assertTrue(w.only_checked)
+        w.only_checked_action.trigger();self.assertEqual(len(w.visible_rows()),4)
+        self.assertNotIn('todo',w.chips);self.assertNotIn('checked',w.chips)
         w.show_live({'pid':1,'effects':[{'matchName':'S_Glow','displayName':'辉光','category':'c'}]})
         w.chips['applied'].click();self.assertEqual(self.shown(),{'S_Glow'})
         w.chips['missing'].click();self.assertEqual(self.shown(),{'tc Shine','Atom Key'})
-        self.assertEqual([w.chips[k].text() for k,_ in app_live.ROW_FILTERS],['全部 4','已勾选 1','已应用 2','未加载 2'])
+        w.favorites.set(['Atom Key'],True);self.assertEqual(w.chips['favorite'].value,1)
+        w.chips['favorite'].click();self.assertEqual(self.shown(),{'Atom Key'})
+        self.assertEqual([w.chips[k].text() for k,_ in app_live.ROW_FILTERS],['全部 4','已应用 2','未加载 2','已收藏 1'])
         w.filter.setText('atom');self.assertEqual(self.shown(),{'Atom Key'})
         w.chips['all'].click();w.filter.clear();self.assertEqual(len(w.visible_rows()),4)
     def test_detail_card_follows_selection(self):
@@ -430,7 +437,7 @@ class NavigationTests(GuiCase):
         translate=self.submenu(w.more_tool,'翻译').actions();self.assertIn(w.translate_checked_action,translate);self.assertIn(w.retranslate_checked_action,translate)
         self.assertIn(w.refresh_action,w.more_tool.menu().actions())
         restore=w.restore_tool.menu().actions();self.assertIn(w.restore_checked_action,restore);self.assertIn(w.restore_all_action,restore);self.assertNotIn(w.restore_selected_action,restore)
-        self.assertEqual([a.text() for a in w.check_tool.menu().actions() if a.text()],['勾选当前筛选结果','取消勾选当前筛选结果','取消全部勾选'])
+        self.assertEqual([a.text() for a in w.check_tool.menu().actions() if a.text()],['勾选当前筛选结果','取消勾选当前筛选结果','取消全部勾选','只看勾选项','收藏勾选项到“默认收藏夹”','把勾选项加入收藏夹','从“默认收藏夹”移出勾选项'])
         self.assertIn(w.manage_action,w.scheme_menu().actions())
         w.manage_action.trigger();self.assertEqual(w.pages.currentIndex(),app_live.SCHEMES)
     def test_effect_menus_no_longer_carry_parameter_options(self):
@@ -503,5 +510,18 @@ class ApiDialogTests(GuiCase):
         with patch.object(self.window,'configure_api',return_value=False) as asked,patch.object(self.window,'work',side_effect=AssertionError('must not translate')):
             self.window.translate_selected()
         asked.assert_called_once()
+
+class RefreshMenuTests(GuiCase):
+    def test_refresh_completion_does_not_claim_content_verified(self):
+        self.window.live={'pid':1,'creationTime':2};done=[]
+        with patch.object(self.window,'work',lambda work,callback:done.append(callback)):
+            self.window.refresh_native()
+        done[0]({'nativePaletteRefreshed':True,'contentVerified':False})
+        self.assertIn('核对',self.window.status.text());self.assertNotIn('已显示最新名称',self.window.toast.full)
+    def test_calibration_has_separate_menu_action_and_busy_guard(self):
+        self.assertIn(self.window.calibrate_refresh_action,self.window.all_actions)
+        self.assertIn('校准',self.window.calibrate_refresh_action.text())
+        self.window.live={'pid':1,'creationTime':2}
+        with patch.object(self.window,'busy',return_value=True),patch.object(self.window,'work') as work:self.window.calibrate_refresh_menu();work.assert_not_called()
 
 if __name__=='__main__':unittest.main()

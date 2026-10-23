@@ -74,6 +74,8 @@ class ParameterPanel(QWidget):
         self.table.itemChanged.connect(self.changed);self.stack.addWidget(self.table);self.build_history();card.box.addWidget(self.stack,1)
         self.status=label('在 AE 图层中添加效果后点击“读取 AE 参数”。当前适配标准参数标签和折叠标题，暂不翻译下拉菜单内部条目或插件自绘界面。','muted',True);card.box.addWidget(self.status)
         self.write_scope_note=label('读取范围仅限制列表；应用和恢复仍影响整个工程中同类效果的已加载实例。','muted',True);card.box.addWidget(self.write_scope_note)
+        # The layer-parameters key (app_live.Window.layer_parameters); the window sets the text whenever keys change.
+        self.key_note=label('','muted',True);card.box.addWidget(self.key_note)
         layout.addWidget(card,1)
         self.controls=[self.refresh,self.scan_menu,self.effects,self.search,self.table,self.empty_read,*self.tools]
         self.show_view()
@@ -241,9 +243,12 @@ class ParameterPanel(QWidget):
         skipped=len(self.selected())-len(names)
         if not names:self.status.setText('勾选的参数还没有中文候选，请先翻译或双击“中文候选”填写');return
         scope=self.read_scope
-        def work(progress):return self.owner.parameter_session.apply(names,progress),read_parameters(expected_image=self.owner.space.exe,scope=scope)
+        # Written from the heap-only structure when that is what is cached (strict guards unchanged); a background
+        # full scan then covers anything outside the default heap.
+        def work(progress):return self.owner.parameter_session.apply(names,progress,full=False),read_parameters(expected_image=self.owner.space.exe,scope=scope)
         def done(result):
             operation,report=result;self.loaded(report);same=operation.get('unchanged',0);written=operation['parameters']-same
+            if operation.get('heapOnly'):self.owner.schedule_completion(names)
             self.status.setText(f"已应用 {written} 个参数名称，{same} 项已为目标名称，{skipped} 项无候选已跳过；请在 AE 原有控件中调节。")
             self.owner.toast.notify('参数处理完成',f"已应用 {written} 项，{same} 项无需修改")
         self.writing=set(names);self.owner.work(work,done)

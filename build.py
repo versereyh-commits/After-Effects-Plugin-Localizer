@@ -4,6 +4,10 @@ import subprocess
 import sys
 
 root=Path(__file__).parent
+# Never build on a coding tool's private Python: Codex's runtime patched its ssl.py to read a file the bundle lacked,
+# and every frozen build since lost HTTPS (PROJECT_HANDOFF.md, 2026-10-23). The TLS self-test below catches the effect.
+if "codex-runtimes" in sys.base_prefix.lower().replace("\\","/"):
+    sys.exit(f"拒绝构建：当前 Python 是 Codex 自带的运行时（{sys.base_prefix}），打包后会无法联网。请用干净的 CPython 建 .venv（见 AGENTS.md）")
 # --dist-dir lets a new build land beside a copy that is still running (its files are locked).
 dist=root/(sys.argv[sys.argv.index("--dist-dir")+1] if "--dist-dir" in sys.argv else "dist")
 native_source=root/"native"/"ae_probe.c";native_dll=root/"native"/"ae_probe.dll"
@@ -38,6 +42,9 @@ def compile_dll(target,args):
     fresh=target.with_name(target.stem+".new.dll")
     subprocess.run([sys.executable,"-m","ziglang","cc",*CPU,*args,"-o",str(fresh)],check=True,cwd=root)
     put(fresh,target)
+identity_source=root/'native'/'ae_host_identity.c';identity_dll=root/'native'/'ae_host_identity_v1.dll'
+if outdated(identity_dll,identity_source):
+    compile_dll(identity_dll,['-shared','-O2','-std=c11',str(identity_source)])
 if outdated(scan_dll,scan_source):
     compile_dll(scan_dll,["-shared","-O3","-std=c11",str(scan_source)])
 if outdated(dynamic_dll,parameter_source):
@@ -59,7 +66,7 @@ def sign_bridge():
     so an installed copy stays current across builds. Returns the folder to bundle, or None without the tool."""
     import hashlib,secrets,zipfile
     ext_id="com.verse.aelocalizer.bridge";signed=root/"build"/"cep"/"signed"
-    sources=[root/"cep"/"CSXS"/"manifest.xml",root/"cep"/"index.html",root/"cep"/"main.js",root/"scripts"/"parameter_bridge.jsx"]
+    sources=[root/"cep"/"CSXS"/"manifest.xml",root/"cep"/"index.html",root/"cep"/"main.js",root/"scripts"/"parameter_bridge.jsx",identity_dll]
     bridge_id=hashlib.sha256(b"".join(p.read_bytes() for p in sources)).hexdigest()[:16]
     if (signed/"bridge.id").is_file() and (signed/"bridge.id").read_text(encoding="ascii")==bridge_id and (signed/ext_id/"META-INF"/"signatures.xml").is_file():return signed
     import os
@@ -70,6 +77,7 @@ def sign_bridge():
         secret.write_text(secrets.token_urlsafe(24),encoding="ascii")
         subprocess.run([str(tool),"-selfSignedCert","CN","Beijing","verse","AE Localizer Bridge",secret.read_text(encoding="ascii"),str(cert),"-validityDays","36500"],check=True,stdout=subprocess.DEVNULL)
     stage=root/"build"/"cep"/"stage"/ext_id;shutil.rmtree(stage.parent,ignore_errors=True);(stage/"CSXS").mkdir(parents=True)
+    shutil.copy2(identity_dll,stage/identity_dll.name)
     shutil.copy2(sources[0],stage/"CSXS"/"manifest.xml");shutil.copy2(sources[1],stage/"index.html");shutil.copy2(sources[3],stage/"parameter_bridge.jsx")
     (stage/"main.js").write_text(sources[2].read_text(encoding="utf-8").replace("@@BRIDGE_ID@@",bridge_id),encoding="utf-8")
     package=root/"build"/"cep"/"bridge.zxp";package.unlink(missing_ok=True)
@@ -89,9 +97,18 @@ if "--native-only" not in sys.argv:
     import os
     system=Path(os.environ.get("SystemRoot",r"C:\Windows"))
     clean_path=os.pathsep.join(str(p) for p in (Path(sys.base_prefix)/"DLLs",Path(sys.base_prefix),Path(sys.executable).parent,system/"System32",system,system/"System32"/"Wbem"))
-    subprocess.run([sys.executable,"-m","PyInstaller","--noconfirm","--clean","--windowed","--onedir","--distpath",str(dist),"--name","AE汉化工具","--add-data",str(root/"scripts")+";scripts",*(["--add-data",str(bridge)+";cep_signed"] if bridge else []),"--add-binary",str(native_dll)+";native","--add-binary",str(scan_dll)+";native","--add-binary",str(parameter_dll)+";native","--add-binary",str(dynamic_dll)+";native","--add-binary",str(legacy_parameter)+";native","--add-binary",str(legacy_dynamic)+";native","--hidden-import","comtypes.gen.UIAutomationClient","--exclude-module","PySide6.QtWebEngineCore","--exclude-module","PySide6.QtWebEngineWidgets","--exclude-module","PySide6.QtQml",str(root/"app_live.py")],check=True,cwd=root,env={**os.environ,"PATH":clean_path})
+    subprocess.run([sys.executable,"-m","PyInstaller","--noconfirm","--clean","--windowed","--onedir","--distpath",str(dist),"--name","AE汉化工具","--add-data",str(root/"scripts")+";scripts",*(["--add-data",str(bridge)+";cep_signed"] if bridge else []),"--add-binary",str(identity_dll)+";native","--add-binary",str(native_dll)+";native","--add-binary",str(scan_dll)+";native","--add-binary",str(parameter_dll)+";native","--add-binary",str(dynamic_dll)+";native","--add-binary",str(legacy_parameter)+";native","--add-binary",str(legacy_dynamic)+";native","--hidden-import","comtypes.gen.UIAutomationClient","--exclude-module","PySide6.QtWebEngineCore","--exclude-module","PySide6.QtWebEngineWidgets","--exclude-module","PySide6.QtQml",str(root/"app_live.py")],check=True,cwd=root,env={**os.environ,"PATH":clean_path})
     # Qt 6.12 on Windows 11 uses the OS ICU shim. PyInstaller picked Poppler's
     # same-named versioned ICU from the build host PATH; it has different exports.
     for name in ("icuuc.dll","icuin.dll","icudt.dll"):
         copied=dist/"AE汉化工具"/"_internal"/name
         if copied.exists():copied.unlink()
+    # The bundle must open HTTPS by itself: Codex's own Python once patched ssl.py to read a .pem beside it, which the
+    # bundle lacked, so every frozen build failed all translation and update requests while the source ran fine.
+    import tempfile
+    with tempfile.TemporaryDirectory() as folder:
+        report=Path(folder)/"tls.txt"
+        code=subprocess.run([str(dist/"AE汉化工具"/"AE汉化工具.exe"),"--selftest-tls",str(report)],timeout=60).returncode
+        result=report.read_text(encoding="utf8") if report.exists() else "没有结果"
+    if code or result!="ok":sys.exit(f"打包结果无法建立 HTTPS 连接（{result}），翻译与更新都会失败：请换用未改动标准库的 Python 构建")
+    print("打包自检：HTTPS 连接可用")

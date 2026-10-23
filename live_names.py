@@ -217,7 +217,6 @@ class NameSession:
         return journal
     def apply(self,translations:dict[str,str],skip_missing=False):
         if not translations:raise ValueError('请先选择插件并输入中文名称')
-        encoded={key:encode_name(value) for key,value in translations.items()}
         with _lock,_process_lock(),self.process() as p:
             main_window(p.pid)
             registry=Registry(p);records=registry.records();by_key={r['matchName']:r for r in records}

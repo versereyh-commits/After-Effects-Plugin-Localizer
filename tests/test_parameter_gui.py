@@ -77,6 +77,26 @@ class ParameterGuiTests(unittest.TestCase):
             self.dialog.load();calls.pop()(None);self.assertEqual(read.call_args.kwargs['scope'],'project')
             self.dialog.apply();calls.pop()(None);self.assertEqual(read.call_args.kwargs['scope'],'project');apply.assert_called_once()
             self.dialog.restore();calls.pop()(None);self.assertEqual(read.call_args.kwargs['scope'],'project');restore.assert_called_once()
+    def test_page_apply_from_the_heap_schedules_one_background_check(self):
+        calls=[];dones=[];self.window.parameter_enabled.add(self.keys[0]);self.window.parameter_pending[self.keys[0]]='亮度'
+        with patch.object(self.window,'work',lambda fn,done:(calls.append(fn),dones.append(done))),patch('parameter_dialog.read_parameters',return_value={'parameters':self.rows}),patch.object(self.window.parameter_session,'apply',return_value={'changed':1,'parameters':1,'heapOnly':True}) as apply:
+            self.dialog.apply();result=calls.pop()(None);self.assertFalse(apply.call_args.kwargs['full']);dones.pop()(result)
+        self.assertTrue(self.window.completion.isActive());self.assertEqual(self.window.completion_keys,{self.keys[0]:'亮度'})
+        threads=[]
+        with patch.object(self.window.parameter_session,'complete',return_value={'missed':0,'checked':True}) as complete,patch('threading.Thread',lambda target,**kw:threads.append(target) or type('T',(),{'start':lambda self:None,'join':lambda self,**kw:None})()):
+            with patch.object(self.window,'busy',return_value=True):self.window.completion_pass()
+            self.assertEqual(threads,[]);self.assertTrue(self.window.completion.isActive())   # waits while another job runs
+            self.window.completion_pass();threads.pop()()
+        complete.assert_called_once_with({self.keys[0]:'亮度'});self.assertEqual(self.window.completion_keys,{})
+    def test_background_check_reports_what_it_found(self):
+        self.window.completion_done({'missed':0,'checked':True},3.2);self.assertIn('都在默认堆里',self.window.log.toPlainText())
+        self.window.completion_done({'missed':2,'checked':True,'changed':4},3.4);self.assertIn('默认堆以外找到 2 组',self.window.log.toPlainText())
+        self.window.completion_done('AE 已关闭',0.1);self.assertIn('补充完整扫描未完成',self.window.log.toPlainText())
+    def test_apply_from_a_full_structure_needs_no_check(self):
+        calls=[];dones=[];self.window.parameter_enabled.add(self.keys[0]);self.window.parameter_pending[self.keys[0]]='亮度'
+        with patch.object(self.window,'work',lambda fn,done:(calls.append(fn),dones.append(done))),patch('parameter_dialog.read_parameters',return_value={'parameters':self.rows}),patch.object(self.window.parameter_session,'apply',return_value={'changed':1,'parameters':1}):
+            self.dialog.apply();dones.pop()(calls.pop()(None))
+        self.assertFalse(self.window.completion.isActive())
     def test_busy_read_does_not_start(self):
         with patch.object(self.window,'busy',return_value=True),patch.object(self.window,'work') as work:self.dialog.load(rescan=True);work.assert_not_called()
     def test_scan_options_hidden_in_history(self):

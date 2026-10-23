@@ -115,7 +115,7 @@ class AdapterDialogTests(GuiCase):
     def test_background_connection_is_the_recommended_fourth_step(self):
         from PySide6.QtWidgets import QLabel
         texts=[l.text() for l in self.dialog.findChildren(QLabel)]
-        self.assertEqual(len(self.dialog.step_badges),4);self.assertIn('AE 后台连接',texts);self.assertIn('推荐安装',texts)
+        self.assertEqual(len(self.dialog.step_badges),4);self.assertIn('后台连接',texts);self.assertIn('推荐安装',texts)
         self.assertTrue(any('看不见的扩展' in t and '带空格的文件夹' in t for t in texts))
         # The settings page keeps its own controls.
         self.assertTrue(hasattr(self.window,'bridge_btn') and hasattr(self.window,'bridge_remove'))

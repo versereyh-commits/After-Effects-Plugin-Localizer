@@ -102,3 +102,48 @@ class AutoTests(unittest.TestCase):
         with patch('parallel_scan.os.cpu_count',return_value=8),patch('parallel_scan.scan_parallel',side_effect=RuntimeError('identity')),patch('parallel_scan.serial_scan') as serial:
             with self.assertRaises(RuntimeError):scan_auto(c)
             serial.assert_not_called()
+
+class HeapTests(unittest.TestCase):
+    HEAP=0x10000
+    def region(self,base,size,alloc,state=0x1000,kind=0x20000,protect=4):
+        return SimpleNamespace(BaseAddress=base,AllocationBase=alloc,RegionSize=size,State=state,Type=kind,Protect=protect)
+    def process(self,headers):
+        def read(address,size):
+            if address not in headers:raise RuntimeError('unreadable')
+            return headers[address][:size]
+        return SimpleNamespace(read=read)
+    def segment(self,heap,signature=0xffeeffee):
+        return bytes(16)+signature.to_bytes(4,'little')+bytes(20)+heap.to_bytes(8,'little')
+    def query(self,regions):
+        def query(address):
+            return next((r for r in regions if r.BaseAddress>=address),None)
+        return query
+    def test_only_default_heap_segments_are_kept(self):
+        from parallel_scan import heap_regions
+        regions=[self.region(0x10000,0x1000,0x10000),self.region(0x11000,0x1000,0x10000,state=0x2000),   # heap segment 1, reserved tail
+                 self.region(0x20000,0x2000,0x20000),                                                     # second segment of the same heap
+                 self.region(0x30000,0x8000,0x30000),                                                     # image cache: not a heap
+                 self.region(0x40000,0x1000,0x40000),                                                     # another heap
+                 self.region(0x50000,0x1000,0x50000),                                                     # header unreadable
+                 self.region(0x60000,0x1000,0x60000,protect=2)]                                           # read-only
+        p=self.process({0x10000:self.segment(self.HEAP),0x20000:self.segment(self.HEAP),0x30000:bytes(0x30),0x40000:self.segment(0x40000),0x60000:self.segment(self.HEAP)})
+        self.assertEqual(heap_regions(p,query=self.query(regions),heap=self.HEAP),[(0x10000,0x11000),(0x20000,0x22000)])
+    def test_unrecognised_heap_falls_back_to_everything(self):
+        from parallel_scan import heap_regions
+        regions=[self.region(0x10000,0x1000,0x10000),self.region(0x20000,0x1000,0x20000)]
+        # The heap's own first segment does not carry the NT heap signature (a segment heap, say): no heap-only scan.
+        p=self.process({0x10000:self.segment(self.HEAP,0xddeeddee),0x20000:self.segment(self.HEAP)})
+        self.assertIsNone(heap_regions(p,query=self.query(regions),heap=self.HEAP))
+        from unittest.mock import patch
+        with patch('parallel_scan.default_heap',side_effect=OSError('denied')):self.assertIsNone(heap_regions(p,query=self.query(regions)))
+    def test_scan_auto_heap_target(self):
+        from unittest.mock import patch
+        from parallel_scan import scan_auto
+        c=SimpleNamespace(timings={},p=object())
+        with patch('parallel_scan.os.cpu_count',return_value=8),patch('parallel_scan.heap_regions',return_value=[(4096,8192)]),patch('parallel_scan.scan_parallel',return_value={7}) as parallel:
+            self.assertEqual(scan_auto(c,full=False),{7});self.assertEqual(c.timings['scanTarget'],'heap')
+            query=parallel.call_args.kwargs['query'];self.assertEqual((query(0).BaseAddress,query(0)),(4096,None))
+        with patch('parallel_scan.os.cpu_count',return_value=8),patch('parallel_scan.heap_regions',return_value=None),patch('parallel_scan.scan_parallel',return_value={7}) as parallel:
+            scan_auto(c,full=False);self.assertEqual(c.timings['scanTarget'],'full');self.assertIsNone(parallel.call_args.kwargs['query'])
+        with patch('parallel_scan.os.cpu_count',return_value=8),patch('parallel_scan.heap_regions') as heap,patch('parallel_scan.scan_parallel',return_value={7}):
+            scan_auto(c);heap.assert_not_called();self.assertEqual(c.timings['scanTarget'],'full')

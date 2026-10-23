@@ -21,6 +21,7 @@ _project_context={}
 _shape_context={}
 _scan_reason={}
 _unsupported={}
+_scan_kind={} # (pid,creation) -> 'heap' | 'full': what the cached structure in _cache was found by
 _timing_lock=threading.Lock()
 
 def identity(effect,param):return json.dumps([effect,param],ensure_ascii=False,separators=(',',':'))
@@ -67,7 +68,7 @@ def bounded_ascii(p,address,limit=256,block=32):
 def record_read_timing(metrics):
     """A bounded statistics-only log. No host/project identity, strings or pointers."""
     allowed={'event','readId','setupMs','hostMs','modulesMs','matchPoolMs','scanMs','treeMs','totalMs','tableMs','scanCount','mode','rows','instances','scanEngine','scanMeasuredMs','scanEnumMs','scanReadMs','scanSearchMs','scanValidateMs','scanBufferMs','scanRegions','scanEligibleRegions','scanReadCalls','scanReadBytes','scanReadFailures','scanHits','scanAlignedHits','scanParentChecks','scanRepeatedParents','scanValidationReads','scanBufferCapacityBytes','scanMergedRegions','scanJobs','scanWorkerCount','scanRetryRegions','scanCoalesced','scanTimingMode','scanResourceFallback'}
-    allowed.add('readScope')
+    allowed.update(('readScope','scanTarget','scanEscalated','scanHeapMissed'))
     safe={k:v for k,v in metrics.items() if k in allowed and isinstance(v,(str,int,float))}
     try:
         with _timing_lock:
@@ -130,19 +131,26 @@ class ParameterCatalog:
                 except UnicodeDecodeError:pass
                 node=struct.unpack_from('<Q',b)[0]
         return names
-    def _scan_parades(self):
+    def _scan_parades(self,full=True):
         from parallel_scan import scan_auto
-        return scan_auto(self)
-    def roots(self,rescan=False,progress=None,_reason=None):
+        return scan_auto(self,full)
+    def roots(self,rescan=False,progress=None,_reason=None,full=False):
+        """full=False lets a scan cover only AE's default heap (where every effect object was found, 2026-10-21);
+        full=True (writes, restores, or a heap scan that came up short) needs a structure from all of AE's memory and
+        replaces a cached heap-only one."""
         p=self.p;key=(p.pid,p.creation_time);vt=self.flt+self.profile.root_vtable
         if not hasattr(self,'timings'):self.timings={'scanMs':0.0,'scanCount':0}
-        full=rescan or key not in _cache
-        if full:
-            reason=_reason or ('手动完整扫描' if rescan else _scan_reason.get(key,'首次扫描'));_scan_reason.pop(key,None)
+        upgrade=full and key in _cache and _scan_kind.get(key)=='heap'
+        scan=rescan or key not in _cache or upgrade
+        if scan:
+            reason=_reason or ('手动完整扫描' if rescan else '写入前完整扫描' if upgrade else _scan_reason.get(key,'首次扫描'));_scan_reason.pop(key,None)
             if progress:progress(reason+'，正在识别 AE 参数结构……')
-            started=time.perf_counter();parades=self._scan_parades()
+            previous=_cache.get(key) if _scan_kind.get(key)=='heap' else None
+            started=time.perf_counter();parades=self._scan_parades(full)
             self.timings['scanMs']+=(time.perf_counter()-started)*1000;self.timings['scanCount']+=1;self.timings['mode']=reason
-            _cache[key]=set(parades)
+            _cache[key]=set(parades);_scan_kind[key]=self.timings.get('scanTarget','full')
+            # Statistics only: structures a full scan found that the earlier heap-only one had not.
+            if previous is not None and _scan_kind[key]=='full':self.timings['scanHeapMissed']=len(_cache[key]-previous)
         else:
             parades=set(_cache[key]);self.timings['mode']='读取缓存结构'
             if progress:progress('读取缓存结构，核对当前参数……')
@@ -158,7 +166,7 @@ class ParameterCatalog:
             except (OSError,RuntimeError):invalid=True
         if not full and (invalid or (parades and not roots)):
             if progress:progress('缓存对象失效，重新扫描……')
-            result=self.roots(rescan=True,progress=progress,_reason='缓存失效重扫');self.timings['mode']='缓存失效重扫';return result
+            result=self.roots(rescan=True,progress=progress,_reason='缓存失效重扫',full=full);self.timings['mode']='缓存失效重扫';return result
         return sorted(set(roots))
     def children(self,root):
         p=self.p
@@ -174,9 +182,9 @@ class ParameterCatalog:
             while node!=head:
                 if node in seen or len(seen)>8192:raise RuntimeError('参数列表循环或过大，已停止')
                 seen.add(node);b=p.read(node,40);yield struct.unpack_from('<Q',b,32)[0],b[16:32];node=struct.unpack_from('<Q',b)[0]
-    def rows(self,rescan=False,progress=None):
+    def rows(self,rescan=False,progress=None,full=False):
         result=[];p=self.p
-        for root in self.roots(rescan,progress):
+        for root in self.roots(rescan,progress,full=full):
             effect=self.names.get(p.read(root+8,16))
             if not effect:continue
             for address,guid in self.children(root):
@@ -193,9 +201,19 @@ class ParameterCatalog:
                             pointer=address+offset if capacity<=7 else struct.unpack_from('<Q',cache)[0]
                             text=p.read(pointer,(length+1)*2)
                             if text[-2:]!=b'\0\0':raise RuntimeError('参数显示缓存未终止')
-                            name=text[:-2].decode('utf-16le')
+                            try:name=text[:-2].decode('utf-16le')
+                            except UnicodeDecodeError:raise RuntimeError('参数显示名包含非法字符') from None
                         result.append({'id':identity(effect,param),'effectMatchName':effect,'matchName':param,'name':name,'pfName':pf_name,'address':address,'guid':guid.hex(),'parent':root})
         return result
+
+def _short(rows,actual)->bool:
+    """Some effect type has fewer structures in memory than instances AE shows."""
+    visible={}
+    for key,names in actual.items():
+        effect=split_identity(key)[0];visible[effect]=max(visible.get(effect,0),len(names))
+    parents={}
+    for row in rows:parents.setdefault(row['effectMatchName'],set()).add(row['parent'])
+    return any(len(found)<visible.get(effect,0) for effect,found in parents.items())
 
 def public_rows(rows):
     unique={}
@@ -241,6 +259,11 @@ def read_parameters(rescan=False,progress=None,expected_image=None,scope='projec
                 else:_shape_context[key]=_name_signature(actual)
                 if progress:progress('出现新的效果类型，重新扫描……')
                 rows=catalog.rows(True,progress);catalog.timings['mode']='出现新的效果类型，重新扫描';scanned=True
+            # A heap-only scan is trusted for a read only when it covered every effect type and, per type, at least
+            # as many structures as AE shows instances (copies only add more); otherwise scan all of AE's memory.
+            if scanned and _scan_kind.get(key)=='heap' and (types(actual)-{r['effectMatchName'] for r in rows}-bare or _short(rows,actual)):
+                if progress:progress('默认堆里没有找全，完整扫描……')
+                rows=catalog.rows(True,progress,full=True);catalog.timings.update(mode='默认堆未找全，完整扫描',scanEscalated=1)
             if scanned:
                 if scope=='project':_shape_context[key]=_name_signature(actual)
                 # Present before a fresh full scan yet without any supported parameter.
@@ -276,7 +299,7 @@ STARTED='started'   # parameter_bridge.jsx writes this into the request folder a
 STAGES={'1':('进入脚本',''),'start':('进入脚本',''),'instances':('读取效果实例',''),'collect':('读取参数列表',''),
         'loadHelper':('加载参数辅助模块','安全软件（360、火绒等）可能拦截了这个 DLL 的加载，请留意它们的提示并允许；'),
         'configure':('核对 AE 模块与名称编码','这个 AE 版本可能与参数辅助模块不兼容，请把诊断文件发给开发者；'),
-        'labels':('写入参数名称',''),'result':('写回结果','')}
+        'labels':('写入参数名称',''),'addEffect':('添加效果',''),'result':('写回结果','')}
 
 # Inside "configure" the helper itself leaves a breadcrumb (native/ae_parameters.c step()), read on a timeout.
 NATIVE_STEP='AE-Localizer-native-step.txt'
@@ -356,6 +379,29 @@ def native_layout(profile)->str:
     kind=2 if getattr(profile,'named_tree',False) else int(profile.named_vector)
     return ','.join(format(v,'x') for v in (profile.root_vtable,profile.group_vector,profile.named_map,kind,profile.parent_get,profile.stream_match_get,profile.count_get))
 
+def safe_unlink(path):
+    try:path.unlink(missing_ok=True)
+    except OSError:pass
+
+def cleanup_requests(parent):
+    """Only expired, old protocol-owned files; never recurse or follow links."""
+    import re
+    allowed={'request.jsx','result.json','permit','started','owner.json','request.json','claimed.json','withdrawn.json','bridge-error.json','request.json.tmp'}
+    try:
+        if any(p.is_symlink() or p.is_junction() for p in (parent,*parent.parents)):return
+        for folder in parent.iterdir():
+            try:
+                if not re.fullmatch('[0-9a-f]{32}',folder.name) or not folder.is_dir() or folder.is_symlink() or folder.is_junction():continue
+                if time.time()-folder.stat().st_mtime<86400:continue
+                owned=list(folder.iterdir())
+                if any(p.name not in allowed or not p.is_file() or p.is_symlink() or p.is_junction() for p in owned):continue
+                value=json.loads((folder/'owner.json').read_text(encoding='utf-8'))
+                if type(value.get('expires')) not in (int,float) or value['expires']>=time.time()*1000:continue
+                for p in owned:safe_unlink(p)
+                folder.rmdir()
+            except (OSError,ValueError,TypeError):continue
+    except OSError:pass
+
 def run_native(p,operations,timeout=25,action='labels',project_token=None,scope=None):
     if scope is not None and (scope not in ('selected','project') or action not in ('catalog','selection')):raise ValueError('读取范围不能用于写入请求')
     # With the background extension loaded in AE (cep_bridge) the request goes through the folder it watches:
@@ -365,20 +411,34 @@ def run_native(p,operations,timeout=25,action='labels',project_token=None,scope=
     # development host AE sees a different LocalAppData view from the executor;
     # a portable-folder IPC directory also avoids that ambiguity in production.
     import cep_bridge
-    use_bridge=cep_bridge.connected()
-    folder=(cep_bridge.root() if use_bridge else bridge_root())/uuid.uuid4().hex
+    from host_identity import target,same
+    expected=target(p)
+    use_bridge=cep_bridge.connected(expected)
+    parent=cep_bridge.host_root(expected) if use_bridge else bridge_root()
+    try:
+        for old in (cep_bridge.root()/'hosts').iterdir():
+            if __import__('re').fullmatch(r'[1-9][0-9]*-[0-9a-f]{16}',old.name):cleanup_requests(old)
+    except OSError:pass
+    cleanup_requests(parent)
+    folder=parent/uuid.uuid4().hex
     try:folder.mkdir(parents=True)
     except OSError as e:
         if use_bridge:raise RuntimeError('无法写入后台连接目录：'+str(cep_bridge.root())) from e
         raise RuntimeError('软件所在目录不可写，请把完整软件目录放在可写位置后重试') from e
     script=folder/'request.jsx';output=folder/'result.json';permit=folder/'permit';permit.write_text('pending',encoding='ascii')
-    profile=profile_for(p,file_version(Path(p.image)))   # the same choice Registry makes for this AE
-    helper=asset_root()/'native'/('ae_parameters_v9.dll' if profile.native_dynamic else 'ae_parameters_v8.dll')
-    if not helper.is_file():raise RuntimeError('参数辅助模块缺失，请保留完整 EXE 目录')
-    request={'action':action,'requestId':folder.name,'hostVersion':profile.host_version,'projectToken':project_token if project_token is not None else _project_context.get((p.pid,getattr(p,'creation_time',None))),'operations':operations,'output':output.as_posix(),'permit':permit.as_posix(),'expires':int((time.time()+timeout-2)*1000),'helper':helper.as_posix()}
+    # Adding an effect (quick_search) uses only AE's public scripting API: no helper module, no adapted build needed.
+    profile=None if action=='addEffect' else profile_for(p,file_version(Path(p.image)))   # the same choice Registry makes for this AE
+    helper=None
+    if profile is not None:
+        helper=asset_root()/'native'/('ae_parameters_v9.dll' if profile.native_dynamic else 'ae_parameters_v8.dll')
+        if not helper.is_file():raise RuntimeError('参数辅助模块缺失，请保留完整 EXE 目录')
+    identity_helper=asset_root()/'native'/'ae_host_identity_v1.dll'
+    if not identity_helper.is_file():raise RuntimeError('宿主身份模块缺失，请更新完整软件及后台连接')
+    request={'targetHost':expected,'identityHelper':identity_helper.as_posix(),'action':action,'requestId':folder.name,'hostVersion':profile.host_version if profile else None,'projectToken':project_token if project_token is not None else _project_context.get((p.pid,getattr(p,'creation_time',None))),'operations':operations,'output':output.as_posix(),'permit':permit.as_posix(),'expires':int((time.time()+timeout-2)*1000),'helper':helper.as_posix() if helper else ''}
+    write_json_atomic(folder/'owner.json',{'expires':request['expires'],'targetHost':expected})
     if scope is not None:request['readScope']=scope
     if trial_projects():request['qaProjects']=list(trial_projects())
-    if profile.native_dynamic:
+    if profile is not None and profile.native_dynamic:
         request['adapter']={'flt':profile.flt_sha,'tdb':profile.tdb_sha,'codec':profile.codec_sha,'layout':native_layout(profile),'encoding':profile.encoding}
     launcher=keeper=None
     def relay():
@@ -406,8 +466,10 @@ def run_native(p,operations,timeout=25,action='labels',project_token=None,scope=
             if output.exists():
                 try:
                     result=json.loads(output.read_text(encoding='utf-8-sig'))
-                    if action in ('instanceCatalog','instanceNames') and (result.get('requestId')!=folder.name or result.get('action')!=action):raise RuntimeError('效果标题响应身份不匹配')
+                    if result.get('requestId')!=folder.name or result.get('action')!=action or not same(result.get('hostIdentity'),expected):raise RuntimeError('AE 响应的宿主或请求身份不匹配，未接受结果')
+                    if action in ('instanceCatalog','instanceNames','addEffect') and (result.get('requestId')!=folder.name or result.get('action')!=action):raise RuntimeError('效果标题响应身份不匹配')
                     if scope is not None and (result.get('requestId')!=folder.name or result.get('action')!=action or result.get('readScope')!=scope):raise RuntimeError('参数读取范围响应身份不匹配')
+                    if action=='addEffect':result['transportRoute']='extension' if use_bridge and launcher is None else 'relay'
                     finished=True;return result
                 except ValueError:pass
             if use_bridge:
@@ -420,19 +482,52 @@ def run_native(p,operations,timeout=25,action='labels',project_token=None,scope=
             time.sleep(.1)
         raise TimeoutError(_timeout_message(p,folder,request,timeout,use_bridge,launcher,submitted))
     finally:
-        permit.unlink(missing_ok=True)
+        safe_unlink(permit)
         # Only the secondary CLI relay may be terminated; never the primary AE.
         if launcher is not None and launcher.poll() is None and launcher.pid!=p.pid:
-            launcher.terminate();launcher.wait(timeout=5)
-        if keeper:keeper.settle()
+            try:launcher.terminate();launcher.wait(timeout=5)
+            except (OSError,subprocess.TimeoutExpired):pass
+        if keeper:
+            try:keeper.settle()
+            except (OSError,RuntimeError):pass
         # A script moved out of the request folder (a path with spaces) has no use once the permit is gone.
-        if script.name!='request.jsx':script.unlink(missing_ok=True)
+        if script.name!='request.jsx':safe_unlink(script)
         if finished or output.exists():
             # Only these task-owned files are removed. Never recurse into a
             # user-selected path or delete the parent portable directory.
-            for owned in (script,output,folder/STARTED,*(folder/name for name in cep_bridge.OWNED)):owned.unlink(missing_ok=True)
+            for owned in (script,output,folder/STARTED,folder/'owner.json',*(folder/name for name in cep_bridge.OWNED)):safe_unlink(owned)
             try:folder.rmdir()
             except OSError:pass
+
+class WindowHost:
+    """The AE behind a window: all an add request needs (pid for the relay's guards, the exe for -r). Taken from
+    the window that was in front, so no process listing (~0.2 s) and no adapted-build check: adding uses only
+    AE's public scripting API."""
+    def __init__(self,hwnd:int):
+        from win_process import window_process
+        found=window_process(hwnd)
+        if not found or Path(found[1]).name.lower()!='afterfx.exe':raise RuntimeError('前台窗口已不是 AE，请回到 AE 后重试')
+        self.pid,self.image=found
+        from host_identity import query
+        image,self.creation_time=query(self.pid)
+        if Path(image)!=Path(self.image) or window_process(hwnd)!=(self.pid,self.image):raise RuntimeError('AE 窗口身份已变化，请重新触发快捷键')
+    def __enter__(self):return self
+    def __exit__(self,*exc):return False
+
+def add_effect(match_name:str,expected_image=None,timeout=15,ae_window:int=0,title:str='')->dict:
+    """Adds one effect (by its internal name) to every selected layer of AE's active composition, in one undo
+    step, through the same hand-over as parameter requests (the background extension, else the -r relay).
+    With ae_window (the AE window the hotkey came from) that window's process is used directly. title: the name
+    AE's effects list shows for it now, given to the new effect where AE kept the plug-in's own name (AE 2021).
+    Returns {'changed','skipped','seconds','route'} (route: the extension was connected, else the relay); raises RuntimeError with AE's reason (no composition, no layer)."""
+    if not isinstance(match_name,str) or not match_name or len(match_name)>255:raise ValueError('效果标识无效')
+    import cep_bridge
+    started=time.perf_counter();route='extension' if cep_bridge.connected() else 'relay'
+    host=WindowHost(ae_window) if ae_window else current_process(expected_image=expected_image) if expected_image else current_process()
+    with _lock,_process_lock(),host as p:
+        result=run_native(p,[match_name,title] if title else [match_name],timeout=timeout,action='addEffect')
+    if result.get('error'):raise RuntimeError(str(result['error']).removeprefix('Error: '))
+    return {'changed':int(result.get('changed',0)),'skipped':int(result.get('skipped',0)),'seconds':time.perf_counter()-started,'route':result.get('transportRoute',route),'hostIdentity':result.get('hostIdentity')}
 
 def _name_signature(names):return tuple(sorted((key,len(value)) for key,value in names.items()))
 
@@ -488,6 +583,12 @@ def _host_names(p,strict=True):
         _shape_context[key]=signature
     return names
 
+class FastMiss(RuntimeError):
+    """The cached structure did not hold every visible instance (a new layer, an effect copy not cached yet):
+    the caller repeats the apply, first with a fresh heap-only scan (when this attempt did not scan), then a full one.
+    scanned: this attempt already scanned memory."""
+    def __init__(self,message,scanned=False):super().__init__(message);self.scanned=scanned
+
 class ParameterSession:
     def __init__(self):self.path=data_root()/'parameter-session.json';self.expected_image=None
     def process(self):return current_process(expected_image=self.expected_image) if self.expected_image else current_process()
@@ -504,7 +605,16 @@ class ParameterSession:
             if 'originalPf' in item:validate_pf_name(item['originalPf'])
         if value['entries'] and (type(value.get('pid')) is not int or type(value.get('creationTime')) is not int):raise RuntimeError('参数恢复会话身份不正确')
         return value
-    def apply(self,names,progress=None):
+    def apply(self,names,progress=None,fast=False,rescan=False,skip_missing=False,full=None):
+        """Writes parameter display names to every instance of each identity. Normally any change in the number of
+        instances drops the cached structure and scans all of AE's memory again (copies of an effect are not counted
+        by AE, so a count never proves everything was found). fast=True (an effect quick_search just added) first
+        tries the cached structure: it writes only when memory holds at least as many instances as AE reports, then
+        reads every visible instance back; any shortfall raises FastMiss before or after the write, and the caller
+        repeats with a full scan. A later full pass (rescan=True) covers copies made after the scan.
+        full (default: not fast) needs a structure from all of AE's memory. full=False (the parameter page) may write
+        from a heap-only structure with every strict guard kept; the result then has heapOnly=True and the caller
+        follows up with complete()."""
         names={k:validate_label(v) for k,v in names.items()}
         for key in names:split_identity(key)
         if not names:raise ValueError('请先选择参数并填写中文候选')
@@ -515,10 +625,18 @@ class ParameterSession:
                 bad=[('/'.join(split_identity(key)),name) for key,name in names.items() if unencodable(name,encoding)]
                 if bad:raise ValueError(encoding_problem(bad,encoding,'参数译名')[0])
             if any(len(name.encode(encoding))>31 for name in names.values()):raise ValueError('译名超过当前 AE 名称缓冲区容量')
-            actual=_host_names(p);rows=[r for r in catalog.rows(progress=progress) if r['id'] in actual];journal=self.journal()
+            full=not fast if full is None else full
+            actual=_host_names(p,strict=False) if fast else _host_names(p);rows=[r for r in catalog.rows(rescan=rescan,progress=progress,full=full) if r['id'] in actual];journal=self.journal()
+            heap_only={'heapOnly':True} if _scan_kind.get((p.pid,p.creation_time))=='heap' else {}
+            scanned=lambda:bool(getattr(catalog,'timings',{}).get('scanCount'))
+            if fast and any(sum(1 for r in rows if r['id']==key)<len(actual.get(key,())) for key in names):raise FastMiss('缓存结构里没有找到全部实例',scanned())
             if (journal.get('pid'),journal.get('creationTime'))!=(p.pid,p.creation_time):journal={'schemaVersion':1,'entries':{}}
             journal.update(pid=p.pid,creationTime=p.creation_time)
             existing={r['id'] for r in rows};missing=set(names)-existing
+            # quick_search may bring translations from another AE version: parameters this one lacks are left out.
+            if missing and skip_missing:
+                names={k:v for k,v in names.items() if k in existing};missing=set()
+                if not names:return {'changed':0,'parameters':0}
             if missing:raise ValueError('部分参数已不在当前 AE 中，请重新读取后再应用')
             originals={}
             for key in names:
@@ -558,15 +676,34 @@ class ParameterSession:
                 elif entry['applied']!=names[key]:entry['previous']=entry['applied'];entry['applied']=names[key]
             # Durable logical identities before any host writes. No process addresses stored here.
             _save(self.path,journal)
-            if not operations:return {'changed':0,'parameters':len(names),'unchanged':len(unchanged)}
+            if not operations:return {'changed':0,'parameters':len(names),'unchanged':len(unchanged),**heap_only}
             result=run_native(p,operations)
             if result.get('error'):raise RuntimeError('参数应用未完成，恢复记录已保留：'+result['error'])
-            after=_host_names(p)
-            if any(not after.get(k) or any(v!=name for v in after[k]) for k,name in names.items()):raise RuntimeError('参数更名回读不一致，恢复记录已保留')
+            after=_host_names(p,strict=False) if fast else _host_names(p)
+            if any(not after.get(k) or any(v!=name for v in after[k]) for k,name in names.items()):
+                if fast:_save(self.path,journal);raise FastMiss('回读仍有实例未改名',scanned())
+                raise RuntimeError('参数更名回读不一致，恢复记录已保留')
+            # Every instance AE shows was read back renamed: the cached structure is trusted for this shape.
+            if fast:_shape_context[(p.pid,p.creation_time)]=_name_signature(after)
             for entry in journal['entries'].values():entry.pop('previous',None)
-            _save(self.path,journal);result={'changed':result.get('changed',0),'parameters':len(names)}
+            _save(self.path,journal);result={'changed':result.get('changed',0),'parameters':len(names),**heap_only}
+            if fast:   # quick_search: say which way it went
+                result['scanned']=scanned()
+                if result['scanned']:result['scanTarget']=getattr(catalog,'timings',{}).get('scanTarget','full')
             if unchanged:result['unchanged']=len(unchanged)
             return result
+    def complete(self,names):
+        """Follow-up to apply(full=False): scans all of AE's memory and writes again only when that finds structures
+        the heap-only scan had not (statistics only go to the read log). Nothing to do once the structure is full."""
+        started=time.perf_counter()
+        with _lock,_process_lock(),self.process() as p:
+            key=(p.pid,p.creation_time)
+            if key not in _cache or _scan_kind.get(key)!='heap':return {'missed':0,'checked':False}
+            catalog=ParameterCatalog(p);catalog.roots(full=True);missed=catalog.timings.get('scanHeapMissed',0)
+        record_read_timing({'event':'complete','scanTarget':'full','scanMs':catalog.timings.get('scanMs',0),'scanHeapMissed':missed,'totalMs':(time.perf_counter()-started)*1000})
+        if not missed:return {'missed':0,'checked':True}
+        # The structure is full now: this write covers what the heap scan left out (and re-notifies the rest).
+        return {**self.apply(names,skip_missing=True),'missed':missed,'checked':True}
     def restore(self,keys=None,progress=None):
         with _lock,_process_lock():
             journal=self.journal();wanted=set(journal['entries']) if keys is None else set(keys)&set(journal['entries'])
@@ -577,7 +714,7 @@ class ParameterSession:
             with self.process() as p:
                 if (journal.get('pid'),journal.get('creationTime'))!=(p.pid,p.creation_time):
                     _save(self.path,{'schemaVersion':1,'entries':{}});return {'restored':0,'oldProcessEnded':True}
-                catalog=ParameterCatalog(p);actual=_host_names(p);rows=[r for r in catalog.rows(progress=progress) if r['id'] in actual];operations=[];present=set()
+                catalog=ParameterCatalog(p);actual=_host_names(p);rows=[r for r in catalog.rows(progress=progress,full=True) if r['id'] in actual];operations=[];present=set()
                 for row in rows:
                     key=row['id']
                     if key not in wanted:continue

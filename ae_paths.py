@@ -5,6 +5,7 @@ from ctypes import wintypes as W
 import hashlib,json,os,winreg
 from pathlib import Path
 from runtime import write_json_atomic
+from storage_safety import read_json
 
 def path_key(path):return os.path.normcase(os.path.abspath(path))
 
@@ -105,19 +106,29 @@ def discover(saved=(),registry=None,running=None,defaults=None):
 
 def read_saved(path):
     try:
-        value=json.loads(Path(path).read_text(encoding='utf-8-sig'))
-        if not isinstance(value,dict) or value.get('schemaVersion')!=1 or not isinstance(value.get('paths'),list):raise ValueError('格式错误')
-        if not all(isinstance(p,str) for p in value['paths']):raise ValueError('路径必须为文字')
-        return value['paths'],''
+        value,warning=_saved_document(path)
+        return value.get('paths',[]),warning
     except FileNotFoundError:return [],''
     except (OSError,ValueError) as error:return [],'AE 路径记录无法读取，已保留原文件；手动定位暂不保存：'+str(error)
 
 def remember(path,exe):
-    saved,warning=read_saved(path)
-    if warning:raise ValueError(warning)
+    value,warning=_saved_document(path);saved=value.get('paths',[])
     item=locate(exe);saved=[p for p in saved if path_key(p)!=path_key(item['exe'])]+[item['exe']]
-    write_json_atomic(path,{'schemaVersion':1,'paths':saved})
+    write_json_atomic(path,{**value,'schemaVersion':2,'paths':saved})
     return item
+
+def _saved_document(path):
+    return read_json(path,lambda v:v.get('schemaVersion') in (1,2) and isinstance(v.get('paths'),list) and all(isinstance(p,str) for p in v['paths']) and isinstance(v.get('extra',{}),dict) and all(isinstance(k,str) and isinstance(rows,list) and all(isinstance(p,str) for p in rows) for k,rows in v.get('extra',{}).items()))
+
+def extra_directories(path,exe):
+    value,warning=_saved_document(path)
+    return [Path(p) for p in value.get('extra',{}).get(path_key(exe),[])],warning
+
+def save_extra(path,exe,folders):
+    value,warning=_saved_document(path)
+    extra=dict(value.get('extra',{}));extra[path_key(exe)]=list(dict.fromkeys(path_key(p) for p in folders))
+    write_json_atomic(path,{**value,'schemaVersion':2,'paths':value.get('paths',[]),'extra':extra})
+    return warning
 
 _flt_digests={}
 def installed_flt_sha(exe)->str|None:

@@ -66,10 +66,10 @@ class NoticeTests(GuiCase):
         w=self.window;w.returning=True
         with patch.object(app_live,'inform'),patch.object(app_live.cep_bridge,'status',return_value='missing'),patch.object(w,'install_bridge') as install:
             w.show_release_notice()
-            self.assertEqual(self.asked,['推荐安装 AE 后台连接']);install.assert_not_called();self.assertIs(self.prefs()['bridgeSuggested'],True)
+            self.assertEqual(self.asked,['推荐安装后台连接']);install.assert_not_called();self.assertIs(self.prefs()['bridgeSuggested'],True)
             # Never again, whatever the answer was -- also on a later update.
             w.save_ui_preference('seenVersion','1.0');w.show_release_notice();w.suggest_bridge()
-        self.assertEqual(self.asked,['推荐安装 AE 后台连接'])
+        self.assertEqual(self.asked,['推荐安装后台连接'])
     def test_accepting_installs_without_a_second_confirmation(self):
         w=self.window;w.returning=True;self.answer='install'
         with patch.object(app_live,'inform'),patch.object(app_live.cep_bridge,'status',return_value='missing'),patch.object(w,'install_bridge') as install:

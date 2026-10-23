@@ -106,7 +106,8 @@ const first=Object.assign(new CompItem(),{id:1,numLayers:3,layer:i=>one[i-1]}),s
 Object.defineProperty(first,'selectedLayers',{get:()=>{selectionReads++;return q.change&&selectionReads>1?[one[2]]:q.none?[]:q.multi?[one[1],one[0]]:q.empty?[one[2]]:[one[1]];}});
 const app={version:'24.2.1x2',project:{activeItem:q.noComp?null:first,file:{fsName:'QA.aep'},numItems:2,item:i=>[first,second][i-1],renderQueue:{rendering:false}}};
 const request={action:q.selectionOnly?'selection':'catalog',readScope:q.project?'project':'selected',requestId:'test',hostVersion:'24.2.1x2',permit:'permit',output:'out',expires:Date.now()+60000,operations:[]};
-vm.runInNewContext(q.template.replace('@@REQUEST@@',JSON.stringify(request)),{app,File,CompItem,ExternalObject:()=>{throw Error('unexpected native write');}},{timeout:3000});
+request.targetHost={pid:3,creationTime:'0000000000000004',image:'C:/AE/AfterFX.exe'};request.identityHelper='identity';
+vm.runInNewContext(q.template.replace('@@REQUEST@@',JSON.stringify(request)),{app,File,CompItem,ExternalObject:function(){return {identity:()=>JSON.stringify(request.targetHost)};}},{timeout:3000});
 process.stdout.write(JSON.stringify({result:JSON.parse(files.out),visits}));
 '''
 

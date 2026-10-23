@@ -31,7 +31,7 @@ class UpdateError(RuntimeError):pass
 class _Transient(UpdateError):
     """The connection failed or dropped; worth trying again. `reason` says why in a few words, `refused`
     whether nothing answered at all (through a proxy: the proxy is not running)."""
-    def __init__(self,message,reason='',refused=False):super().__init__(message);self.reason=reason or message;self.refused=refused
+    def __init__(self,message,reason='',refused=False,reroute=False):super().__init__(message);self.reason=reason or message;self.refused=refused;self.reroute=reroute
 class _Bad(UpdateError):
     """What arrived cannot be the installer; what was saved is deleted."""
 class _NoRange(Exception):
@@ -83,7 +83,8 @@ def _open(url:str,opener,timeout,headers=None):
         if code==404:raise UpdateError('还没有发布任何版本') from None
         raise (_Transient if code>=500 or code==429 else UpdateError)(f'更新服务器返回错误（HTTP {code}）') from None
     except (URLError,TimeoutError,ConnectionError,OSError,HTTPException) as error:
-        reason=_reason(error);raise _Transient(f'无法连接更新服务器（{reason}），请检查网络',reason,_refused(error)) from None
+        if isinstance(_cause(error),ssl.SSLError):raise UpdateError('无法连接更新服务器（'+_reason(error)+'）') from None
+        reason=_reason(error);raise _Transient(f'无法连接更新服务器（{reason}），请检查网络',reason,_refused(error),True) from None
     final=getattr(response,'geturl',lambda:url)()
     if not str(final).startswith('https://'):response.close();raise UpdateError('更新地址不是 HTTPS，已停止')
     return response
@@ -246,13 +247,18 @@ def download(manifest:dict,folder:Path,progress=None,cancelled=None,repo=None,op
     manifest=validate(manifest);info=manifest['installer'];folder=Path(folder);folder.mkdir(parents=True,exist_ok=True)
     target=folder/info['name'];partial=target.with_name(target.name+'.part');note=target.with_name(target.name+'.part.json')
     if target.is_file() and target.stat().st_size==info['bytes'] and _digest(target)==info['sha256']:return target
-    url=installer_url(manifest,repo);opener=opener or _connect(SYSTEM)
+    url=installer_url(manifest,repo)
+    ways=[None] if opener else [proxy for _,proxy in routes(url)]
+    route=0;open_route=opener or _connect(ways[route])
     try:
         for attempt in range(ATTEMPTS):
             if attempt:wait(RETRY_WAIT[min(attempt,len(RETRY_WAIT))-1])
             if cancelled and cancelled():raise UpdateError('下载已取消')
-            try:_fetch(url,info,partial,note,progress,cancelled,opener);break
-            except _Transient as error:failure=error
+            try:_fetch(url,info,partial,note,progress,cancelled,open_route);break
+            except _Transient as error:
+                failure=error
+                if not opener and error.reroute and route+1<len(ways):
+                    route+=1;open_route=_connect(ways[route])
         else:
             kept=partial.stat().st_size if partial.is_file() else 0
             raise UpdateError(f'下载未完成：{failure}'+(f'。已保存 {kept/1048576:.1f} MB，再次下载会接着下载' if kept else ''))
@@ -285,13 +291,15 @@ def _fetch(url,info,partial,note,progress,cancelled,opener):
             while True:
                 if cancelled and cancelled():raise UpdateError('下载已取消')
                 try:block=response.read(BLOCK)
-                except (OSError,HTTPException) as error:raise _Transient('连接中断') from error
+                except (OSError,HTTPException) as error:
+                    if isinstance(error,ssl.SSLError):raise UpdateError(_reason(error)) from error
+                    raise _Transient('连接中断',reroute=True) from error
                 if not block:break
                 done+=len(block)
                 if done>info['bytes']:raise _Bad('下载内容比更新信息里的大，已停止')
                 digest.update(block);out.write(block)
                 if progress:progress(done,info['bytes'])
-    if done<info['bytes']:raise _Transient(f'连接中断（{done}/{info["bytes"]} 字节）')
+    if done<info['bytes']:raise _Transient(f'连接中断（{done}/{info["bytes"]} 字节）',reroute=True)
     if digest.hexdigest()!=info['sha256']:raise _Bad('安装包校验值不一致，已删除下载内容')
 
 def _resumable(partial:Path,note:Path,info:dict)->int:

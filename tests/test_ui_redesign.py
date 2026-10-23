@@ -112,11 +112,12 @@ class LoaderTests(GuiCase):
 class TileTests(GuiCase):
     def test_tiles_count_and_filter(self):
         w=self.window;self.assertEqual(w.chips['all'].value,4);self.assertEqual(w.chips['missing'].text(),'未加载 0')
-        w.chips['checked'].click();self.assertEqual(w.visible_rows(),[])
+        w.chips['favorite'].click();self.assertEqual(w.visible_rows(),[])
     def test_tile_order_ends_with_token_usage(self):
         w=self.window;row=w.chips['all'].parentWidget().layout()
         self.assertEqual([row.itemAt(i).widget() for i in range(row.count())],[*(w.chips[k] for k,_ in app_live.ROW_FILTERS),w.usage_tile])
-        self.assertEqual([k for k,_ in app_live.ROW_FILTERS],['all','checked','applied','missing'])
+        # The user's order: no 已勾选 tile (only_checked in the check menu took over), 已收藏 after 未加载, with a star.
+        self.assertEqual([k for k,_ in app_live.ROW_FILTERS],['all','applied','missing','favorite']);self.assertEqual(w.chips['favorite'].mark,'star')
 
 class EmptyStateTests(GuiCase):
     def test_effects_table_explains_an_empty_version(self):
@@ -510,8 +511,8 @@ class PutInSchemeTests(GuiCase):
         with patch.object(app_live,'ask_text',return_value=('甲',True)):w.save_scheme_as()
         menu=w.scheme_menu();sub=next(a.menu() for a in menu.actions() if a.menu() is not None)
         self.assertEqual(sub.title(),'把勾选项加入方案（2 项）');self.assertIn('甲（当前方案）',[a.text() for a in sub.actions()])
-        self.assertEqual(len([a for a in w.scheme_menu().actions() if a.menu() is not None]),1)
-        self.assertFalse(any(a.menu() for a in w.check_tool.menu().actions()))
+        self.assertEqual([a.menu().title() for a in w.scheme_menu().actions() if a.menu() is not None],['把勾选项加入方案（2 项）'])
+        self.assertEqual([a.menu() for a in w.check_tool.menu().actions() if a.menu()],[w.folder_checked_menu])   # folders, not schemes
 
 class SchemeScopeTests(GuiCase):
     """With a scheme in use the effects table lists only its effects; 显示全部效果 lists all, greying the rest."""

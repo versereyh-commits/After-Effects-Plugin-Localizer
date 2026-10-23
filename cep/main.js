@@ -8,29 +8,36 @@
 (function () {
     'use strict';
     var BRIDGE_ID = '@@BRIDGE_ID@@';
-    var ACTIONS = ['catalog', 'selection', 'labels', 'codec', 'instanceCatalog', 'instanceNames'];
+    var ACTIONS = ['catalog', 'selection', 'labels', 'codec', 'instanceCatalog', 'instanceNames', 'addEffect'];
     var host = window.__adobe_cep__, fs = window.cep && window.cep.fs;
     if (!host || !fs) return;
 
     function systemPath(kind) {
         var path = decodeURI(host.getSystemPath(kind));
-        return path.replace(/^file:\/\/\//, '').replace(/^file:\/\//, '');
+        return path.replace(/^file:\/\/\//, '').replace(/^file:\/\//, '').replace(/\\/g,'/');
     }
-    var root = systemPath('userData') + '/AE-Localizer/bridge';
+    var base = systemPath('userData') + '/AE-Localizer/bridge', root = '', identity = null;
+    var extension = systemPath('extension');
     var template = fs.readFile(systemPath('extension') + '/parameter_bridge.jsx');
     if (template.err !== 0 || template.data.indexOf('@@REQUEST@@') < 0) return;
     template = template.data;
     var version = '';
     try { version = JSON.parse(host.getHostEnvironment()).appVersion || ''; } catch (e) {}
-    var busy = false;
+    var busy = false, pulse = 0;
 
     function makeRoot() {
-        var parent = root.slice(0, root.lastIndexOf('/'));
-        fs.makedir(parent); fs.makedir(root);
+        var parent = base.slice(0, base.lastIndexOf('/'));
+        fs.makedir(parent); fs.makedir(base);fs.makedir(base+'/hosts');if(root)fs.makedir(root);
     }
     function beat() {
         makeRoot();
-        fs.writeFile(root + '/heartbeat.json', JSON.stringify({ time: Date.now(), bridge: BRIDGE_ID, host: version }));
+        if(!identity)return;
+        // CEP rename does not replace an existing destination on Windows. Alternate two slots so readers
+        // always have the preceding complete heartbeat while the other is replaced.
+        var target=root+'/heartbeat.'+(pulse++%2)+'.json',temp=target+'.tmp';
+        if(fs.writeFile(temp,JSON.stringify({time:Date.now(),bridge:BRIDGE_ID,host:version,identity:identity})).err===0){
+            fs.deleteFile(target);fs.rename(temp,target);
+        }
     }
     function inside(path, folder) {
         return typeof path === 'string' && path.replace(/\\/g, '/').toLowerCase().indexOf(folder.toLowerCase() + '/') === 0;
@@ -39,11 +46,14 @@
         fs.writeFile(folder + '/bridge-error.json', JSON.stringify({ error: message }));
     }
     function run(folder) {
+        var preview=fs.readFile(folder+'/request.json'), checked;
+        try{checked=JSON.parse(preview.data);}catch(e){return false;}
+        if(!sameHost(checked.targetHost,identity)||checked.expires<=Date.now())return false;
         var claimed = folder + '/claimed.json';
         if (fs.rename(folder + '/request.json', claimed).err !== 0) return false;   // the program took it back
         var text = fs.readFile(claimed), request;
         try { request = JSON.parse(text.data); } catch (e) { fail(folder, 'request'); return true; }
-        if (!request || ACTIONS.indexOf(request.action) < 0 || !inside(request.output, folder) || !inside(request.permit, folder)) {
+        if (!request || !sameHost(request.targetHost,identity) || ACTIONS.indexOf(request.action) < 0 || !inside(request.output, folder) || !inside(request.permit, folder)) {
             fail(folder, 'request'); return true;
         }
         // JSON is a valid ExtendScript literal once the two JavaScript line separators are escaped.
@@ -66,7 +76,13 @@
             if (run(root + '/' + name)) return;          // one request at a time
         }
     }
-    beat();
-    setInterval(beat, 1000);
-    setInterval(poll, 100);
+    function sameHost(a,b){return a&&b&&a.pid===b.pid&&a.creationTime===b.creationTime&&String(a.image).replace(/\\/g,'/').toLowerCase()===String(b.image).replace(/\\/g,'/').toLowerCase();}
+    // The only startup script is a read-only helper shipped inside this signed extension.
+    var helper=JSON.stringify(extension+'/ae_host_identity_v1.dll');
+    host.evalScript('(function(){try{var lib=new ExternalObject("lib:"+'+helper+');return lib.identity();}catch(e){return "";}})()',function(text){
+        try{identity=JSON.parse(text);}catch(e){return;}
+        if(!identity||!(identity.pid>0)||!/^[0-9a-f]{16}$/.test(identity.creationTime)||typeof identity.image!=='string')return;
+        root=base+'/hosts/'+identity.pid+'-'+identity.creationTime;
+        beat();setInterval(beat,1000);setInterval(poll,100);
+    });
 })();

@@ -28,6 +28,49 @@ def enumerate_regions(p,query=None,limit=LIMIT):
         if m.State==0x1000 and m.Type==0x20000 and not m.Protect&0x100 and m.Protect&0xff in (4,8):regions.append((base,end))
     p.ensure_alive();return regions,count,(time.perf_counter()-start)*1000
 
+class _BasicInfo(C.Structure):
+    _fields_=[('ExitStatus',C.c_void_p),('PebBaseAddress',C.c_void_p),('AffinityMask',C.c_void_p),('BasePriority',C.c_void_p),('UniqueProcessId',C.c_void_p),('Parent',C.c_void_p)]
+
+def default_heap(p):
+    """PEB.ProcessHeap of the target (x64 PEB +0x30). Read with the query/read rights the handle already has."""
+    ntdll=C.WinDLL('ntdll');ntdll.NtQueryInformationProcess.argtypes=[C.c_void_p,C.c_int,C.c_void_p,C.c_ulong,C.c_void_p]
+    info=_BasicInfo()
+    if ntdll.NtQueryInformationProcess(p.handle,0,C.byref(info),C.sizeof(info),None) or not info.PebBaseAddress:raise OSError('进程信息读取失败')
+    return p.u64(info.PebBaseAddress+0x30)
+
+def heap_regions(p,query=None,heap=None,limit=LIMIT):
+    """Committed private read-write regions of the default process heap's segments, in address order.
+    AE's effect and parameter objects come from U.dll's tracked allocator, which calls the CRT malloc, which
+    uses this heap (AE 2021-2026; AfterFX.exe does not opt into the segment heap). An NT heap segment starts at its
+    allocation base with HEAP_SEGMENT: signature 0xffeeffee at +0x10, owning heap at +0x28. Returns None whenever
+    the heap cannot be identified, so the caller scans everything instead."""
+    from parameter_names import MBI
+    try:heap=heap or default_heap(p)
+    except (OSError,RuntimeError,ValueError):return None
+    if not heap:return None
+    if query is None:
+        kernel=_kernel(MBI)
+        def query(address):
+            m=MBI();return m if kernel.VirtualQueryEx(p.handle,C.c_void_p(address),C.byref(m),C.sizeof(m)) else None
+    address=0;owners={};regions=[]
+    while address<limit:
+        m=query(address)
+        if m is None:break
+        base=m.BaseAddress or 0;end=base+m.RegionSize
+        if end<=address:raise RuntimeError('memory enumeration did not advance')
+        address=end
+        if not (m.State==0x1000 and m.Type==0x20000 and not m.Protect&0x100 and m.Protect&0xff in (4,8)):continue
+        start=m.AllocationBase or 0
+        if start not in owners:
+            try:
+                header=p.read(start,0x30)
+                owners[start]=int.from_bytes(header[0x10:0x14],'little')==0xffeeffee and int.from_bytes(header[0x28:0x30],'little')==heap
+            except (OSError,RuntimeError):owners[start]=False
+        if owners[start]:regions.append((base,end))
+    # The heap's first segment is the heap itself: no match means the layout is not the one described above.
+    if not owners.get(heap):return None
+    return regions
+
 def consolidate(regions,merge):
     spans=[]
     for start,end in regions:
@@ -109,17 +152,22 @@ def scan_parallel(catalog,*,workers=2,merge=False,query=None,factory=None,job=JO
     finally:stop.set()
 
 
-def scan_auto(catalog):
-    """Bound concurrency by CPU count. Resource-only failures retain serial coverage."""
+def scan_auto(catalog,full=True):
+    """Bound concurrency by CPU count. Resource-only failures retain serial coverage.
+    full=False scans only the default heap (heap_regions) and falls back to everything when it cannot be found;
+    catalog.timings['scanTarget'] says which one ran ('heap' or 'full')."""
+    regions=None if full else heap_regions(catalog.p)
+    query=None if regions is None else region_query(regions)
+    catalog.timings['scanTarget']='full' if regions is None else 'heap'
     cores=os.cpu_count() or 1
     if cores<2:
-        result=serial_scan(catalog,optimized=True,native=True)
+        result=serial_scan(catalog,optimized=True,native=True,query=query)
         catalog.timings.update(scanWorkerCount=1,scanCoalesced=0,scanTimingMode='serial')
         return result
     workers=4 if cores>=4 else 2;started=time.perf_counter()
-    try:return scan_parallel(catalog,workers=workers,merge=True)
+    try:return scan_parallel(catalog,workers=workers,merge=True,query=query)
     except (OSError,MemoryError):
         # scan_parallel joins workers before raising. Never fall back on identity/runtime guards.
-        catalog.p.ensure_alive();result=serial_scan(catalog,optimized=True,native=True)
+        catalog.p.ensure_alive();result=serial_scan(catalog,optimized=True,native=True,query=None if regions is None else region_query(regions))
         catalog.timings.update(scanWorkerCount=1,scanCoalesced=0,scanTimingMode='serial-resource-fallback',scanResourceFallback=1,scanMeasuredMs=(time.perf_counter()-started)*1000)
         return result

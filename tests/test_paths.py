@@ -41,11 +41,12 @@ class PathTests(unittest.TestCase):
     def test_bad_saved_record_is_preserved_and_not_overwritten(self):
         path=self.root/'paths.json';path.write_text('{bad',encoding='utf8')
         self.assertTrue(ae_paths.read_saved(path)[1])
-        with self.assertRaises(ValueError):ae_paths.remember(path,self.exe)
-        self.assertEqual(path.read_text(encoding='utf8'),'{bad')
+        ae_paths.remember(path,self.exe)
+        self.assertEqual(next(self.root.glob('paths.corrupt-*.json')).read_text(encoding='utf8'),'{bad')
+        self.assertEqual(ae_paths.read_saved(path)[0],[str(self.exe.resolve())])
     def test_foreign_json_shape_is_rejected(self):
         path=self.root/'paths.json'
-        for value in ([],{'schemaVersion':1,'paths':[3]},{'schemaVersion':2,'paths':[]}):
+        for value in ([],{'schemaVersion':1,'paths':[3]},{'schemaVersion':3,'paths':[]}):
             path.write_text(json.dumps(value),encoding='utf8');self.assertTrue(ae_paths.read_saved(path)[1])
     def test_unknown_version_never_becomes_live(self):
         item=ae_paths.locate(self.exe)

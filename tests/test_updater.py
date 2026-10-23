@@ -169,6 +169,17 @@ class ConnectionTests(unittest.TestCase):
         with patch.object(updater,'tls_context',return_value=context) as made:
             updater._connect(None);updater._connect(updater.SYSTEM)
         self.assertEqual(made.call_count,2)
+    def test_tls_selftest_reports_a_bundle_that_cannot_open_https(self):
+        # build.py runs the frozen EXE with this flag; it once caught nothing because there was no such check.
+        with tempfile.TemporaryDirectory() as folder:
+            report=Path(folder)/'tls.txt'
+            self.assertEqual(app_live.tls_selftest(report),0);self.assertEqual(report.read_text(encoding='utf8'),'ok')
+            with patch.object(ssl,'create_default_context',side_effect=FileNotFoundError(2,'No such file or directory')):
+                self.assertEqual(app_live.tls_selftest(report),1)
+            self.assertIn('FileNotFoundError',report.read_text(encoding='utf8'))
+            with patch.object(app_live.sys,'argv',['AE汉化工具.exe',app_live.TLS_SELFTEST,str(report)]),patch.object(app_live,'QApplication') as qt:
+                with self.assertRaises(SystemExit) as stop:app_live.main()
+            self.assertEqual(stop.exception.code,0);qt.assert_not_called()
     def test_pac_proxy_lists(self):
         for listed,proxy in (('127.0.0.1:1080','http://127.0.0.1:1080'),('a.example:8080;b.example:8080','http://a.example:8080'),
                              ('http=a:1;https=b:2','http://b:2'),('http://p:3','http://p:3'),('[::1]:7890','http://[::1]:7890'),('',None),('DIRECT',None),('http=a:1',None)):

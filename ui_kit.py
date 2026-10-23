@@ -6,9 +6,9 @@ switched off in Settings; with motion off every widget jumps straight to its fin
 from __future__ import annotations
 import ctypes,math,os,re,sys,tempfile,time
 from pathlib import Path
-from PySide6.QtCore import Qt,QEvent,QObject,QEasingCurve,QPointF,QPropertyAnimation,QRect,QRectF,QSize,QTimer,QVariantAnimation,Signal
+from PySide6.QtCore import Qt,QEvent,QObject,QEasingCurve,QPoint,QPointF,QPropertyAnimation,QRect,QRectF,QSize,QTimer,QVariantAnimation,Signal
 from PySide6.QtGui import QColor,QCursor,QFont,QFontMetrics,QIcon,QPainter,QPainterPath,QPen,QPixmap,QPolygonF
-from PySide6.QtWidgets import (QAbstractItemView,QApplication,QComboBox,QDialog,QMainWindow,QListWidget,QFrame,QGraphicsOpacityEffect,QHBoxLayout,QHeaderView,QLabel,QLineEdit,QMenu,QPushButton,QSizePolicy,QStackedWidget,
+from PySide6.QtWidgets import (QAbstractItemView,QApplication,QCheckBox,QComboBox,QDialog,QScrollArea,QMainWindow,QListWidget,QFrame,QGraphicsOpacityEffect,QHBoxLayout,QHeaderView,QLabel,QLineEdit,QMenu,QPushButton,QSizePolicy,QStackedWidget,
                                QStyle,QStyledItemDelegate,QStyleOptionViewItem,QToolButton,QVBoxLayout,QWidget)
 
 # Tokens: one ink, one paper, greys between. Colour appears only for errors.
@@ -76,6 +76,9 @@ def _poly(painter,*points,closed=False):
     polygon=QPolygonF([QPointF(x,y) for x,y in points])
     painter.drawPolygon(polygon) if closed else painter.drawPolyline(polygon)
 def _diamond(cx,cy,r)->QPolygonF:return QPolygonF([QPointF(cx,cy-r),QPointF(cx+r,cy),QPointF(cx,cy+r),QPointF(cx-r,cy)])
+def star_shape(cx,cy,r)->QPolygonF:
+    """A five-pointed star, point up (favourites)."""
+    return QPolygonF([QPointF(cx+(r if i%2==0 else r*.45)*math.sin(i*math.pi/5),cy-(r if i%2==0 else r*.45)*math.cos(i*math.pi/5)) for i in range(10)])
 
 def _draw(name,painter,color):
     _stroke(painter,color)
@@ -119,6 +122,13 @@ def _draw(name,painter,color):
     elif name=='inbox':
         _poly(painter,(3,13),(8,13),(9.5,16),(14.5,16),(16,13),(21,13));_poly(painter,(3,13),(6,5),(18,5),(21,13),(21,19),(3,19),closed=True)
     elif name=='diamond':painter.drawPolygon(_diamond(12,12,8))
+    elif name=='star':painter.drawPolygon(star_shape(12,12.8,9))
+    elif name=='star_fill':painter.setBrush(QColor(color));painter.drawPolygon(star_shape(12,12.8,9))
+    elif name=='grip':
+        painter.setPen(Qt.PenStyle.NoPen);painter.setBrush(QColor(color))
+        for x in (9,15):
+            for y in (6,12,18):painter.drawEllipse(QPointF(x,y),1.5,1.5)
+    elif name=='quick':_poly(painter,(13.5,2.5),(5,13.5),(11.5,13.5),(10.5,21.5),(19,10.5),(12.5,10.5),closed=True)
     elif name=='trash':
         painter.drawLine(QPointF(4,6.5),QPointF(20,6.5));_poly(painter,(9.5,6.5),(9.5,4),(14.5,4),(14.5,6.5));_poly(painter,(6,6.5),(7,20),(17,20),(18,6.5))
         painter.drawLine(QPointF(10,10.5),QPointF(10,16.5));painter.drawLine(QPointF(14,10.5),QPointF(14,16.5))
@@ -296,6 +306,7 @@ def stylesheet()->str:
 QWidget {{ font-size:13px; color:{INK}; }}
 QMainWindow,QDialog,QMessageBox,QFileDialog {{ background:{CANVAS}; }}
 QScrollArea#pageScroll,QScrollArea#pageScroll > QWidget,QWidget#scrollPage {{ background:transparent; border:none; }}
+QScrollArea#reorder,QScrollArea#reorder > QWidget,QWidget#reorderBody {{ background:transparent; border:none; }}
 QDialog,QMessageBox,QFileDialog,QMenu,QCheckBox,QComboBox QAbstractItemView {{ color:{INK}; }}
 QCheckBox:disabled {{ color:{FAINT}; }}
 QLabel#muted,QLabel#hint {{ color:{MUTED}; font-size:12px; }}
@@ -609,13 +620,14 @@ def button(text,kind=None,icon_name=None,tip=None)->QPushButton:
     widget.setCursor(Qt.CursorShape.PointingHandCursor);return widget
 
 def menu_button(text,entries,primary=False,default=None,icon_name=None)->QToolButton:
-    """A drop-down; None separates groups and (title,[...]) nests a submenu.
-    With a default action the button runs it and its arrow opens the rest."""
+    """A drop-down; None separates groups, (title,[...]) nests a submenu and a QMenu is nested as it is
+    (one that fills itself when it opens). With a default action the button runs it and its arrow opens the rest."""
     widget=QToolButton();menu=QMenu(widget)
     def fill(target,items):
         for entry in items:
             if entry is None:target.addSeparator()
             elif isinstance(entry,tuple):fill(target.addMenu(entry[0]),entry[1])
+            elif isinstance(entry,QMenu):target.addMenu(entry)
             else:target.addAction(entry)
     fill(menu,entries)
     if default:widget.setDefaultAction(default);widget.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
@@ -920,8 +932,9 @@ class MetricTile(QPushButton):
         if self.hasFocus():painter.setPen(QPen(QColor(INK),2));painter.setBrush(Qt.BrushStyle.NoBrush);painter.drawRoundedRect(rect.adjusted(-1,-1,1,1),17,17)
         x=rect.x()+16;caption=QFont(self.font());caption.setPixelSize(12);painter.setFont(caption);fg=QColor(ON_INK_MUTED) if on else QColor(MUTED)
         if self.mark:
-            mark_color=QColor(ON_INK if on else INK);painter.setPen(QPen(mark_color,1.3));painter.setBrush(mark_color if self.mark=='solid' else Qt.BrushStyle.NoBrush)
+            mark_color=QColor(ON_INK if on else INK);painter.setPen(QPen(mark_color,1.3));painter.setBrush(mark_color if self.mark in ('solid','star') else Qt.BrushStyle.NoBrush)
             if self.mark=='dash':painter.drawLine(QPointF(x,rect.y()+21),QPointF(x+7,rect.y()+21))
+            elif self.mark=='star':painter.drawPolygon(star_shape(x+4,rect.y()+21.5,5.2))
             else:painter.drawPolygon(_diamond(x+4,rect.y()+21,4))
             x+=14
         painter.setPen(fg);painter.drawText(QRectF(x,rect.y()+12,rect.width()-(x-rect.x())-10,18),Qt.AlignmentFlag.AlignVCenter|Qt.AlignmentFlag.AlignLeft,self.caption)
@@ -1049,6 +1062,204 @@ class TrashDelegate(QStyledItemDelegate):
         hover=bool(option.state&QStyle.StateFlag.State_MouseOver);centre=QRectF(option.rect).center();painter.save();painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         if hover:painter.setPen(Qt.PenStyle.NoPen);painter.setBrush(QColor(SELECT));painter.drawEllipse(centre,14,14)
         painter.drawPixmap(QRectF(centre.x()-8,centre.y()-8,16,16).toRect(),pixmap('trash',INK if hover else FAINT,16));painter.restore()
+
+class StarDelegate(QStyledItemDelegate):
+    """Favourite as a star: solid for a favourite (the item's text is '★'), otherwise always an outline (faint, darker
+    under the pointer) so every row shows where to click. The view handles the click."""
+    def paint(self,painter,option,index):
+        opt=QStyleOptionViewItem(option);self.initStyleOption(opt,index);opt.text=''
+        style=opt.widget.style() if opt.widget else QApplication.style();style.drawControl(QStyle.ControlElement.CE_ItemViewItem,opt,painter,opt.widget)
+        on=bool(index.data());hover=bool(option.state&QStyle.StateFlag.State_MouseOver)
+        centre=QRectF(option.rect).center();painter.save();painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.drawPixmap(QRectF(centre.x()-8,centre.y()-8,16,16).toRect(),pixmap('star_fill' if on else 'star',INK if on else MUTED if hover else FAINT,16));painter.restore()
+
+class _OrderRow(QWidget):
+    """One row of a ReorderList: a box, the name (and a muted note), a grip; drawn here so it follows the theme.
+    The box takes no clicks of its own: the list decides (a click flips it, a press-and-slide sets a run, the grip drags)."""
+    BOX_ZONE=40     # where the name starts
+    GRIP_ZONE=44    # the grip at the right end: only here does pressing and moving drag the row
+    def __init__(self,owner,key):
+        super().__init__(owner.body);self.owner=owner;self.key=key;self.text='';self.note='';self.faint=False;self.lifted=False;self.anim=None;self.target=None
+        self.box=QCheckBox(self);self.box.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents);self.box.toggled.connect(lambda _:owner.checks.emit())
+        self.setMouseTracking(True);self.setCursor(Qt.CursorShape.PointingHandCursor)
+    def set_item(self,text,tip='',faint=False,note=''):
+        self.text,self.faint,self.note=text,faint,note;self.setToolTip(tip);self.update()
+    def on_grip(self,x)->bool:return self.owner.draggable and x>=self.width()-self.GRIP_ZONE
+    def hovered(self)->bool:
+        # Qt's own under-the-pointer state (set before the leave repaint), and the pointer really inside, since rows
+        # also slide under a still pointer. The pointer position alone disagreed with Qt at row edges on 125% displays
+        # (rounding), so a row left behind repainted itself highlighted and stayed so.
+        return self.isVisible() and self.underMouse() and self.rect().contains(self.mapFromGlobal(QCursor.pos()))
+    def resizeEvent(self,event):self.box.move(12,(self.height()-self.box.sizeHint().height())//2)
+    def enterEvent(self,event):self.update()
+    def leaveEvent(self,event):self.update()
+    def mousePressEvent(self,event):self.owner.press(self,event)
+    def mouseMoveEvent(self,event):
+        if not event.buttons():self.setCursor(Qt.CursorShape.OpenHandCursor if self.on_grip(event.position().x()) else Qt.CursorShape.PointingHandCursor)
+        self.owner.drag(event)
+    def mouseReleaseEvent(self,event):self.owner.release(self,event)
+    def contextMenuEvent(self,event):self.owner.menu.emit(self.key,event.globalPos())
+    def paintEvent(self,event):
+        painter=QPainter(self);painter.setRenderHint(QPainter.RenderHint.Antialiasing);rect=QRectF(self.rect()).adjusted(2,2,-2,-2);hovered=self.hovered()
+        # Opaque, so a row sliding past another covers it instead of mixing their names.
+        if not self.lifted:painter.fillRect(self.rect(),QColor(PAPER))
+        if self.lifted:
+            for step,alpha in ((4,8),(2,14)):
+                painter.setPen(Qt.PenStyle.NoPen);painter.setBrush(shadow(alpha));painter.drawRoundedRect(rect.adjusted(-step+2,step,step-2,step),10,10)
+            painter.setPen(QPen(QColor(LINE),1));painter.setBrush(QColor(PAPER));painter.drawRoundedRect(rect,10,10)
+        elif hovered or self.box.isChecked():
+            painter.setPen(Qt.PenStyle.NoPen);painter.setBrush(QColor(SELECT if self.box.isChecked() else HOVER));painter.drawRoundedRect(rect,10,10)
+        font=QFont(self.font());font.setPixelSize(13);painter.setFont(font);metrics=QFontMetrics(font);left=float(self.BOX_ZONE);right=self.width()-34.0
+        name=metrics.elidedText(self.text,Qt.TextElideMode.ElideRight,int(right-left));painter.setPen(QColor(FAINT if self.faint else INK))
+        painter.drawText(QRectF(left,0,right-left,self.height()),Qt.AlignmentFlag.AlignVCenter|Qt.AlignmentFlag.AlignLeft,name)
+        if self.note and metrics.horizontalAdvance(name)+16<right-left:
+            small=QFont(font);small.setPixelSize(11);painter.setFont(small);painter.setPen(QColor(MUTED));start=left+metrics.horizontalAdvance(name)+12
+            painter.drawText(QRectF(start,0,right-start,self.height()),Qt.AlignmentFlag.AlignVCenter|Qt.AlignmentFlag.AlignLeft,QFontMetrics(small).elidedText(self.note,Qt.TextElideMode.ElideRight,int(right-start)))
+        if self.owner.draggable:painter.drawPixmap(QRectF(self.width()-28,(self.height()-16)/2,16,16).toRect(),pixmap('grip',INK_2 if (hovered or self.lifted) else FAINT,16))
+
+class ReorderList(QScrollArea):
+    """A list the user puts in order by dragging (the favourites). Each row has a box for picking several, its name
+    and a grip. Two gestures, told apart by where the press starts:
+    - anywhere but the grip: a click flips the box; pressing and moving up or down sweeps every row passed to the
+      state the first box switched to (as in the effects table);
+    - on the grip (right end): pressing and moving drags the row (with every checked row, when it is checked, as one
+      block). It lifts and follows the pointer, the others slide aside, on release it settles. A click there flips the box.
+    While rows are hidden (a search) there is no grip and every press sweeps.
+    Order changes made elsewhere (menu moves, a reload) slide the rows the same way; with motion off everything jumps.
+    A lifted row lands (loses its shadow) whenever its slide ends, however it ends.
+    reordered(keys) after a drag; checks() when a box changes; menu(key, global point) on right-click."""
+    reordered=Signal(list);checks=Signal();menu=Signal(str,object)
+    ROW=38;EDGE=28;DURATION=180
+    def __init__(self):
+        super().__init__();self.setObjectName('reorder');self.setWidgetResizable(True);self.setFrameShape(QFrame.Shape.NoFrame);self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.body=QWidget();self.body.setObjectName('reorderBody');self.setWidget(self.body);self.body.installEventFilter(self)
+        self.rows:dict[str,_OrderRow]={};self.order:list[str]=[];self.hidden:set[str]=set();self.draggable=True
+        self.pressed=None;self.start=None;self.group=None;self.rest=[];self.slot=0;self.grab=0.0;self.pointer=None;self.direction=0
+        self.sweep=None;self.swept=set();self.sweep_from=None     # sweeping boxes: the state, the rows done, the row it started on
+        self.scroller=QTimer(self);self.scroller.setInterval(30);self.scroller.timeout.connect(self.autoscroll);self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+    # Contents.
+    def set_items(self,items,checked=None):
+        """items: (key, text, tip, faint, note) in order. Same keys in another order slide into it."""
+        keys=[item[0] for item in items]
+        for key in [k for k in self.rows if k not in set(keys)]:self.rows.pop(key).deleteLater()
+        fresh=False
+        for key,text,tip,faint,note in items:
+            row=self.rows.get(key)
+            if row is None:row=self.rows[key]=_OrderRow(self,key);row.resize(self.body.width(),self.ROW);row.show();fresh=True
+            row.set_item(text,tip,faint,note)
+            if checked is not None:row.box.blockSignals(True);row.box.setChecked(key in checked);row.box.blockSignals(False)
+        moved=keys!=self.order
+        if moved and not fresh:
+            # The rows that jumped (a menu move) slide over the ones that only make room.
+            old={k:i for i,k in enumerate(self.order)}
+            for i,key in enumerate(keys):
+                if abs(old.get(key,i)-i)>1:self.rows[key].raise_()
+        self.order=keys;self.layout_rows(animated=moved and not fresh)
+    def set_hidden(self,keys):
+        """Rows left out (a search); dragging is off meanwhile, since it would move rows nobody can see."""
+        self.hidden=set(keys)&set(self.order);self.draggable=not self.hidden
+        for key,row in self.rows.items():row.setVisible(key not in self.hidden);row.update()
+        self.layout_rows(False)
+    def keys(self)->list[str]:return list(self.order)
+    def visible_keys(self)->list[str]:return [k for k in self.order if k not in self.hidden]
+    def is_checked(self,key)->bool:return key in self.rows and self.rows[key].box.isChecked()
+    def checked_keys(self)->list[str]:return [k for k in self.visible_keys() if self.is_checked(k)]
+    def set_checked(self,keys,on=True,tell=True):
+        for key in keys:
+            if key in self.rows:self.rows[key].box.blockSignals(True);self.rows[key].box.setChecked(on);self.rows[key].box.blockSignals(False);self.rows[key].update()
+        if tell:self.checks.emit()
+    # Layout: row i of the shown rows sits at i*ROW.
+    def slots(self,order)->dict[str,int]:
+        shown=[k for k in order if k not in self.hidden];return {k:i*self.ROW for i,k in enumerate(shown)}
+    def layout_rows(self,animated=True):
+        self.body.setMinimumHeight(len(self.visible_keys())*self.ROW)
+        for key,y in self.slots(self.order).items():self.place(self.rows[key],y,animated)
+    def dragging(self,row)->bool:return self.group is not None and row.key in self.group
+    def land(self,row):
+        """A lifted row that is no longer being dragged takes its normal look."""
+        if row.lifted and not self.dragging(row):row.lifted=False;row.setCursor(Qt.CursorShape.OpenHandCursor);row.update()
+    def halt(self,row,land=True):
+        """Stops a row's slide (a finished one has already deleted itself); a row that was landing lands now."""
+        anim,row.anim=row.anim,None
+        if anim is not None:
+            try:anim.stop()
+            except RuntimeError:pass
+        if land:self.land(row)
+    def place(self,row,y,animated=True):
+        # Already sliding there: let it finish (a reload right after a drop must not cut the landing short).
+        if row.anim is not None and row.target==y:return
+        self.halt(row,land=False);row.target=y
+        if (row.y()!=y or row.x()!=0) and animated and motion() and self.isVisible():
+            anim=row.anim=animate(row,b'pos',QPoint(0,y),self.DURATION,QEasingCurve.Type.OutCubic)
+            anim.finished.connect(lambda r=row,a=anim:(setattr(r,'anim',None),self.land(r)) if r.anim is a else None)
+        else:row.move(0,y);self.land(row)
+    def eventFilter(self,obj,event):
+        if obj is self.body and event.type()==QEvent.Type.Resize:
+            for row in self.rows.values():row.resize(self.body.width(),self.ROW)
+        return super().eventFilter(obj,event)
+    # Pointer.
+    def body_y(self,global_point)->float:return self.body.mapFromGlobal(global_point.toPoint()).y()
+    def row_at(self,global_point):
+        """The shown row under a point (clamped to the first and last)."""
+        shown=self.visible_keys()
+        if not shown:return None
+        return shown[max(0,min(len(shown)-1,int(self.body_y(global_point)//self.ROW)))]
+    def press(self,row,event):
+        self.setFocus()
+        if event.button()!=Qt.MouseButton.LeftButton:return
+        self.pressed=row;self.start=event.globalPosition()
+        if not row.on_grip(event.position().x()):
+            # Anywhere but the grip: the box flips at once, and every row passed while held takes the same state.
+            self.sweep=not row.box.isChecked();self.swept={row.key};self.sweep_from=row.key;self.set_checked([row.key],self.sweep)
+    def drag(self,event):
+        if self.pressed is None:return
+        self.pointer=event.globalPosition()
+        if self.sweep is not None:self.sweep_to(self.row_at(self.pointer))
+        else:
+            if self.group is None:
+                if not self.draggable or (self.pointer-self.start).manhattanLength()<5:return
+                self.lift(self.pressed)
+            self.follow()
+        y=self.viewport().mapFromGlobal(self.pointer.toPoint()).y();height=self.viewport().height()
+        self.direction=-1 if y<self.EDGE else 1 if y>height-self.EDGE else 0
+        if self.direction and not self.scroller.isActive():self.scroller.start()
+        elif not self.direction:self.scroller.stop()
+    def sweep_to(self,key):
+        if key is None:return
+        shown=self.visible_keys();low,high=sorted((shown.index(self.sweep_from),shown.index(key)))
+        run=[k for k in shown[low:high+1] if k not in self.swept]
+        if run:self.swept.update(run);self.set_checked(run,self.sweep)
+    def lift(self,row):
+        key=row.key;checked=self.checked_keys()
+        self.group=checked if key in checked and len(checked)>1 else [key]
+        self.rest=[k for k in self.order if k not in set(self.group)];self.slot=-1
+        self.grab=self.body_y(self.start)-self.slots(self.order)[key]+self.group.index(key)*self.ROW
+        for k in self.group:
+            moving=self.rows[k];self.halt(moving);moving.lifted=True;moving.raise_();moving.setCursor(Qt.CursorShape.ClosedHandCursor);moving.update()
+    def follow(self):
+        """The block follows the pointer; the other rows slide to leave a gap where it would land."""
+        top=max(0.0,min(self.body_y(self.pointer)-self.grab,(len(self.order)-len(self.group))*self.ROW))
+        for i,k in enumerate(self.group):self.rows[k].move(0,int(top+i*self.ROW));self.rows[k].target=None
+        slot=max(0,min(len(self.rest),int(round(top/self.ROW))))
+        if slot!=self.slot:
+            self.slot=slot;new=self.rest[:slot]+self.group+self.rest[slot:];y=self.slots(new)
+            for k in self.rest:self.place(self.rows[k],y[k])
+    def autoscroll(self):
+        if self.pressed is None or not self.direction:self.scroller.stop();return
+        bar=self.verticalScrollBar();bar.setValue(bar.value()+self.direction*12)
+        if self.sweep is not None:self.sweep_to(self.row_at(self.pointer))
+        elif self.group is not None:self.follow()
+    def release(self,row,event):
+        self.scroller.stop();pressed,self.pressed=self.pressed,None
+        if self.sweep is not None:self.sweep=None;self.swept=set();self.sweep_from=None;return
+        if self.group is None:
+            # A click, not a drag: the box flips.
+            if pressed is row and event.button()==Qt.MouseButton.LeftButton:self.set_checked([row.key],not row.box.isChecked())
+            return
+        group,self.group=self.group,None;new=self.rest[:max(self.slot,0)]+group+self.rest[max(self.slot,0):];changed=new!=self.order;self.order=new
+        # Each dropped row slides to its place and lands when the slide ends (or at once, when there is none).
+        for k,y in self.slots(new).items():self.place(self.rows[k],y)
+        if changed:self.reordered.emit(list(new))
 
 class Breather:
     """Drives a delegate's phase and repaints its view while something is being written."""

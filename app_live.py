@@ -4,29 +4,32 @@ from dataclasses import asdict
 from datetime import datetime
 from typing import NamedTuple
 import json,os,re,shutil,subprocess,sys,threading
-from PySide6.QtCore import Qt,QEvent,QEventLoop,QObject,QTimer,QItemSelection,QItemSelectionModel,QPoint,QRect,QRectF,QEasingCurve,QUrl,Signal
+from PySide6.QtCore import Qt,QEvent,QEventLoop,QObject,QTimer,QItemSelection,QItemSelectionModel,QPoint,QRect,QRectF,QSize,QEasingCurve,QUrl,Signal
 from PySide6.QtGui import QAction,QColor,QDesktopServices,QFont,QKeySequence,QPainter,QShortcut
 from PySide6.QtWidgets import (QApplication,QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,QLabel,QPushButton,QLineEdit,QTableWidget,QTableWidgetItem,QHeaderView,QPlainTextEdit,QFileDialog,QCheckBox,QDialog,QFormLayout,QMessageBox,
-                               QComboBox,QInputDialog,QMenu,QFrame,QToolButton,QButtonGroup,QListWidget,QListWidgetItem,QSizePolicy,QGridLayout,QGraphicsOpacityEffect,QAbstractItemView,QWidgetAction,QScrollArea)
+                               QComboBox,QInputDialog,QMenu,QFrame,QToolButton,QButtonGroup,QListWidget,QListWidgetItem,QSizePolicy,QGridLayout,QGraphicsOpacityEffect,QAbstractItemView,QWidgetAction,QScrollArea,QSystemTrayIcon)
 from app import Job,apply_theme
-from core import scan,installations,shared_roots
+from core import scan,installations,shared_roots,readable_category
 from live_names import NameSession,read_live,UNSUPPORTED
 from ae_ui import refresh_effects
 from runtime import data_root,file_version,write_json_atomic
 from settings_store import Settings
-from llm_client import translate_names,TranslationError,PROVIDERS,list_models
+from llm_client import translate_names,TranslationError,PROVIDERS,PARAMETER_PROMPT,list_models
 from parameter_names import ParameterSession,identity,split_identity,validate_label
 from effect_instances import EffectInstanceSession
 from ae_profiles import is_supported,supported_text
 from ae_paths import installed_flt_sha
-import cep_bridge,release_notes,ui_kit,token_usage,updater
+import autostart,cep_bridge,release_notes,ui_kit,token_usage,updater
 from PySide6.QtWidgets import QStackedWidget
 from shortcuts import Keymap,ShortcutDialog,PAGES,local_shortcut
+from quick_search import AeHotkey,HOTKEY_ID,QuickSearch,build_entries,record_timing
+from favorites import Favorites
+import favorites as favorites_store
 from ui_kit import confirm,choose,inform,ask_text,Prompt,SchemeDelegate,SchemeRow,SchemeSwitcher,CheckHeader,CheckDragger,TrashDelegate,check_state
 from ui_kit import (SHADOW,STATUS_MARK,Banner,DiamondDelegate,Breather,EmptyState,FadeStack,Legend,LoaderButton,MetricTile,UsageTile,NavRail,Pill,SearchField,Spinner,StatusTag,Surface,
                     button,divider,elastic,fade_in,icon,label,logo,menu_button,page_head,repolish,soft_path,table_style)
 
-APP_VERSION='1.2.1'
+APP_VERSION='1.3.0'
 APP_NAME='AE汉化工具'
 # Installed copies: the current folder name, and the folder older versions used (an upgrade keeps it).
 INSTALL_FOLDERS=('AE汉化工具','AE插件名称汉化')
@@ -38,7 +41,7 @@ LIMITS=('· 中文只写在正在运行的 AE 里，不改插件文件：AE 重�
         '· 只有已验证的 AE 构建能实时汉化；其他版本需先在“AE 版本”页自动识别与适配。\n'
         '· 下拉菜单选项和插件自绘的界面无法汉化；参数名称最多约 10 个汉字，效果名称约 15 个汉字。\n'
         '· “效果和预设”列表要手动刷新才显示新名称；图层上的效果标题随工程保存。')
-CHECK,ORIGINAL,CANDIDATE,CURRENT,KEY,CATEGORY,STATUS=range(7)
+CHECK,ORIGINAL,CANDIDATE,CURRENT,KEY,CATEGORY,STATUS,FAVORITE=range(8)
 SUPPORTED_BUILD='26.0.0.67'
 
 def _under(path,root)->bool:
@@ -68,6 +71,10 @@ def discover_spaces(installs:list[dict],version_of,root:Path)->list[VersionSpace
         key=item.get('key',item['name'])
         folder=root if version==SUPPORTED_BUILD and not any(s.version==SUPPORTED_BUILD for s in spaces) else root/'versions'/(re.sub(r'[^0-9A-Za-z]+','_',key).strip('_') or 'AE')
         spaces.append(VersionSpace(key,item['name'].replace('Adobe After Effects','AE').strip() or item['name'],version,Path(item['plugins']),live,folder,Path(item['exe'])))
+    from ae_paths import extra_directories
+    for space in spaces:
+        try:space.extra,_=extra_directories(root/'ae-installations.json',space.exe)
+        except OSError:pass
     return spaces or [VersionSpace('default','AE','未检测到安装',None,False,root)]
 SCHEME_FORMAT='ae-localizer-scheme'
 
@@ -101,18 +108,22 @@ class CandidateStore:
 def entries(names:dict[str,str],enabled:set[str])->dict:
     return {k:{'name':names.get(k,''),'enabled':k in enabled} for k in sorted(set(names)|enabled)}
 
-def dump_scheme(names:dict[str,str],enabled:set[str],title:str|None=None,saved:datetime|None=None,parameters:tuple[dict[str,str],set[str]]|None=None)->dict:
-    """Effects always; parameters only when given. Older versions ignore the extra key."""
+def dump_scheme(names:dict[str,str],enabled:set[str],title:str|None=None,saved:datetime|None=None,parameters:tuple[dict[str,str],set[str]]|None=None,favorites:list[str]|None=None)->dict:
+    """Effects always; parameters only when given. favorites: what a scheme saved while schemes carried favourites
+    (1.2.2 test builds) holds, passed through so rewriting the file keeps it; schemes no longer manage favourites."""
     value={'format':SCHEME_FORMAT,'schemaVersion':1}
     if title is not None:value.update(name=title,savedAt=(saved or datetime.now()).isoformat(timespec='seconds'))
     value['effects']=entries(names,enabled)
     if parameters is not None:value['parameters']=entries(*parameters)
+    if favorites is not None:value['favorites']=list(dict.fromkeys(favorites))
     return value
 
 class SavedScheme(NamedTuple):
     path:Path;title:str;names:dict[str,str];enabled:set[str];saved:datetime
     # None: saved before schemes carried parameter labels; loading it leaves them alone.
     parameter_names:dict[str,str]|None=None;parameter_enabled:set[str]|None=None
+    # Favourite effects a scheme saved while schemes carried them; kept in the file, offered as a folder (收藏夹).
+    favorites:list[str]|None=None
     @property
     def parameters(self)->tuple[dict[str,str],set[str]]|None:
         return None if self.parameter_names is None else (self.parameter_names,self.parameter_enabled or set())
@@ -135,11 +146,14 @@ def open_scheme(path:Path)->SavedScheme:
     parameters=value.get('parameters')
     if parameters is not None and not isinstance(parameters,dict):raise ValueError('翻译方案中的参数部分格式错误')
     parameter_names,parameter_enabled=read_entries(parameters,'参数') if parameters is not None else (None,None)
+    favorites=value.get('favorites')
+    if favorites is not None and (not isinstance(favorites,list) or not all(isinstance(k,str) and k for k in favorites)):raise ValueError('翻译方案中的收藏部分格式错误')
+    favorites=list(dict.fromkeys(favorites)) if favorites is not None else None
     # Files exported before schemes had titles are named after the file.
     title=value.get('name') if isinstance(value.get('name'),str) and value['name'].strip() else Path(path).stem
     try:saved=datetime.fromisoformat(value['savedAt'])
     except (KeyError,TypeError,ValueError):saved=datetime.fromtimestamp(Path(path).stat().st_mtime)
-    return SavedScheme(Path(path),title.strip(),names,enabled,saved.replace(tzinfo=None),parameter_names,parameter_enabled)
+    return SavedScheme(Path(path),title.strip(),names,enabled,saved.replace(tzinfo=None),parameter_names,parameter_enabled,favorites)
 
 def read_scheme(path:Path)->tuple[dict[str,str],set[str]]:
     scheme=open_scheme(path);return scheme.names,scheme.enabled
@@ -202,6 +216,17 @@ def duplicate_names(names:dict[str,str],originals:dict[str,str]|None=None)->dict
     def same(keys):return all(key in originals for key in keys) and len({originals[key].casefold() for key in keys})==1
     return {value:sorted(keys,key=str.casefold) for value,keys in users.items() if len(keys)>1 and not same(keys)}
 
+def move_keys(order:list[str],keys,where:str)->list[str]:
+    """order with keys moved 'top', 'up', 'down' or 'bottom' (one place for up/down); they keep their order among themselves."""
+    order=list(order);chosen=[k for k in order if k in set(keys)]
+    if where in ('top','bottom'):
+        rest=[k for k in order if k not in set(chosen)];return chosen+rest if where=='top' else rest+chosen
+    step=-1 if where=='up' else 1;indexes=[order.index(k) for k in chosen]
+    for index in (indexes if step<0 else reversed(indexes)):
+        target=index+step
+        if 0<=target<len(order) and order[target] not in set(chosen):order[index],order[target]=order[target],order[index]
+    return order
+
 def next_title(schemes:list[SavedScheme])->str:
     taken={s.title.casefold() for s in schemes};number=1
     while f'方案 {number}'.casefold() in taken:number+=1
@@ -211,12 +236,22 @@ def record_usage(tokens):
     """Adds a translation reply's tokens to the running totals (called from worker threads)."""
     token_usage.record(tokens,data_root())
 
+NAME_BYTES=47       # AE keeps an effect's name in a fixed 48-byte field (live_names.encode_name): a hard limit
 def bilingual_name(english:str,chinese:str)->str:
-    """'English (中文)' when it fits AE's 47-byte name field; the Chinese alone otherwise, or when it already carries the English."""
+    """'English (中文)'. When that is longer than AE's name field, the English is shortened with an ellipsis and the
+    Chinese kept whole ('Sapphire Gl… (蓝宝石辉光)'); with less than three letters of English left, the Chinese alone.
+    Also the Chinese alone when it already carries the English. Lengths are counted in UTF-8, which is never
+    shorter than the system code page a build may use instead."""
     english=english.strip();chinese=chinese.strip()
     if not english or not chinese or chinese.casefold().startswith(english.casefold()):return chinese
-    both=f'{english} ({chinese})'
-    return both if len(both.encode('utf8'))<=47 else chinese
+    suffix=f' ({chinese})';both=english+suffix
+    if len(both.encode('utf8'))<=NAME_BYTES:return both
+    room=NAME_BYTES-len(suffix.encode('utf8'))-len('…'.encode('utf8'));kept=''
+    for char in english:
+        if len((kept+char).encode('utf8'))>room:break
+        kept+=char
+    kept=kept.rstrip(' -_.,:;(')
+    return kept+'…'+suffix if len(kept)>=3 else chinese
 
 write_json=write_json_atomic  # settings, schemes and the remembered version
 
@@ -237,7 +272,7 @@ class ApiDialog(QDialog):
     """Chooses the translation service; each service keeps its own address, model and key."""
     def __init__(self,settings,parent):
         super().__init__(parent);self.settings=settings;self.job=None;self.setWindowTitle('翻译模型设置');self.setMinimumWidth(600)
-        self.profiles={key:dict(value) for key,value in settings.profiles.items()};self.service=settings.service
+        self.profiles={key:dict(value) for key,value in settings.profiles.items()};self.service=settings.service;self.edited_keys=set()
         outer=QVBoxLayout(self);outer.setContentsMargins(20,22,20,18);outer.setSpacing(6)
         head=QVBoxLayout();head.setContentsMargins(SHADOW,0,SHADOW,0);head.setSpacing(2)
         head.addWidget(label('翻译模型','pageTitle'));head.addWidget(label('名称翻译和可选的 AI 诊断使用这里选择的服务。每个服务分别记住自己的地址、模型和密钥。','pageNote',True));outer.addLayout(head)
@@ -249,6 +284,7 @@ class ApiDialog(QDialog):
         self.fetch_btn=LoaderButton('');self.fetch_btn.setObjectName('icon');ui_kit.themed_icon(self.fetch_btn,'refresh','INK_2',16);self.fetch_btn.setToolTip('从服务商获取可用模型列表（只发送接口地址和 API Key）');self.fetch_btn.clicked.connect(lambda:self.fetch_models())
         model_row=QHBoxLayout();model_row.setSpacing(8);model_row.addWidget(self.model,1);model_row.addWidget(self.fetch_btn)
         self.key=QLineEdit();self.key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.key.textEdited.connect(lambda _:self.edited_keys.add(self.service))
         self.link=QLabel();self.link.setOpenExternalLinks(True);self.hint=label('','muted',True)
         self.remember=QCheckBox('在此 Windows 用户下加密保存密钥');self.remember.setChecked(settings.remember)
         layout.addRow(label('服务商','field'),self.services);layout.addRow('',self.hint);layout.addRow(label('接口地址','field'),self.base);layout.addRow(label('模型','field'),model_row)
@@ -306,6 +342,7 @@ class ApiDialog(QDialog):
         self.store()
         try:
             self.settings.profiles={key:dict(value) for key,value in self.profiles.items()};self.settings.service=self.service;self.settings.remember=self.remember.isChecked()
+            for key in self.edited_keys:self.settings._protected.pop(key,None)
             self.settings.save();self.accept()
         except Exception as error:self.error.setText(str(error))
     def test(self):
@@ -321,10 +358,11 @@ class ApiDialog(QDialog):
         if self.busy():self.error.setText('请等待连接测试或模型列表获取完成');return
         super().reject()
 
-EFFECTS,PARAMETERS,SCHEMES,VERSIONS,SETTINGS=range(5)
+# Page numbers (and the page0... shortcut ids); the quick search page came last, though the rail lists it under 汉化.
+EFFECTS,PARAMETERS,SCHEMES,VERSIONS,SETTINGS,QUICK=range(6)
 MISSING='当前 AE 未加载'
-ROW_FILTERS=(('all','全部'),('checked','已勾选'),('applied','已应用'),('missing','未加载'))
-TILE_MARKS={'applied':'solid','missing':'dash'}
+ROW_FILTERS=(('all','全部'),('applied','已应用'),('missing','未加载'),('favorite','已收藏'))
+TILE_MARKS={'applied':'solid','missing':'dash','favorite':'star'}
 
 class BackgroundCheck(QObject):
     """A short read-only task (the update check) on a daemon thread: closing the window never waits for it, and
@@ -397,12 +435,16 @@ PART_WORD={'effects':'效果','parameters':'参数'}
 class EffectPicker(QDialog):
     """Chooses effects to add to a scheme. Effects that already have a Chinese name (in the table,
     another scheme or AE itself) show it with its source and bring it along when added."""
-    def __init__(self,parent,rows,what='效果'):
-        super().__init__(parent);self.setObjectName('prompt');self.setWindowTitle(f'添加{what}到方案');self.resize(720,640)
+    def __init__(self,parent,rows,what='效果',title=None,intro=None):
+        caption=title or f'添加{what}到方案'
+        super().__init__(parent);self.setObjectName('prompt');self.setWindowTitle(caption);self.resize(720,640)
         col=QVBoxLayout(self);col.setContentsMargins(28,24,28,22);col.setSpacing(10)
-        col.addWidget(label(f'添加{what}到方案','promptTitle'))
-        intro=('列出此 AE 版本中、方案里还没有的效果。' if what=='效果' else '列出本机记录过的参数（读取过或翻译过的）中、方案里还没有的。')
-        col.addWidget(label(intro+f'已有中文名称的{what}显示名称和来源，加入时一并带上；加入后默认勾选，之后可在方案页修改。','promptText',True))
+        col.addWidget(label(caption,'promptTitle'))
+        if intro is None:
+            intro=('列出此 AE 版本中、方案里还没有的效果。' if what=='效果' else '列出本机记录过的参数（读取过或翻译过的）中、方案里还没有的。')
+            intro+=f'已有中文名称的{what}显示名称和来源，加入时一并带上；加入后默认勾选，之后可在方案页修改。'
+        self.prefer_translated=title is None   # adding to a scheme first lists the effects that bring a Chinese name along
+        col.addWidget(label(intro,'promptText',True))
         tools=QHBoxLayout();tools.setSpacing(14);field=SearchField('搜索名称、中文或内部标识');self.search=field.edit;self.search.textChanged.connect(self.filter);tools.addWidget(field,1)
         self.translated_only=QCheckBox('只看已有中文的');self.translated_only.setObjectName('check');self.translated_only.toggled.connect(self.filter);tools.addWidget(self.translated_only);col.addLayout(tools)
         self.table=QTableWidget(0,4);self.header=CheckHeader(self.table,self.toggle_visible);self.table.setHorizontalHeader(self.header)
@@ -425,7 +467,7 @@ class EffectPicker(QDialog):
         bottom=QHBoxLayout();bottom.setSpacing(8);self.count=label('','muted');bottom.addWidget(self.count);bottom.addStretch()
         cancel=button('取消');cancel.clicked.connect(self.reject);bottom.addWidget(cancel)
         self.ok=button('加入','primary');self.ok.clicked.connect(self.accept);bottom.addWidget(self.ok);col.addLayout(bottom)
-        self.translated_only.setChecked(bool(self.translated));self.translated_only.setToolTip('来源：当前表格、本版本及其他 AE 版本的方案和中文候选、连接时 AE 显示的名称');self.filter();self.search.setFocus()
+        self.translated_only.setChecked(bool(self.translated) and self.prefer_translated);self.translated_only.setToolTip('来源：当前表格、本版本及其他 AE 版本的方案和中文候选、连接时 AE 显示的名称');self.filter();self.search.setFocus()
     def is_checked(self,row)->bool:return self.table.item(row,0).checkState()==Qt.CheckState.Checked
     def set_rows(self,rows,state,count=True):
         self.filling=True
@@ -450,16 +492,21 @@ class EffectPicker(QDialog):
         self.none_note.setVisible(self.translated_only.isChecked() and not self.translated)
         total=self.table.rowCount();self.count.setText(f'可加入 {total} 个{self.what}，其中 {self.translated} 个已有中文' if total else f'没有可加入的{self.what}')
 
-def pick_effects(parent,rows,what='效果')->list[str]:
+def pick_effects(parent,rows,what='效果',title=None,intro=None)->list[str]:
     """rows: (key, display name, Chinese name or '', where the name comes from)."""
-    dialog=EffectPicker(parent,rows,what)
+    dialog=EffectPicker(parent,rows,what,title,intro)
     return dialog.chosen() if dialog.exec()==QDialog.DialogCode.Accepted else []
 
 def pick_parameters(parent,rows)->list[str]:return pick_effects(parent,rows,'参数')
 
 class Window(QMainWindow):
+    task_finished=Signal(str)
+    quick_result=Signal(object,object,float)   # quick search: entry, result dict or error text, seconds since Enter
+    layer_result=Signal(object,float,object,str)   # Shift+Space: result dict or error text, seconds, new translations, translation note
+    completion_result=Signal(object,float)   # the full scan after a parameter-page write from the heap-only structure: result or error, seconds
+    quick_params_result=Signal(object,object,float,str,object,str)   # its parameter names: entry, result or error, seconds, 'cache' / 'scan' / 'full', new translations, translation note
     def __init__(self):
-        super().__init__();self.setWindowTitle(f'{APP_NAME} {APP_VERSION}');self.resize(1400,880);self.setMinimumSize(1200,720)
+        super().__init__();self._tasks={};self._stopping=threading.Event();self.task_finished.connect(self.task_done);self.setWindowTitle(f'{APP_NAME} {APP_VERSION}');self.resize(1400,880);self.setMinimumSize(1200,720)
         # The theme's stylesheet goes on before any child exists (ui_kit.restyle keeps it on the windows).
         if ui_kit.WINDOW_SHEET is not None:self.setStyleSheet(ui_kit.WINDOW_SHEET)
         # Someone who used an earlier version (before anything below writes a file): only they get the update notice.
@@ -472,6 +519,8 @@ class Window(QMainWindow):
         self.load_ui_preferences()
         # Every keyboard shortcut is bound through the keymap so it can be changed or switched off while running.
         self.keymap=Keymap(data_root()/'shortcuts.json')
+        # Favourite effects and the ones quick search added lately: one list for all AE versions (favorites.py).
+        self.favorites=Favorites(data_root()/favorites_store.FILE);self.only_checked=False
         installs=installations()
         from local_adapters import load_installations
         local_warnings=load_installations(installs,data_root()/'adapters')
@@ -490,7 +539,7 @@ class Window(QMainWindow):
         main=QVBoxLayout();main.setContentsMargins(24-SHADOW,22,24-SHADOW,10);main.setSpacing(14)
         self.banner=Banner('warn','自动识别与适配…',lambda:self.analyze_adapter(self.space));self.note=self.banner.text;main.addWidget(inset(self.banner))
         self.pages=FadeStack()
-        for build in (self.build_effects_page,self.build_parameters_page,self.build_schemes_page,self.build_versions_page,self.build_settings_page):self.pages.addWidget(build())
+        for build in (self.build_effects_page,self.build_parameters_page,self.build_schemes_page,self.build_versions_page,self.build_settings_page,self.build_quick_page):self.pages.addWidget(build())
         main.addWidget(self.pages,1)
         foot=QHBoxLayout();foot.setContentsMargins(SHADOW,0,SHADOW,0);foot.setSpacing(8)
         self.progress=Spinner('arc');self.progress.hide();foot.addWidget(self.progress)
@@ -501,14 +550,24 @@ class Window(QMainWindow):
                       self.apply_btn,self.restore_btn,self.translate_btn,self.parameters_btn,self.reveal_btn,*self.all_actions,
                       self.page_save_as_btn,self.page_import_btn,self.load_scheme_btn,self.scheme_apply_btn,self.scheme_restore_btn,self.add_effects_btn,self.delete_checked_btn,self.discard_btn,self.scheme_more,self.empty_save_btn,
                       self.paths_btn,self.scan_btn,self.use_version_btn,self.dir_btn,self.analyze_btn,self.api_btn,*self.parameter_page.controls)
+        for warning in self.settings.warnings:self.log.appendPlainText(warning)
+        if self.favorites.warning:self.log.appendPlainText(self.favorites.warning)
         if load_warning:self.log.appendPlainText(load_warning)
         for warning in local_warnings:self.log.appendPlainText(warning)
         from ae_paths import read_saved
         _,path_warning=read_saved(data_root()/'ae-installations.json')
         if path_warning:self.log.appendPlainText(path_warning)
+        self.favorites.listeners.append(self.favorites_changed)
         self.refresh_schemes(self.remembered_scheme());self.update_version_bar();self.update_api_info()
         self.refresh_bridge()
-        self.keymap.listeners.append(self.refresh_shortcut_hints);self.refresh_shortcut_hints()
+        self.keymap.listeners.append(self.refresh_shortcut_hints);self.refresh_shortcut_hints();self.make_tray();self.keymap.listeners.append(self.tray_tip)
+        # Quick effect search over AE (quick_search): a key that exists only while AE is in front, bound like the others.
+        self.quick=QuickSearch();self.quick.upcoming=self.quick_sections;self.quick.chosen.connect(self.quick_add);self.quick_result.connect(self.quick_added);self.quick_params_result.connect(self.quick_params_done)
+        # After quick adds, one full pass (debounced) writes the same names to effect copies the cached structure missed.
+        self.quick_full_keys={};self.quick_full=QTimer(self);self.quick_full.setSingleShot(True);self.quick_full.setInterval(15000);self.quick_full.timeout.connect(self.quick_full_pass)
+        self.completion_keys={};self.completion=QTimer(self);self.completion.setSingleShot(True);self.completion.setInterval(1000);self.completion.timeout.connect(self.completion_pass);self.completion_result.connect(self.completion_done)
+        self.quick_key=AeHotkey(self);self.quick_key.triggered.connect(self.open_quick_search);self.quick_key.unavailable.connect(self.quick_key_taken);self.keymap.bind('quick_search',self.quick_key)
+        self.layer_running=False;self.layer_key=AeHotkey(self,hotkey_id=HOTKEY_ID+1);self.layer_key.triggered.connect(self.layer_parameters);self.layer_key.unavailable.connect(self.layer_key_taken);self.keymap.bind('layer_parameters',self.layer_key);self.layer_result.connect(self.layer_done)
         self.go(EFFECTS);self.update_buttons();QTimer.singleShot(100,self.start_scan)
         self.update_job=None;self.update_offer=None;self.pending_installer=None;self.reapplied_for=None;self.show_update_info()
         QTimer.singleShot(2500,self.auto_check_update);QTimer.singleShot(600,self.show_release_notice)
@@ -530,7 +589,7 @@ class Window(QMainWindow):
         except OSError:return
         if state!='missing':return    # installed, connected, being updated, or not shipped with this build
         self.save_ui_preference('bridgeSuggested',True)
-        prompt=Prompt(self,'推荐安装 AE 后台连接','你还没有安装 AE 后台连接。它让读写参数直接在 AE 后台进行，更稳定，'
+        prompt=Prompt(self,'推荐安装后台连接','你还没有安装后台连接。它让读写参数直接在 AE 后台进行，更稳定，'
                       '软件放在带空格的文件夹里也能正常读写。\n\n'+self.bridge_install_text()+
                       '\n\n以后也可以在“设置与日志 → 适配范围”或“AE 版本 → 自动识别与适配”中安装。','安装后台连接',cancel=False,extra=['以后再说'])
         if prompt.exec()==QDialog.DialogCode.Accepted and prompt.choice is None:self.install_bridge(confirmed=True)
@@ -657,7 +716,7 @@ class Window(QMainWindow):
         note=('\n\n当前运行的不是安装版（例如便携版），安装包会装到“'+str(home)+'”，当前这份不会被替换。' if portable else '')
         if not confirm(self,f"关闭软件并安装 {offer['version']}？",'安装包已下载并核对通过。点“安装”后本软件会关闭（开启“临时翻译”时先恢复原名），然后打开安装向导。\nAE 正在运行时，安装向导会提示先关闭 AE。'+note,'安装'):
             self.status.setText(f"安装包已保存，可稍后在“查看更新”中安装：{path}");return
-        self.pending_installer=path;self.close()
+        self.pending_installer=path;self.quitting=True;self.close()   # really quit, not to the tray
     def launch_installer(self):
         path,self.pending_installer=self.pending_installer,None
         try:os.startfile(str(path))
@@ -692,9 +751,17 @@ class Window(QMainWindow):
         self.restore_checked_action=A('恢复勾选项原名',self.restore_checked)
         self.restore_all_action=A('一键恢复全部默认（含参数）',self.restore_all,'restore_all',tip='把本软件改过的所有效果和参数名称恢复为 AE 原名；方案和勾选保留')
         self.refresh_action=A('刷新 AE“效果和预设”列表',self.refresh_native,'refresh')
+        self.calibrate_refresh_action=A('校准刷新菜单按钮…',self.calibrate_refresh_menu,tip='5 秒内把鼠标停在 AE 效果和预设的菜单按钮上；只核对菜单，不刷新。本次 AE 会话有效，布局或缩放变化需重校准。')
         self.check_filtered_action=A('勾选当前筛选结果',lambda:self.check_visible(True),'check_filtered')
         self.uncheck_filtered_action=A('取消勾选当前筛选结果',lambda:self.check_visible(False))
         self.uncheck_all_action=A('取消全部勾选',lambda:self.check_keys(set(self.enabled),False),'uncheck_all',tip='包括被筛选隐藏的效果')
+        # Took over from the 已勾选 tile: the table lists only the checked effects (with the tiles and the search).
+        self.only_checked_action=A('只看勾选项',lambda:self.set_only_checked(self.only_checked_action.isChecked()),tip='表格只列出勾选的效果；统计卡和搜索照常筛选')
+        self.only_checked_action.setCheckable(True)
+        # The two texts name the current folder (favorites_changed keeps them up to date).
+        folder=self.favorites.current
+        self.favorite_checked_action=A(f'收藏勾选项到“{folder}”',lambda:self.favorite_keys(self.checked_keys(),True),tip='把勾选的效果加入当前收藏夹（排在已有收藏之后）；快速搜索时置顶')
+        self.unfavorite_checked_action=A(f'从“{folder}”移出勾选项',lambda:self.favorite_keys(self.checked_keys(),False),tip='把勾选的效果移出当前收藏夹')
         self.save_scheme_action=A('保存更改到当前方案',self.save_scheme,'save_scheme')
         self.save_as_action=A('新建方案…',self.new_scheme_from_checks,'save_as')
         self.import_action=A('从文件导入方案…',self.import_scheme,'import')
@@ -709,17 +776,18 @@ class Window(QMainWindow):
         A('恢复所选项 / 勾选项原名',lambda:self.press(self.restore_btn),'restore')
         for index in range(len(PAGES)):A(PAGES[index],lambda i=index:self.go(i),f'page{index}')
         self.all_actions=(self.translate_action,self.translate_checked_action,self.retranslate_checked_action,self.api_action,self.apply_selected_action,
-                          self.restore_selected_action,self.restore_checked_action,self.restore_all_action,self.refresh_action,self.check_filtered_action,self.uncheck_filtered_action,self.uncheck_all_action,
+                          self.restore_selected_action,self.restore_checked_action,self.restore_all_action,self.refresh_action,self.calibrate_refresh_action,self.check_filtered_action,self.uncheck_filtered_action,self.uncheck_all_action,
                           self.save_scheme_action,self.save_as_action,self.import_action,self.no_scheme_action)
     def build_nav(self):
         rail=NavRail();rail.setFixedWidth(232);self.nav=rail;col=rail.col
         brand=QHBoxLayout();brand.setContentsMargins(8,0,0,14);brand.setSpacing(10);mark=ui_kit.themed_logo(QLabel(),30);brand.addWidget(mark)
         names=QVBoxLayout();names.setSpacing(0);names.addWidget(label('AE插件汉化','brand'));names.addWidget(label(f'After Effects · {APP_VERSION}','brandSub'));brand.addLayout(names);brand.addStretch();col.addLayout(brand)
-        self.nav_group=QButtonGroup(self);self.nav_buttons=[]
-        for section,items in (('汉化',(('效果名称','effects',EFFECTS),('参数名称','params',PARAMETERS),('翻译方案','schemes',SCHEMES))),('环境',(('AE 版本','versions',VERSIONS),('设置与日志','settings',SETTINGS)))):
+        # nav_buttons follows the page numbers; the rail shows them in its own order.
+        self.nav_group=QButtonGroup(self);self.nav_buttons=[None]*len(PAGES)
+        for section,items in (('汉化',(('效果名称','effects',EFFECTS),('参数名称','params',PARAMETERS),('翻译方案','schemes',SCHEMES),('快速搜索','quick',QUICK))),('环境',(('AE 版本','versions',VERSIONS),('设置与日志','settings',SETTINGS)))):
             rail.add_section(section)
             for text,glyph,index in items:
-                item=rail.add_item(text,glyph);self.nav_group.addButton(item,index);self.nav_buttons.append(item)
+                item=rail.add_item(text,glyph);self.nav_group.addButton(item,index);self.nav_buttons[index]=item
         col.addStretch()
         # A found update waits here, where it takes no room from the pages; clicking shows the details.
         self.update_notice=button('','',icon_name='info');self.update_notice.clicked.connect(lambda:self.offer_update(self.update_offer));self.update_notice.hide()
@@ -738,9 +806,10 @@ class Window(QMainWindow):
         head,row,self.summary=page_head('效果名称','正在发现插件目录……')
         self.scheme_switcher=SchemeSwitcher();self.scheme_switcher.menu().aboutToShow.connect(self.scheme_menu)
         # Kept across rebuilds of the switcher menu; filled each time it opens.
-        self.add_checked_menu=QMenu('把勾选项加入方案',self.scheme_switcher.menu());self.add_checked_menu.aboutToShow.connect(lambda:self.fill_add_menu(self.add_checked_menu,sorted(self.enabled,key=str.casefold)));row.addWidget(self.scheme_switcher);row.addSpacing(8)
+        self.add_checked_menu=QMenu('把勾选项加入方案',self.scheme_switcher.menu());self.add_checked_menu.aboutToShow.connect(lambda:self.fill_add_menu(self.add_checked_menu,sorted(self.enabled,key=str.casefold)))
+        row.addWidget(self.scheme_switcher);row.addSpacing(8)
         self.restore_tool=menu_button('恢复',[self.restore_checked_action,None,self.restore_all_action],icon_name='restore');row.addWidget(self.restore_tool)
-        self.more_tool=menu_button('更多',[('翻译',[self.translate_checked_action,self.retranslate_checked_action,None,self.api_action]),None,self.refresh_action]);row.addWidget(self.more_tool)
+        self.more_tool=menu_button('更多',[('翻译',[self.translate_checked_action,self.retranslate_checked_action,None,self.api_action]),None,self.refresh_action,self.calibrate_refresh_action]);row.addWidget(self.more_tool)
         self.refresh_btn=button('','icon');ui_kit.themed_icon(self.refresh_btn,'refresh','INK_2',16);self.refresh_btn.clicked.connect(self.refresh_native);row.addWidget(self.refresh_btn)
         layout.addWidget(inset(head))
         tiles=QWidget();tile_row=QHBoxLayout(tiles);tile_row.setContentsMargins(0,0,0,0);tile_row.setSpacing(12)
@@ -749,20 +818,29 @@ class Window(QMainWindow):
             tile=MetricTile(text,TILE_MARKS.get(key));tile.setToolTip(f'只看“{text}”的效果');self.chip_group.addButton(tile,index);self.chips[key]=tile;tile_row.addWidget(tile,2)
         # The last tile only reports what translation has cost so far; it filters nothing, and is wider so its three figures fit at 1200 px.
         self.usage_tile=UsageTile('翻译 token 用量');tile_row.addWidget(self.usage_tile,3);self.update_usage()
+        self.chips['favorite'].setToolTip(f'只看当前收藏夹“{self.favorites.current}”里的效果')
         self.chips['all'].setChecked(True);self.chip_group.idClicked.connect(lambda _:self.filter_rows());layout.addWidget(inset(tiles))
         split=QHBoxLayout();split.setSpacing(0)
         table_card=Surface(padding=(14,12,14,6),spacing=8)
         bar=QHBoxLayout();bar.setSpacing(8)
         search=SearchField('搜索名称、内部标识或分类');self.filter=search.edit;self.filter.textChanged.connect(self.filter_rows);bar.addWidget(search,1)
-        self.check_tool=menu_button('勾选',[self.check_filtered_action,self.uncheck_filtered_action,None,self.uncheck_all_action]);self.check_tool.setObjectName('quiet');bar.addWidget(self.check_tool)
+        # Every folder, plus a new one named by the user, as places for the checked effects.
+        self.folder_checked_menu=QMenu('把勾选项加入收藏夹',self);self.folder_checked_menu.aboutToShow.connect(lambda:self.fill_folder_menu(self.folder_checked_menu,self.checked_keys()))
+        self.check_tool=menu_button('勾选',[self.check_filtered_action,self.uncheck_filtered_action,None,self.uncheck_all_action,None,self.only_checked_action,None,
+                                            self.favorite_checked_action,self.folder_checked_menu,self.unfavorite_checked_action])
+        self.check_tool.setObjectName('quiet');bar.addWidget(self.check_tool)
         table_card.box.addLayout(bar)
-        self.table=QTableWidget(0,7);self.check_header=CheckHeader(self.table,self.toggle_visible);self.table.setHorizontalHeader(self.check_header)
-        self.table.setHorizontalHeaderLabels(['','原始名称','中文候选（可编辑）','AE 当前名称','内部标识','分类','状态']);table_style(self.table);self.check_anchor=None
+        self.table=QTableWidget(0,8);self.check_header=CheckHeader(self.table,self.toggle_visible);self.table.setHorizontalHeader(self.check_header)
+        self.table.setHorizontalHeaderLabels(['','原始名称','中文候选（可编辑）','AE 当前名称','内部标识','分类','状态','']);table_style(self.table);self.check_anchor=None
         self.table.horizontalHeaderItem(CHECK).setToolTip('勾选的效果组成当前方案；批量翻译、应用、恢复只作用于勾选项。\n点这里勾选或取消当前筛选结果；按住行内复选框上下拖动可快速勾选，Shift+点击可连续勾选')
+        self.table.horizontalHeaderItem(FAVORITE).setToolTip('收藏：星星表示在当前收藏夹里，点击加入或移出。当前收藏夹的效果在快速搜索里置顶；收藏夹在“快速搜索”页切换和管理')
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows);self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked|QAbstractItemView.EditTrigger.EditKeyPressed|QAbstractItemView.EditTrigger.SelectedClicked)
         header=self.table.horizontalHeader();header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive);header.setStretchLastSection(True);header.moveSection(STATUS,1)
-        for column,width in ((CHECK,52),(STATUS,100),(ORIGINAL,150),(CANDIDATE,150),(CURRENT,140),(KEY,170),(CATEGORY,120)):self.table.setColumnWidth(column,width)
+        # The star sits right after the box; the category column stays last and takes the spare width.
+        header.moveSection(header.visualIndex(FAVORITE),2);header.setSectionResizeMode(FAVORITE,QHeaderView.ResizeMode.Fixed)
+        for column,width in ((CHECK,52),(FAVORITE,34),(STATUS,100),(ORIGINAL,150),(CANDIDATE,150),(CURRENT,140),(KEY,170),(CATEGORY,120)):self.table.setColumnWidth(column,width)
+        self.table.setItemDelegateForColumn(FAVORITE,ui_kit.StarDelegate(self.table));self.table.cellClicked.connect(self.table_clicked)
         self.status_delegate=DiamondDelegate(self.table,lambda index:bool(self.writing) and self.table.item(index.row(),KEY) is not None and self.table.item(index.row(),KEY).text() in self.writing)
         self.table.setItemDelegateForColumn(STATUS,self.status_delegate);self.breather=Breather(self.table,self.status_delegate)
         self.table.itemSelectionChanged.connect(self.selection_changed);self.table.itemChanged.connect(self.item_changed)
@@ -778,14 +856,17 @@ class Window(QMainWindow):
         layout.addLayout(split,1);return page
     def build_detail(self):
         frame=Surface(padding=(20,18,20,16),spacing=8);frame.setFixedWidth(330+2*SHADOW);col=frame.box
-        self.detail_eyebrow=label('效果详情','eyebrow');col.addWidget(self.detail_eyebrow)
+        top=QHBoxLayout();top.setSpacing(6);self.detail_eyebrow=label('效果详情','eyebrow');top.addWidget(self.detail_eyebrow,1)
+        self.detail_star=QToolButton();self.detail_star.setObjectName('icon');self.detail_star.setCursor(Qt.CursorShape.PointingHandCursor);self.detail_star.setAutoRaise(True)
+        self.detail_star.clicked.connect(lambda:self.selected_rows() and self.toggle_favorite(self.table.item(self.selected_rows()[0],KEY).text()));self.detail_star.hide()
+        top.addWidget(self.detail_star,0,Qt.AlignmentFlag.AlignTop);col.addLayout(top)
         self.selected_label=label('在左侧表格中选择效果','detailName',True);col.addWidget(self.selected_label)
         self.detail_state=StatusTag();col.addWidget(self.detail_state);col.addSpacing(6)
         field_row=QHBoxLayout();field_row.setSpacing(8);field_row.addWidget(label('中文名称','field'));field_row.addStretch()
         # Applies to every effect-name write (effects page, schemes page); the table keeps only the Chinese.
         self.bilingual_box=QCheckBox('双语写入');self.bilingual_box.setChecked(self.bilingual)
         self.bilingual_box.setToolTip('写入 AE 时使用“英文原名 (中文)”，例如 Gaussian Blur (高斯模糊)，在 AE 里用英文或中文都能搜到。\n'
-                                      '超过 AE 名称长度（47 字节）的只写中文；表格里的中文候选不变。只影响效果名称和图层效果标题，不影响参数名称。\n'
+                                      'AE 的效果名称最多 47 字节（约 47 个英文字母或 15 个汉字），超长时把英文原名截短加“…”、中文保持完整；表格里的中文候选不变。只影响效果名称和图层效果标题，不影响参数名称。\n'
                                       '切换后已应用的效果会显示为“待应用”，再次应用即可按新方式写入。')
         self.bilingual_box.toggled.connect(self.set_bilingual);field_row.addWidget(self.bilingual_box);col.addLayout(field_row)
         # The field edits the selected row; Enter applies just that row.
@@ -945,7 +1026,8 @@ class Window(QMainWindow):
         head,_,_=page_head('设置与日志','翻译服务、退出行为、界面外观和运行记录');layout.addWidget(inset(head))
         grid=QGridLayout();grid.setSpacing(0)
         frame,col=self.settings_card('翻译模型');self.api_info=label('','field',True);col.addWidget(self.api_info)
-        col.addWidget(label('翻译只发送所选效果 / 参数的名称、内部标识和分类，不发送工程、画面或参数值。','muted',True));col.addStretch()
+        col.addWidget(label('翻译只发送所选效果 / 参数的名称、内部标识和分类，不发送工程、画面或参数值。','muted',True))
+        col.addWidget(label('快速搜索添加效果后自动翻译参数的开关在“快速搜索”页。','muted',True));col.addStretch()
         self.api_btn=button('修改翻译模型设置…');self.api_btn.clicked.connect(self.configure_api);col.addWidget(self.api_btn,0,Qt.AlignmentFlag.AlignLeft);grid.addWidget(frame,0,0)
         frame,col=self.settings_card('退出与恢复')
         # Off by default: names stay in AE after the localizer quits. Remembered in ui.json.
@@ -955,7 +1037,15 @@ class Window(QMainWindow):
         # On by default: AE shows the original names again after every restart.
         self.reapply_box=QCheckBox('AE 重启后自动重新应用效果名称');self.reapply_box.setChecked(self.ui_preferences().get('reapplyNames') is not False)
         self.reapply_box.toggled.connect(lambda on:self.save_ui_preference('reapplyNames',bool(on)));col.addWidget(self.reapply_box)
-        col.addWidget(label('AE 每次启动都会恢复原名；本软件连接 AE 时把上次应用的效果名称写回。不改图层效果标题，参数名称需在参数页重新应用。','muted',True));col.addStretch()
+        col.addWidget(label('AE 每次启动都会恢复原名；本软件连接 AE 时把上次应用的效果名称写回。不改图层效果标题，参数名称需在参数页重新应用。','muted',True))
+        # Quick search needs this program running: the tray keeps it there when the window is closed (on by default).
+        self.tray_box=QCheckBox('关闭窗口时缩到托盘');self.tray_box.setChecked(self.tray_on_close());self.tray_box.setToolTip(self.keymap.tip('quick_search','快速搜索效果')+'需要本软件在运行；关闭窗口后仍在托盘里，右键托盘图标可退出')
+        self.tray_box.toggled.connect(self.set_tray_on_close);col.addWidget(self.tray_box)
+        self.autostart_box=QCheckBox('开机自动启动（最小化到托盘）');self.autostart_box.setEnabled(autostart.available())
+        try:self.autostart_box.setChecked(autostart.enabled())
+        except OSError:pass
+        self.autostart_box.setToolTip('登录 Windows 后自动在托盘里启动；关闭此项即删除启动项' if autostart.available() else '只有安装版可以开机启动')
+        self.autostart_box.toggled.connect(self.set_autostart);col.addWidget(self.autostart_box);col.addStretch()
         folder_btn=button('打开本地记录','',icon_name='folder');folder_btn.clicked.connect(lambda:os.startfile(str(data_root())));col.addWidget(folder_btn,0,Qt.AlignmentFlag.AlignLeft);grid.addWidget(frame,0,1)
         frame,col=self.settings_card('界面')
         self.motion_box=QCheckBox('界面动效');self.motion_box.setChecked(ui_kit.motion());self.motion_box.toggled.connect(self.save_motion);col.addWidget(self.motion_box)
@@ -966,7 +1056,7 @@ class Window(QMainWindow):
         self.scope_info=label('','field',True);col.addWidget(self.scope_info)
         col.addWidget(label(f'候选、勾选、方案和恢复记录保存在：\n{data_root()}','muted',True));col.addSpacing(6)
         # The background extension (cep_bridge): parameter reads and writes without a second AfterFX.exe.
-        col.addWidget(label('AE后台连接','cardTitle'));self.bridge_info=label('','muted',True);col.addWidget(self.bridge_info);col.addStretch()
+        col.addWidget(label('后台连接','cardTitle'));self.bridge_info=label('','muted',True);col.addWidget(self.bridge_info);col.addStretch()
         row=QHBoxLayout();row.setSpacing(8)
         self.bridge_btn=button('安装后台连接');self.bridge_btn.clicked.connect(self.install_bridge);row.addWidget(self.bridge_btn)
         self.bridge_remove=button('移除','quiet');self.bridge_remove.clicked.connect(self.remove_bridge);row.addWidget(self.bridge_remove);row.addStretch();col.addLayout(row)
@@ -1002,6 +1092,137 @@ class Window(QMainWindow):
         # The log grows with the window; on a short window the whole page scrolls rather than squeezing any card.
         self.log=QPlainTextEdit();self.log.setReadOnly(True);self.log.setMinimumHeight(120);col.addWidget(self.log,1);grid.addWidget(frame,2,0,1,2);grid.setRowStretch(2,1)
         return self.scrolling(page)
+    # Quick search: favourites (in the user's order) and recently added effects come first in the search box;
+    # its switches, the parameter options and the key live here.
+    def build_quick_page(self):
+        page=QWidget();layout=QVBoxLayout(page);layout.setContentsMargins(0,0,0,0);layout.setSpacing(12)
+        head,row,self.quick_summary=page_head('快速搜索','AE 窗口在前台时按快捷键，在鼠标旁搜索并添加效果；当前收藏夹的效果置顶，下面是最近用快速搜索添加的效果')
+        self.quick_keys_btn=button('修改快捷键…',tip='在快捷键列表中修改“在 AE 中快速搜索并添加效果”');self.quick_keys_btn.clicked.connect(self.edit_shortcuts);row.addWidget(self.quick_keys_btn)
+        layout.addWidget(inset(head))
+        split=QHBoxLayout();split.setSpacing(0)
+        card=Surface(padding=(18,14,18,10),spacing=8)
+        top=QHBoxLayout();top.setSpacing(8)
+        # Picks every favourite, or none (partly checked shows as such).
+        self.fav_all=QCheckBox();self.fav_all.setToolTip('勾选或取消这个收藏夹里的全部效果');self.fav_all.clicked.connect(lambda:self.fav_list.set_checked(self.fav_list.keys(),self.fav_all.checkState()!=Qt.CheckState.Unchecked))
+        # The folder shown here is the current one: quick search lists it first, the stars on the effects page mark it.
+        self.folder_box=QComboBox();self.folder_box.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents);self.folder_box.setMinimumContentsLength(6)
+        self.folder_box.setToolTip('当前收藏夹：快速搜索置顶它的效果，“效果名称”页的星星也表示它');self.folder_box.activated.connect(self.choose_folder)
+        self.folder_more=QToolButton();self.folder_more.setObjectName('icon');ui_kit.themed_icon(self.folder_more,'more','INK_2',16);self.folder_more.setToolTip('新建、重命名或删除收藏夹')
+        self.folder_more.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup);self.folder_more.setMenu(QMenu(self.folder_more));self.folder_more.menu().aboutToShow.connect(self.folder_menu)
+        self.folder_more.setCursor(Qt.CursorShape.PointingHandCursor);self.folder_more.setStyleSheet('QToolButton::menu-indicator { image:none; width:0; }')
+        top.addWidget(self.fav_all);top.addWidget(self.folder_box);top.addWidget(self.folder_more);self.fav_count=label('','muted');top.addWidget(self.fav_count);top.addStretch()
+        self.fav_top_btn=button('置顶','quiet',tip='把勾选的收藏移到最前（保持它们之间的顺序）');self.fav_top_btn.clicked.connect(lambda:self.move_favorites(self.selected_favorites(),'top'));top.addWidget(self.fav_top_btn)
+        self.fav_remove_btn=button('移除','quiet',tip='把勾选的效果移出这个收藏夹');self.fav_remove_btn.clicked.connect(lambda:self.remove_favorites(self.selected_favorites()));top.addWidget(self.fav_remove_btn)
+        self.fav_add_btn=button('添加收藏…','',icon_name='star');self.fav_add_btn.clicked.connect(self.add_favorites);top.addWidget(self.fav_add_btn)
+        card.box.addLayout(top)
+        # Dragged into order (rows slide aside, the dragged one lifts); boxes pick several for the buttons and the menu.
+        self.fav_list=ui_kit.ReorderList();self.fav_list.reordered.connect(self.save_favorite_order);self.fav_list.checks.connect(self.update_quick_buttons)
+        self.fav_list.menu.connect(self.favorite_menu)
+        self.keymap.bind('delete',local_shortcut(self.fav_list,lambda:self.remove_favorites(self.selected_favorites())))
+        self.fav_stack=QStackedWidget();self.fav_empty=EmptyState('star')
+        self.fav_empty.show_message('这个收藏夹还是空的','在“效果名称”页点行首的星星，或在“勾选”菜单里把勾选项加入收藏夹，也可以点上方“添加收藏…”。当前收藏夹的效果在快速搜索里置顶，可在这里拖动调整顺序。')
+        self.fav_stack.addWidget(self.fav_empty);self.fav_stack.addWidget(self.fav_list);card.box.addWidget(self.fav_stack,1)
+        self.fav_hint=label('','hint');card.box.addWidget(self.fav_hint)
+        split.addWidget(card,1)
+        side=QVBoxLayout();side.setSpacing(0)
+        recent=Surface(padding=(18,14,18,12),spacing=8);recent.setFixedWidth(340+2*SHADOW)
+        top=QHBoxLayout();top.setSpacing(8);top.addWidget(label('最近使用','cardTitle'));top.addStretch()
+        self.recent_fav_btn=button('收藏','quiet',tip='把所选的最近使用效果加入当前收藏夹');self.recent_fav_btn.clicked.connect(lambda:self.favorite_keys(self.selected_recent(),True));top.addWidget(self.recent_fav_btn)
+        self.recent_clear_btn=button('清空','quiet',tip='清空最近使用记录（不影响收藏）');self.recent_clear_btn.clicked.connect(self.favorites.clear_recent);top.addWidget(self.recent_clear_btn)
+        recent.box.addLayout(top)
+        self.recent_list=QListWidget();self.recent_list.setObjectName('favorites');self.recent_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection);self.recent_list.setUniformItemSizes(True)
+        self.recent_list.itemSelectionChanged.connect(self.update_quick_buttons);self.recent_list.itemDoubleClicked.connect(lambda item:self.favorite_keys([item.data(Qt.ItemDataRole.UserRole)],True))
+        self.recent_list.setMinimumHeight(96);recent.box.addWidget(self.recent_list,1)
+        self.recent_note=label('只记录用快速搜索添加的效果（在 AE 里直接添加的看不到），已收藏的不重复列出。','muted',True);recent.box.addWidget(self.recent_note)
+        side.addWidget(recent,1)
+        options=Surface(padding=(18,14,18,14),spacing=6);options.setFixedWidth(340+2*SHADOW);col=options.box
+        col.addWidget(label('搜索框','cardTitle'))
+        self.quick_fav_box=QCheckBox('置顶显示当前收藏夹的效果');self.quick_fav_box.setChecked(self.quick_favorites_on())
+        self.quick_fav_box.setToolTip('打开搜索框、还没输入时先列出当前收藏夹的效果，按这里的顺序');self.quick_fav_box.toggled.connect(lambda on:(self.save_ui_preference('quickFavorites',bool(on)),self.fill_quick_lists()));col.addWidget(self.quick_fav_box)
+        self.quick_recent_box=QCheckBox(f'在收藏下面显示最近使用的 {favorites_store.RECENT} 个效果');self.quick_recent_box.setChecked(self.quick_recent_on())
+        self.quick_recent_box.setToolTip('关闭后不再记录，也不显示；已有记录保留，可点“清空”删除');self.quick_recent_box.toggled.connect(lambda on:(self.save_ui_preference('quickRecent',bool(on)),self.fill_quick_lists()));col.addWidget(self.quick_recent_box)
+        col.addSpacing(6);col.addWidget(label('添加之后','cardTitle'))
+        # On by default (the user's choice): after an effect is added, its parameters in Chinese; the AI part is a second step.
+        self.quick_params_box=QCheckBox('快速添加效果后自动把参数改成中文');self.quick_params_box.setChecked(self.quick_parameters_on())
+        self.quick_params_box.setToolTip('用参数页已有的译名，当前版本没有时借用其他 AE 版本的；关闭后添加效果不再改参数名')
+        self.quick_params_box.toggled.connect(self.set_quick_parameters);col.addWidget(self.quick_params_box)
+        self.quick_translate_box=QCheckBox('还没有译名的参数自动翻译');self.quick_translate_box.setChecked(self.quick_translate_on())
+        self.quick_translate_box.setToolTip('调用“设置与日志”中设置的翻译服务，译名保存到当前 AE 版本的参数记录并勾选，再写入 AE；会用少量翻译 token')
+        self.quick_translate_box.toggled.connect(lambda on:self.save_ui_preference('quickTranslate',bool(on)))
+        self.quick_translate_box.setEnabled(self.quick_parameters_on())
+        sub=QHBoxLayout();sub.setContentsMargins(24,0,0,0);sub.addWidget(self.quick_translate_box);col.addLayout(sub)
+        col.addSpacing(6);self.quick_key_info=label('','muted',True);col.addWidget(self.quick_key_info)
+        side.addWidget(options);split.addLayout(side)
+        layout.addLayout(split,1);return page
+    def quick_favorites_on(self)->bool:return self.ui_preferences().get('quickFavorites') is not False
+    def quick_recent_on(self)->bool:return self.ui_preferences().get('quickRecent') is not False
+    def quick_titles(self)->dict:
+        """matchName -> quick search entry (its shown name), for every effect this version lists."""
+        entries=build_entries(self.plugins,self.pending,self.live['effects'] if self.live else None)
+        self.title_cache={e.match_name:e.title for e in entries};return {e.match_name:e for e in entries}
+    def fill_quick_lists(self):
+        if not hasattr(self,'fav_list'):return
+        entries=self.quick_titles();english={p.match_name:p.display_name for p in self.plugins}
+        missing='当前 AE 没有加载这个效果，快速搜索里不会列出' if self.live else '此 AE 版本的插件里没有这个效果'
+        def describe(key):
+            entry=entries.get(key)
+            return (entry.title if entry else english.get(key) or key,f'内部标识：{key}'+(f'\n原名：{entry.english}' if entry and entry.english!=entry.title else '')+('' if entry else '\n'+missing),entry is None)
+        names=self.favorites.names();self.folder_box.blockSignals(True)
+        if [self.folder_box.itemText(i) for i in range(self.folder_box.count())]!=names:self.folder_box.clear();self.folder_box.addItems(names)
+        self.folder_box.setCurrentIndex(names.index(self.favorites.current));self.folder_box.blockSignals(False)
+        self.fav_list.set_items([(key,*describe(key),'') for key in self.favorites.favorites])
+        recent=self.favorites.latest() if self.quick_recent_on() else []
+        chosen=set(self.selected_recent());self.recent_list.blockSignals(True);self.recent_list.clear()
+        for key in recent:
+            text,tip,faint=describe(key);item=QListWidgetItem(text);item.setData(Qt.ItemDataRole.UserRole,key);item.setSizeHint(QSize(0,34));item.setToolTip(tip)
+            if faint:item.setForeground(QColor(ui_kit.FAINT))
+            self.recent_list.addItem(item);item.setSelected(key in chosen)
+        self.recent_list.blockSignals(False)
+        count=len(self.favorites.favorites);self.fav_count.setText(f'{count} 个' if count else '')
+        self.fav_stack.setCurrentIndex(1 if count else 0);self.fav_hint.setVisible(count>1)
+        self.recent_note.setText('最近使用记录已关闭；打开下方“在收藏下面显示最近使用”后开始记录。' if not self.quick_recent_on() else
+                                 ('还没有记录。用快速搜索添加效果后会出现在这里。' if not recent else '')+'只记录用快速搜索添加的效果（在 AE 里直接添加的看不到），已收藏的不重复列出。')
+        self.update_quick_buttons();self.update_nav()
+    def update_quick_buttons(self):
+        if not hasattr(self,'fav_list'):return
+        picked=self.selected_favorites();total=len(self.fav_list.keys())
+        for widget,word in ((self.fav_remove_btn,'移除'),(self.fav_top_btn,'置顶')):widget.setEnabled(bool(picked));widget.setText(f'{word} {len(picked)} 项' if picked else word)
+        self.fav_all.setEnabled(bool(total));self.fav_all.setCheckState(check_state(k in set(picked) for k in self.fav_list.keys()) if total else Qt.CheckState.Unchecked)
+        self.recent_fav_btn.setEnabled(bool(self.recent_list.selectedItems()));self.recent_clear_btn.setEnabled(bool(self.favorites.recent))
+    def selected_favorites(self)->list[str]:return self.fav_list.checked_keys()
+    def selected_recent(self)->list[str]:return [i.data(Qt.ItemDataRole.UserRole) for i in sorted(self.recent_list.selectedItems(),key=self.recent_list.row)]
+    def save_favorite_order(self,order=None):
+        order=list(order if order is not None else self.fav_list.keys())
+        if order!=self.favorites.favorites and set(order)==set(self.favorites.favorites):self.favorites.replace(order);self.status.setText('收藏顺序已更新')
+    def remove_favorites(self,keys):
+        if keys:self.favorite_keys(keys,False)
+    def move_favorites(self,keys,where):
+        """where: 'top', 'up', 'down' or 'bottom'; the rows slide to their new places (ReorderList)."""
+        order=move_keys(self.favorites.favorites,keys,where)
+        if order!=self.favorites.favorites:self.favorites.replace(order);self.status.setText('收藏顺序已更新')
+    def favorite_menu(self,key,point):
+        """Right-click: the checked favourites when the row is one of them, else that row alone."""
+        self.favorite_row_menu(key).exec(point)
+    def favorite_row_menu(self,key)->QMenu:
+        picked=self.selected_favorites();keys=picked if key in picked else [key];menu=QMenu(self)
+        for text,where in (('置顶','top'),('上移','up'),('下移','down'),('置底','bottom')):menu.addAction(text,lambda w=where:self.move_favorites(keys,w))
+        menu.addSeparator();self.fill_folder_menu(menu.addMenu(f'也加入收藏夹（{len(keys)} 项）' if len(keys)>1 else '也加入收藏夹'),keys)
+        menu.addAction(f'移出这个收藏夹（{len(keys)} 项）' if len(keys)>1 else '移出这个收藏夹',lambda:self.remove_favorites(keys))
+        return menu
+    def folder_menu(self):
+        """The ⋯ beside the folder picker, rebuilt each time it opens."""
+        menu=self.folder_more.menu();menu.clear();name=self.favorites.current;last=len(self.favorites.folders)==1
+        menu.addAction('新建收藏夹…',self.new_folder);menu.addAction(f'重命名“{name}”…',self.rename_folder)
+        menu.addSeparator();menu.addAction(f'清空“{name}”…' if last else f'删除“{name}”…',self.delete_folder).setEnabled(not (last and not self.favorites.favorites))
+    def add_favorites(self):
+        entries=self.quick_titles();rows={}
+        for plugin in self.plugins:
+            key=plugin.match_name
+            if key and key not in self.favorites and key not in rows:
+                entry=entries.get(key);display=plugin.display_name if plugin.display_name==key else f'{plugin.display_name}（{key}）'
+                rows[key]=(key,display,entry.chinese if entry else '','AE 当前名称' if entry and entry.live and entry.chinese==entry.live else '中文候选' if entry and entry.chinese else '')
+        keys=pick_effects(self,sorted(rows.values(),key=lambda r:r[1].casefold()),title=f'添加到收藏夹“{self.favorites.current}”',intro='列出此 AE 版本中还不在这个收藏夹里的效果。加入后排在已有收藏之后，可拖动调整顺序；当前收藏夹的效果在快速搜索里置顶。')
+        if keys:self.favorite_keys(keys,True)
     def scrolling(self,page):
         """Scrolls a page vertically when the window is too short for it (cards keep their full text)."""
         area=QScrollArea();area.setObjectName('pageScroll');area.setWidgetResizable(True);area.setFrameShape(QFrame.Shape.NoFrame)
@@ -1036,16 +1257,26 @@ class Window(QMainWindow):
         self.connect_btn.setToolTip(k.tip('connect','核对 AE 路径、构建版本并读取实际效果目录'))
         self.update_refresh_hint()
         self.filter.setPlaceholderText(k.tip('find','搜索名称、内部标识或分类'))
+        layer=k.hint('layer_parameters');note=self.parameter_page.key_note
+        note.setText(f'快捷键 {layer}：在 AE 中选中图层后按下，把这些图层的全部参数改成中文（缺译名的自动翻译）' if layer else '');note.setVisible(bool(layer))
+        note.setToolTip('已勾选的译名直接用，其他 AE 版本有的借用，都没有的用翻译服务翻译并保存，然后写入；同“应用”一样作用于整个工程中的同类效果。只在 AE 窗口在前台时生效，可在“设置与日志 → 快捷键”中修改。')
+        if hasattr(self,'quick_key_info'):
+            delete=k.hint('delete');self.fav_hint.setText(' · '.join(x for x in ('按住右侧手柄拖动排序，勾选的一起拖','在行上按住上下滑动可连选',f'{delete} 移除勾选项' if delete else '','右键更多') if x))
+            key=k.hint('quick_search')
+            layer=k.hint('layer_parameters')
+            self.quick_key_info.setText((f'快捷键：{key}（只在 AE 窗口在前台时生效）' if key else '快速搜索没有设置快捷键，点右上角“修改快捷键…”设置')
+                                        +(f'；{layer} 把 AE 中选中图层的全部参数改成中文' if layer else '')+('；键盘快捷键当前已全部停用' if not k.enabled else ''))
         self.page_save_as_btn.setToolTip(k.tip('save_as','把当前的效果与参数表格保存为新方案'))
         load,rename=k.hint('load'),k.hint('rename')
         self.list_hint.setText(' · '.join(x for x in ('双击'+(f'或 {load} ' if load else '')+'载入',f'{rename} 重命名' if rename else '','右键更多') if x))
         self.delete_checked_btn.setToolTip('把当前列出的勾选项从方案中删除（会确认'+self.undo_note('，可 {key} 撤销')+'）')
         self.parameter_page.history_delete.setToolTip('删除勾选的汉化记录（中文候选和勾选）；不改 AE 中已应用的名称'+self.undo_note('，可 {key} 撤销'))
         self.update_scheme_bar()
-        if hasattr(self,'preview_table'):self.edit_hint.setText(' · '.join(x for x in ('复选框可按住上下拖动','双击中文名称修改','垃圾桶删除单个'+('参数' if self.preview_group.checkedId()==1 else '效果'),self.undo_note(),'右键更多') if x))
+        if hasattr(self,'preview_table'):self.show_edit_hint()
         self.update_detail_actions()
     def go(self,index:int):
-        self.pages.setCurrentIndex(index);self.nav_buttons[index].setChecked(True);self.nav.select(index)
+        self.pages.setCurrentIndex(index);self.nav_buttons[index].setChecked(True);self.nav.select(self.nav.buttons.index(self.nav_buttons[index]))
+        if index==QUICK:self.fill_quick_lists()
         if index==SETTINGS:self.unread=0;self.update_bridge_info()
         self.update_nav()
     # Background extension: installed on request into the user's CEP folder, active after AE restarts.
@@ -1071,7 +1302,7 @@ class Window(QMainWindow):
     def bridge_install_text(self)->str:
         """What installing does, shown before every install (the debug-mode change in particular)."""
         return (f'把 AE 后台扩展（看不见的 CEP 扩展，不需要管理员权限）复制到：\n{cep_bridge.installed()}\n\n'
-                '同时开启 Adobe 扩展调试模式（当前用户注册表 Software\\Adobe\\CSXS.10～13 的 PlayerDebugMode），让 AE 一定加载这个扩展。'
+                '同时开启 Adobe 扩展调试模式（当前用户注册表中内置及已检测到的 CSXS 版本的 PlayerDebugMode），让 AE 一定加载这个扩展。'
                 '调试模式下 AE 不再检查扩展签名，对你所有 Adobe 扩展都生效；移除后台连接时，本软件改过的值会恢复原样。\n\n'
                 '安装后需要重启一次 AE 才会生效；之后读写参数不再启动第二个 AE 进程，AE 窗口和焦点保持不变。没有加载时软件自动改用原来的方式。')
     def install_bridge(self,parent=None,confirmed=False):
@@ -1088,7 +1319,7 @@ class Window(QMainWindow):
         except Exception as error:self.error('移除后台连接失败：'+str(error));return
         self.log.appendPlainText('已移除后台连接扩展');self.update_bridge_info()
     def update_nav(self):
-        counts=(len(self.plugins),len(self.parameter_page.rows) or '',len(self.schemes),len(self.spaces),self.unread or '')
+        counts=(len(self.plugins),len(self.parameter_page.rows) or '',len(self.schemes),len(self.spaces),self.unread or '',len(self.favorites.favorites) or '')
         for button_,count in zip(self.nav_buttons,counts):button_.set_count(count,button_ is self.nav_buttons[SETTINGS] and bool(self.unread))
     def update_pill(self):
         if not self.space.live:state,text='warn','仅翻译'
@@ -1171,6 +1402,7 @@ class Window(QMainWindow):
         if not 0<=index<len(self.spaces):return
         space=self.spaces[index]
         if space is self.space or self.busy():self.update_version_bar();return
+        self.quick_full.stop();self.completion.stop();self.quick_full_keys={};self.completion_keys={}
         warning=self.bind_space(space)
         self.bind_targets()
         try:write_json(self.version_path,{'key':space.key})
@@ -1201,18 +1433,34 @@ class Window(QMainWindow):
     def reload_installations(self,selected_exe):
         if self.busy():QTimer.singleShot(50,lambda:self.reload_installations(selected_exe));return
         from ae_paths import path_key
-        extras={s.key:s.extra for s in self.spaces}
+        from ae_paths import path_key
+        extras={path_key(s.exe):s.extra for s in self.spaces if s.exe}
         self.spaces=discover_spaces(installations(),file_version,data_root());self.shared=shared_roots()
-        for space in self.spaces:space.extra=extras.get(space.key,[])
+        for space in self.spaces:space.extra=extras.get(path_key(space.exe),space.extra) if space.exe else space.extra
         chosen=next((s for s in self.spaces if s.exe and path_key(s.exe)==path_key(selected_exe)),self.spaces[0])
         warning=self.bind_space(chosen);self.bind_targets()
         if warning:self.log.appendPlainText(warning)
         try:write_json(self.version_path,{'key':chosen.key})
         except OSError as error:self.log.appendPlainText('所选 AE 未能保存：'+str(error))
         self.parameter_page.clear();self.refresh_schemes(self.remembered_scheme());self.all_plugins=[];self.show_space();self.update_version_bar();self.update_buttons();self.start_scan()
-    def busy(self):return self.job is not None and self.job.isRunning()
+    def busy(self):return (self.job is not None and self.job.isRunning()) or bool(getattr(self,'_tasks',{}))
+    def background(self,name,run):
+        if self._stopping.is_set() or self.busy():return False
+        space=self.space
+        def guarded():
+            try:run()
+            finally:self.task_finished.emit(name)
+        thread=threading.Thread(target=guarded,daemon=False,name=name);self._tasks[name]=(thread,space)
+        for widget in self.buttons:widget.setEnabled(False)
+        thread.start();return True
+    def task_done(self,name):
+        task=self._tasks.pop(name,None)
+        if task:task[0].join(timeout=.05)
+        self.update_buttons()
+        if self._stopping.is_set():QTimer.singleShot(0,self.close)
+
     def work(self,work,callback,failure=None):
-        if self.busy():return
+        if self.busy() or (self._stopping.is_set() and not self.close_after):return
         for widget in self.buttons:widget.setEnabled(False)
         self.progress.show()
         self.job=Job(work);self.job.result.connect(callback);self.job.failure.connect(failure or self.error);self.job.progress.connect(self.status.setText);self.job.finished.connect(lambda job=self.job:self.finished(job));self.job.start()
@@ -1224,11 +1472,12 @@ class Window(QMainWindow):
         if self.loading_button:self.loading_button.stop();self.loading_button=None
         if self.writing:self.writing=set();self.breather.stop()
         self.parameter_page.stop_writing();self.progress.hide();self.update_buttons();self.update_usage()
-        if self.close_after:QTimer.singleShot(0,self.close)
+        if self.close_after or self._stopping.is_set():QTimer.singleShot(0,self.close)
     def update_buttons(self):
+        if self.busy():return
         for widget in self.buttons:widget.setEnabled(True)
         live=self.live is not None and self.space.live
-        for widget in (self.apply_selected_action,self.restore_selected_action,self.restore_all_action,self.refresh_btn,self.refresh_action):widget.setEnabled(live)
+        for widget in (self.apply_selected_action,self.restore_selected_action,self.restore_all_action,self.refresh_btn,self.refresh_action,self.calibrate_refresh_action):widget.setEnabled(live)
         for widget in self.parameter_page.controls:widget.setEnabled(self.space.live)
         self.parameter_page.update_check_all();self.parameter_page.update_empty()
         self.update_detail_actions();self.update_scheme_bar();self.update_pill();self.update_refresh_hint()
@@ -1310,8 +1559,9 @@ class Window(QMainWindow):
         for row,p in enumerate(self.plugins):
             check=QTableWidgetItem();check.setFlags(Qt.ItemFlag.ItemIsUserCheckable|Qt.ItemFlag.ItemIsEnabled|Qt.ItemFlag.ItemIsSelectable)
             check.setCheckState(Qt.CheckState.Checked if p.match_name in self.enabled else Qt.CheckState.Unchecked);self.table.setItem(row,CHECK,check)
-            for col,value in ((ORIGINAL,p.display_name),(CANDIDATE,self.pending.get(p.match_name,'')),(CURRENT,'尚未连接'),(KEY,p.match_name),(CATEGORY,p.category),(STATUS,'')):
-                item=QTableWidgetItem(value);item.setToolTip(p.path if col==ORIGINAL else value)
+            for col,value in ((ORIGINAL,p.display_name),(CANDIDATE,self.pending.get(p.match_name,'')),(CURRENT,'尚未连接'),(KEY,p.match_name),(CATEGORY,readable_category(p.category)),(STATUS,''),
+                              (FAVORITE,'★' if p.match_name in self.favorites else '')):
+                item=QTableWidgetItem(value);item.setToolTip(p.path if col==ORIGINAL else '点击收藏或取消收藏' if col==FAVORITE else value)
                 if col!=CANDIDATE:item.setFlags(item.flags()&~Qt.ItemFlag.ItemIsEditable)
                 if col==KEY:item.setFont(mono)
                 if col in (KEY,CATEGORY):item.setForeground(QColor(ui_kit.MUTED))
@@ -1348,13 +1598,13 @@ class Window(QMainWindow):
         process=(self.live.get('pid'),self.live.get('creationTime'))
         if process==self.reapplied_for:return
         if self.busy():QTimer.singleShot(500,self.auto_reapply);return
-        self.reapplied_for=process
         current={r['matchName']:r['displayName'] for r in self.live['effects']};english={p.match_name:p.display_name for p in self.plugins}
         due={k:v for k,v in self.kept_names().items() if k in current and current[k]!=self.target_name(english.get(k,''),v)}
-        if not due:return
+        if not due:self.reapplied_for=process;return
         self.status.setText(f'AE 重启后效果名称已变回原名，正在重新应用 {len(due)} 个……');self.writing=set(due)
-        self.work(lambda progress:self.apply_names(due,instances=False),self.reapplied,lambda message:self.error('自动重新应用效果名称未完成：'+message))
-    def reapplied(self,result):
+        self.work(lambda progress:self.apply_names(due,instances=False),lambda result:self.reapplied(result,process),lambda message:self.error('自动重新应用效果名称未完成：'+message))
+    def reapplied(self,result,process=None):
+        if process is not None:self.reapplied_for=process
         operation,live,read_error=result;written=[k for k in operation.get('applied',{}) if k not in set(operation.get('unchanged',[]))]
         if written:
             self.toast.notify('已重新应用效果名称',f'{len(written)} 项（AE 重启后会恢复原名）');self.log.appendPlainText(f'AE 重启后自动重新应用 {len(written)} 个效果名称：'+brief({k:operation["applied"][k] for k in written}))
@@ -1410,11 +1660,12 @@ class Window(QMainWindow):
         if mode=='all':return True
         key=self.table.item(row,KEY).text();candidate=self.table.item(row,CANDIDATE).text().strip();current=self.table.item(row,CURRENT).text()
         applied=bool(self.live and candidate and current==self.target_name(self.table.item(row,ORIGINAL).text(),candidate))
-        return {'checked':key in self.enabled,'todo':not candidate,'applied':applied,'missing':current==MISSING}[mode]
+        return {'checked':key in self.enabled,'todo':not candidate,'applied':applied,'missing':current==MISSING,'favorite':key in self.favorites}[mode]
     def filter_rows(self,*_):
         text=self.filter.text().casefold();mode=ROW_FILTERS[max(self.chip_group.checkedId(),0)][0];members=self.scheme_members()
         for row in range(self.table.rowCount()):
             hit=self.in_scope(row,members) and text in ' '.join(self.table.item(row,c).text() for c in range(ORIGINAL,CATEGORY+1)).casefold() and self.row_matches(row,mode)
+            if hit and self.only_checked:hit=self.table.item(row,KEY).text() in self.enabled
             self.table.setRowHidden(row,not hit)
         self.paint_membership();self.update_counts();self.show_table_state();self.update_check_header()
     def visible_keys(self)->set[str]:return {self.table.item(row,KEY).text() for row in self.visible_rows()}
@@ -1434,7 +1685,104 @@ class Window(QMainWindow):
             self.empty_paths_btn.hide();self.empty_clear_btn.show();self.empty_all_btn.setVisible(self.scoped());self.table_stack.setCurrentIndex(0)
         else:self.table_stack.setCurrentIndex(1)
     def clear_filters(self):
-        self.filter.clear();self.chips['all'].setChecked(True);self.filter_rows()
+        self.filter.clear();self.chips['all'].setChecked(True);self.only_checked=False;self.only_checked_action.setChecked(False);self.filter_rows()
+    def set_only_checked(self,on):
+        self.only_checked=bool(on);self.only_checked_action.setChecked(self.only_checked);self.filter_rows()
+        self.status.setText(f'只看勾选项（{len(self.enabled)} 个）' if self.only_checked else '显示全部勾选状态的效果')
+    # Favourites, kept in folders (收藏夹): the star, the 已收藏 tile and the detail star show the current folder;
+    # the check menu and the row menu can also put effects into any folder, or a new one the user names.
+    def checked_keys(self)->list[str]:return sorted(self.enabled,key=str.casefold)
+    def favorite_keys(self,keys,on):
+        keys=list(keys);folder=self.favorites.current
+        if not keys:self.status.setText('先勾选效果');return
+        changed=self.favorites.set(keys,on)
+        self.status.setText((f'已把 {changed} 个效果加入收藏夹“{folder}”' if on else f'已从收藏夹“{folder}”移出 {changed} 个效果') if changed else
+                            (f'这些效果都已在收藏夹“{folder}”里' if on else f'这些效果都不在收藏夹“{folder}”里'))
+    def table_clicked(self,row,column):
+        if column==FAVORITE and self.table.item(row,KEY) is not None:self.toggle_favorite(self.table.item(row,KEY).text())
+    def toggle_favorite(self,key):
+        on=self.favorites.toggle(key);folder=self.favorites.current
+        self.status.setText(f'已把“{self.effect_title(key)}”'+(f'加入收藏夹“{folder}”' if on else f'移出收藏夹“{folder}”'))
+    def fill_folder_menu(self,menu:QMenu,keys:list[str])->QMenu:
+        """Every folder (the current one marked), then a new one, as places to put keys."""
+        menu.clear()
+        if not keys:menu.addAction('先勾选效果').setEnabled(False);return menu
+        for name in self.favorites.names():
+            count=len(self.favorites.folders[name]);held=sum(1 for k in keys if k in self.favorites.folders[name])
+            text=name+('（当前）' if name==self.favorites.current else '')+(f'　{count} 个' if count else '')
+            action=menu.addAction(text,lambda n=name:self.put_in_folder(keys,n))
+            if held==len(keys):action.setEnabled(False);action.setText(text+'　已全部在内')
+        menu.addSeparator();menu.addAction('新建收藏夹…',lambda:self.put_in_folder(keys,None));return menu
+    def next_folder_name(self)->str:
+        number=1
+        while self.favorites.find(f'收藏夹 {number}') is not None:number+=1
+        return f'收藏夹 {number}'
+    def ask_folder_name(self,caption,label_text,text,ok_text='保存')->str|None:
+        name,ok=ask_text(self,caption,label_text,text,ok_text)
+        if not ok:return None
+        try:return favorites_store.clean_name(name)
+        except ValueError as error:self.error(str(error));return None
+    def put_in_folder(self,keys:list[str],name:str|None):
+        """Adds effects at the end of a folder; None asks for a name and makes a new folder holding them."""
+        keys=list(dict.fromkeys(keys))
+        if not keys:return
+        try:
+            if name is None:
+                name=self.ask_folder_name('新建收藏夹',f'收藏夹名称（放入 {len(keys)} 个效果）：',self.next_folder_name(),'新建')
+                if name is None:return
+                name=self.favorites.create(name,keys);added=len(keys);verb='已新建收藏夹'
+            else:added=self.favorites.add(name,keys);verb='已加入收藏夹'
+        except ValueError as error:self.error(str(error));return
+        text=f'{len(keys)} 个效果'+(f'，其中新增 {added} 个' if added!=len(keys) else '')
+        self.log.appendPlainText(f'{verb}“{name}”：{text}');self.status.setText(f'{verb}“{name}”（{text}）');self.toast.notify(f'{verb}“{name}”',text)
+    def new_folder(self):
+        name=self.ask_folder_name('新建收藏夹','收藏夹名称：',self.next_folder_name(),'新建')
+        if name is None:return
+        try:name=self.favorites.create(name,select=True)
+        except ValueError as error:self.error(str(error));return
+        self.status.setText(f'已新建收藏夹“{name}”，并切换到它')
+    def rename_folder(self):
+        old=self.favorites.current;name=self.ask_folder_name('重命名收藏夹','新的收藏夹名称：',old)
+        if name is None or name==old:return
+        try:name=self.favorites.rename(old,name)
+        except ValueError as error:self.error(str(error));return
+        self.status.setText(f'收藏夹“{old}”已改名为“{name}”')
+    def delete_folder(self):
+        name=self.favorites.current;count=len(self.favorites.favorites);last=len(self.favorites.folders)==1
+        if last and not count:self.status.setText('这是唯一的收藏夹，而且已经是空的');return
+        text=(f'这是唯一的收藏夹，删除只会清空它里面的 {count} 个效果。' if last else f'收藏夹里的 {count} 个效果会一起移出（效果本身、其他收藏夹和方案都不受影响）。' if count else '这个收藏夹是空的。')
+        if not confirm(self,f'删除收藏夹“{name}”？' if not last else f'清空收藏夹“{name}”？',text,'清空' if last else '删除',danger=True):return
+        self.favorites.delete(name)
+        self.log.appendPlainText(f'已{"清空" if last else "删除"}收藏夹“{name}”（{count} 个效果）');self.status.setText(f'已{"清空" if last else "删除"}收藏夹“{name}”')
+    def choose_folder(self,index):
+        names=self.favorites.names()
+        if 0<=index<len(names) and self.favorites.select(names[index]):self.status.setText(f'当前收藏夹：{names[index]}（快速搜索置顶它的效果）')
+    def folder_from_scheme(self,scheme:SavedScheme):
+        """A scheme saved while schemes carried favourites: those favourites become a folder of their own."""
+        base=scheme.title[:favorites_store.NAME_LIMIT];name=base;number=2
+        while self.favorites.find(name) is not None:name=f'{base[:favorites_store.NAME_LIMIT-4]} {number}';number+=1
+        name=self.ask_folder_name('存为收藏夹',f'收藏夹名称（{len(scheme.favorites)} 个效果，按方案里的顺序）：',name,'新建')
+        if name is None:return
+        try:name=self.favorites.create(name,scheme.favorites)
+        except ValueError as error:self.error(str(error));return
+        self.log.appendPlainText(f'已把方案“{scheme.title}”里的 {len(scheme.favorites)} 个收藏存为收藏夹“{name}”');self.toast.notify(f'已新建收藏夹“{name}”',f'{len(scheme.favorites)} 个效果；可在“快速搜索”页切换到它')
+    def effect_title(self,key)->str:
+        """What quick search shows for an effect: its Chinese name when there is one, else the plug-in's own name."""
+        return getattr(self,'title_cache',{}).get(key) or self.pending.get(key,'').strip() or next((p.display_name for p in self.plugins if p.match_name==key),key)
+    def favorites_changed(self):
+        """Every change to the favourites or their folders (any page) ends here."""
+        if not hasattr(self,'table'):return
+        folder=self.favorites.current
+        self.favorite_checked_action.setText(f'收藏勾选项到“{folder}”');self.unfavorite_checked_action.setText(f'从“{folder}”移出勾选项')
+        self.chips['favorite'].setToolTip(f'只看当前收藏夹“{folder}”里的效果')
+        self._fill=True;sorting=self.table.isSortingEnabled();self.table.setSortingEnabled(False)
+        for row in range(self.table.rowCount()):
+            item=self.table.item(row,FAVORITE)
+            if item is not None:item.setText('★' if self.table.item(row,KEY).text() in self.favorites else '')
+        self.table.setSortingEnabled(sorting);self._fill=False
+        if ROW_FILTERS[max(self.chip_group.checkedId(),0)][0]=='favorite':self.filter_rows()
+        else:self.update_counts()
+        self.show_detail(self.selected_rows());self.fill_quick_lists();self.update_scheme_bar()
     def update_counts(self):
         members=self.scheme_members();rows=[row for row in range(self.table.rowCount()) if self.in_scope(row,members)]
         for key,text in ROW_FILTERS:
@@ -1474,9 +1822,11 @@ class Window(QMainWindow):
         self.update_detail_actions();self.fit_detail()
     def show_detail(self,rows):
         if not rows:
-            self.detail_eyebrow.setText('效果详情');self.selected_label.setText('在左侧表格中选择效果');self.detail_state.set(None,'')
+            self.detail_eyebrow.setText('效果详情');self.selected_label.setText('在左侧表格中选择效果');self.detail_state.set(None,'');self.detail_star.hide()
             self.detail_info.setText('点击一行查看详情并输入中文名称；批量操作请勾选左侧复选框。');self.path_label.clear();self.name_edit.clear();return
         row=rows[0];item=lambda col:self.table.item(row,col).text()
+        starred=item(KEY) in self.favorites;ui_kit.themed_icon(self.detail_star,'star_fill' if starred else 'star','INK' if starred else 'MUTED',18);self.detail_star.show()
+        folder=self.favorites.current;self.detail_star.setToolTip(f'在收藏夹“{folder}”里，点击移出' if starred else f'加入收藏夹“{folder}”：快速搜索时置顶')
         self.detail_eyebrow.setText(item(CATEGORY) or '效果');self.selected_label.setText(item(ORIGINAL))
         state=item(STATUS);self.detail_state.set(STATUS_MARK.get(state),{'已应用':'已在 AE 生效','待应用':'有中文，待应用','待翻译':'还没有中文名称'}.get(state,state))
         self.detail_info.setText(f'内部标识：{item(KEY)}\n分类：{item(CATEGORY)}\nAE 当前名称：{item(CURRENT)}')
@@ -1490,6 +1840,9 @@ class Window(QMainWindow):
         self.table.selectRow(row);key=self.table.item(row,KEY).text();checked=key in self.enabled
         menu=QMenu(self);menu.addAction(self.apply_selected_action);menu.addAction(self.restore_selected_action);menu.addAction(self.translate_action);menu.addSeparator()
         menu.addAction('取消勾选此效果' if checked else '勾选此效果',lambda:self.check_keys({key},not checked))
+        folder=self.favorites.current
+        menu.addAction(ui_kit.icon('star_fill' if key in self.favorites else 'star'),f'移出收藏夹“{folder}”' if key in self.favorites else f'收藏到“{folder}”',lambda:self.toggle_favorite(key))
+        self.fill_folder_menu(menu.addMenu('加入收藏夹'),[key])
         edit=menu.addAction('编辑此效果的参数名称…',lambda:self.open_parameters(key));edit.setEnabled(self.space.live and not self.busy())
         self.fill_add_menu(menu.addMenu('加入方案'),[key])
         menu.addSeparator();copy=menu.addMenu('复制')
@@ -1714,9 +2067,18 @@ class Window(QMainWindow):
         live=dict(self.live);image=str(self.space.exe)
         def done(result):
             self.needs_refresh=False;self.update_refresh_hint()
-            self.status.setText('AE 原生列表已刷新');self.toast.notify('列表已刷新','AE“效果和预设”已显示最新名称')
+            self.status.setText('已执行 AE 原生列表刷新菜单，请在 AE 中核对名称');self.toast.notify('刷新菜单已执行','请在 AE“效果和预设”列表核对最新名称')
             if result.get('diagnosticPath'):self.log.appendPlainText('刷新诊断：'+result['diagnosticPath'])
         self.work(lambda progress:refresh_effects(live['pid'],expected_image=image,creation_time=live['creationTime']),done)
+    def calibrate_refresh_menu(self):
+        if not self.live or self.busy():return
+        from ae_ui import calibrate_effects
+        live=dict(self.live);image=str(self.space.exe)
+        def done(result):
+            self.status.setText('刷新菜单按钮已校准；本次 AE 会话有效，布局或缩放变化后请重新校准')
+            self.toast.notify('已校准','校准没有执行刷新；现在可点击刷新按钮')
+            if result.get('diagnosticPath'):self.log.appendPlainText('校准诊断：'+result['diagnosticPath'])
+        self.work(lambda progress:calibrate_effects(live['pid'],expected_image=image,creation_time=live['creationTime'],progress=progress),done)
     def configure_api(self):
         accepted=ApiDialog(self.settings,self).exec()==QDialog.DialogCode.Accepted
         self.update_api_info();self.update_usage();return accepted
@@ -1796,7 +2158,9 @@ class Window(QMainWindow):
         menu.addSeparator()
         for action in (self.save_scheme_action,self.save_as_action,self.add_checked_menu,None,self.import_action,self.manage_action):
             if action is None:menu.addSeparator()
-            elif isinstance(action,QMenu):action.setTitle(f'把勾选项加入方案（{len(self.enabled)} 项）' if self.enabled else '把勾选项加入方案');menu.addMenu(action)
+            elif isinstance(action,QMenu):
+                what='把勾选项加入方案'
+                action.setTitle(f'{what}（{len(self.enabled)} 项）' if self.enabled else what);menu.addMenu(action)
             else:menu.addAction(action)
         self.fill_add_menu(self.add_checked_menu,sorted(self.enabled,key=str.casefold))
         return menu
@@ -1846,7 +2210,10 @@ class Window(QMainWindow):
         return '' if names.get(key,'')==new_names.get(key,'') else names.get(key) or '（无中文）'
     # Both previews share one layout: box (the scheme's check), names, Chinese (editable), current table, delete.
     # Rows only in the current table have no box or delete button and show with the differences.
-    def preview_tab_table(self)->QTableWidget:return (self.preview_table,self.param_preview_table)[max(self.preview_group.checkedId(),0)]
+    def preview_tab(self)->int:return max(self.preview_group.checkedId(),0)   # 0 effects, 1 parameters
+    def preview_tab_table(self)->QTableWidget:
+        """The table of the chosen tab."""
+        return (self.preview_table,self.param_preview_table)[self.preview_tab()]
     def table_part(self,part)->tuple[dict[str,str],set[str]]:
         return (self.current_names(),set(self.enabled)) if part=='effects' else self.current_parameters()
     @staticmethod
@@ -1896,13 +2263,16 @@ class Window(QMainWindow):
             rows.append((key,[effect,label_],new_names.get(key,''),key in new_checks,self.diff_text(names,checks,key,new_names,new_checks),tip,False,extra))
         rows.sort(key=lambda r:(r[1][0].casefold(),r[0]));self.fill_preview_rows(self.param_preview_table,rows)
     def show_preview_tab(self):
-        effects=max(self.preview_group.checkedId(),0)==0;word='效果' if effects else '参数'
+        tab=self.preview_tab();effects=tab==0;word=('效果','参数')[tab]
         self.add_effects_btn.setText(f'添加{word}…');self.dup_banner.setVisible(effects and self.dup_banner.property('wanted') is True)
-        self.edit_hint.setText(' · '.join(x for x in ('复选框可按住上下拖动','双击中文名称修改',f'垃圾桶删除单个{word}',self.undo_note(),'右键更多') if x))
+        self.delete_checked_btn.setText('删除勾选项');self.show_edit_hint()
         self.filter_preview()
+    def show_edit_hint(self):
+        tab=self.preview_tab()
+        self.edit_hint.setText(' · '.join(x for x in ('复选框可按住上下拖动','双击中文名称修改','垃圾桶删除单个'+('参数' if tab==1 else '效果'),self.undo_note(),'右键更多') if x))
     def filter_preview(self):
         """Shows the chosen tab's table filtered by the search and the difference switch, or a note when there is nothing to list."""
-        scheme=self.selected_scheme();tab=max(self.preview_group.checkedId(),0)
+        scheme=self.selected_scheme();tab=self.preview_tab()
         if scheme is None:return
         table=self.preview_tab_table();query=self.preview_search.text().casefold().strip();only=self.diff_only.isChecked();shown=0
         for row in range(table.rowCount()):
@@ -2009,7 +2379,8 @@ class Window(QMainWindow):
         return known
     def add_to_scheme(self,keys=None,part=None):
         """Adds effects of this AE version, or parameters this computer has seen, checked, with a Chinese name already known for them."""
-        scheme=self.selected_scheme();part=part or self.preview_tab_table().part
+        scheme=self.selected_scheme()
+        part=part or self.preview_tab_table().part
         if scheme is None:return
         known=self.known_names(scheme) if part=='effects' else self.known_parameters(scheme)
         if keys is None:
@@ -2045,7 +2416,7 @@ class Window(QMainWindow):
         if not keys:return False
         effects=(names,enabled) if part=='effects' else (saved.names,saved.enabled)
         parameters=(names,enabled) if part=='parameters' else saved.parameters
-        try:write_json(saved.path,dump_scheme(*effects,saved.title,None,parameters))
+        try:write_json(saved.path,dump_scheme(*effects,saved.title,None,parameters,saved.favorites))
         except OSError as error:self.error('修改翻译方案失败：'+str(error));return False
         if record:self.scheme_undo=[*self.scheme_undo[-29:],(saved.path,{k:before[0].get(k,'') for k in keys},{k for k in keys if k in before[1]},set(keys),message,part)]
         active=self.is_active(scheme);table=self.preview_table if part=='effects' else self.param_preview_table;bar=table.verticalScrollBar().value()
@@ -2095,7 +2466,10 @@ class Window(QMainWindow):
         menu=menu if menu is not None else QMenu(self);menu.clear();scheme=self.selected_scheme()
         if scheme is None:return menu
         if with_load and not self.is_active(scheme):menu.addAction('载入此方案',self.load_selected_scheme)
-        menu.addAction('用当前表格覆盖…',self.overwrite_selected);menu.addSeparator()
+        menu.addAction('用当前表格覆盖…',self.overwrite_selected)
+        # Schemes saved while they carried favourites keep them; this turns them into a folder.
+        if scheme.favorites:menu.addAction(f'把此方案里的收藏存为收藏夹（{len(scheme.favorites)} 个）…',lambda:self.folder_from_scheme(scheme))
+        menu.addSeparator()
         menu.addAction('重命名…',lambda:self.rename_scheme(scheme));menu.addAction('创建副本',lambda:self.duplicate_scheme(scheme));menu.addAction('导出为文件…',lambda:self.export_scheme(scheme))
         menu.addSeparator();menu.addAction('删除…',lambda:self.delete_scheme(scheme))
         return menu
@@ -2147,10 +2521,13 @@ class Window(QMainWindow):
         while True:
             try:return title,self.free_path(title)
             except ValueError:title=f'{base} {number}' if base.endswith('副本') else f'{base} ({number})';number+=1
-    def current_scheme_value(self,title)->dict:
-        return dump_scheme(self.current_names(),self.enabled,title,parameters=self.current_parameters())
+    def current_scheme_value(self,title,favorites:list[str]|None=None)->dict:
+        return dump_scheme(self.current_names(),self.enabled,title,parameters=self.current_parameters(),favorites=favorites)
     def write_scheme(self,path,title,verb):
-        try:write_json(path,self.current_scheme_value(title))
+        # Overwriting keeps the favourites an older save put in the file (schemes no longer change them).
+        try:kept=open_scheme(path).favorites if Path(path).is_file() else None
+        except ValueError:kept=None
+        try:write_json(path,self.current_scheme_value(title,kept))
         except OSError as error:self.error('保存翻译方案失败：'+str(error));return
         self.refresh_schemes(title);self.remember_active();names,checks=self.current_parameters()
         self.log.appendPlainText(f'{verb}方案“{title}”（效果 {len(self.current_names())} 个中文、{len(self.enabled)} 个勾选；参数 {len(names)} 个中文、{len(checks)} 个勾选）');self.status.setText(f'{verb}方案“{title}”')
@@ -2190,7 +2567,7 @@ class Window(QMainWindow):
         try:
             path=self.free_path(title,exclude=old);saved=open_scheme(old.path)
             # Renaming keeps the scheme's saved content, not the table's unsaved edits.
-            write_json(old.path,dump_scheme(saved.names,saved.enabled,title,saved.saved,saved.parameters))
+            write_json(old.path,dump_scheme(saved.names,saved.enabled,title,saved.saved,saved.parameters,saved.favorites))
             if path.name!=old.path.name:os.rename(old.path,path)
         except (OSError,ValueError) as error:self.error('重命名方案失败：'+str(error));self.refresh_schemes(self.active.title if self.active else None);return
         self.preview_path=path;self.refresh_schemes(keep());self.remember_active();self.log.appendPlainText(f'方案“{old.title}”已重命名为“{title}”');self.status.setText('方案已重命名')
@@ -2199,7 +2576,7 @@ class Window(QMainWindow):
         if scheme is None:return
         try:
             saved=open_scheme(scheme.path);title,path=self.unique_path(clean_title(f'{saved.title} 副本'[-60:]))
-            write_json(path,dump_scheme(saved.names,saved.enabled,title,parameters=saved.parameters))
+            write_json(path,dump_scheme(saved.names,saved.enabled,title,parameters=saved.parameters,favorites=saved.favorites))
         except (OSError,ValueError) as error:self.error('创建副本失败：'+str(error));return
         self.preview_path=path;self.refresh_schemes(self.active.title if self.active else None)
         self.log.appendPlainText(f'已为方案“{saved.title}”创建副本“{title}”');self.status.setText(f'已创建副本“{title}”')
@@ -2220,7 +2597,7 @@ class Window(QMainWindow):
         if current and confirm(self,'导出包含未保存更改的版本？',f'方案“{scheme.title}”在当前表格里还有未保存的更改。选“保存并导出”会先保存再导出；取消则导出上次保存的版本。','保存并导出'):self.save_scheme();scheme=self.active or scheme
         path,_=QFileDialog.getSaveFileName(self,'导出翻译方案',str(Path.home()/scheme_file(Path(),scheme.title).name),'翻译方案 (*.json)')
         if not path:return
-        try:saved=open_scheme(scheme.path);write_json(Path(path),dump_scheme(saved.names,saved.enabled,saved.title,saved.saved,saved.parameters))
+        try:saved=open_scheme(scheme.path);write_json(Path(path),dump_scheme(saved.names,saved.enabled,saved.title,saved.saved,saved.parameters,saved.favorites))
         except (OSError,ValueError) as error:self.error('导出翻译方案失败：'+str(error));return
         self.log.appendPlainText(f'已导出翻译方案“{scheme.title}”：{path}');self.status.setText('翻译方案已导出');self.toast.notify('已导出方案',scheme.title)
     def import_scheme(self):
@@ -2229,14 +2606,15 @@ class Window(QMainWindow):
         try:scheme=open_scheme(Path(path))
         except ValueError as error:self.error(str(error));return
         title,target=self.unique_path(scheme.title)
-        try:write_json(target,dump_scheme(scheme.names,scheme.enabled,title,scheme.saved,scheme.parameters))
+        try:write_json(target,dump_scheme(scheme.names,scheme.enabled,title,scheme.saved,scheme.parameters,scheme.favorites))
         except OSError as error:self.error('导入翻译方案失败：'+str(error));return
         self.log.appendPlainText(f'已把 {Path(path).name} 导入为方案“{title}”')
         previous=self.active.title if self.active else None;self.refresh_schemes(previous)
         imported=next((s for s in self.schemes if s.title==title),None)
         if imported:self.preview_path=imported.path;self.switch_to(imported)
     def load_scheme(self,names,enabled,label_text,parameters=None):
-        """Replaces the tables with a scheme; parameter labels only when the scheme carries them."""
+        """Replaces the tables with a scheme; parameter labels only when the scheme carries them. The favourites
+        are not part of it (the user's choice): their folders stay as they are."""
         changed=set(self.pending)|set(self.enabled)|set(names)|enabled
         self.pending.clear();self.pending.update(names);self.enabled.clear();self.enabled.update(enabled)
         if parameters is not None:
@@ -2248,7 +2626,13 @@ class Window(QMainWindow):
     def add_directory(self):
         row=self.version_table.currentRow();space=self.spaces[row] if 0<=row<len(self.spaces) else self.space
         path=QFileDialog.getExistingDirectory(self,f'为 {space.label} 添加插件目录')
-        if path and Path(path) not in self.roots:space.extra.append(Path(path));self.start_scan()
+        if path and Path(path) not in space.roots():
+            from ae_paths import save_extra
+            try:warning=save_extra(data_root()/'ae-installations.json',space.exe,[*space.extra,Path(path)])
+            except OSError as error:self.error('插件目录未能保存：'+str(error));return
+            space.extra.append(Path(path))
+            if warning:self.log.appendPlainText(warning)
+            self.start_scan()
     def toast_area(self)->QRect:
         """The status line under the pages: wide as the pages, minus the busy indicator's place on the left."""
         left=self.pages.mapTo(self,QPoint(0,0)).x();width=max(self.pages.width()-2*170,240)
@@ -2256,8 +2640,253 @@ class Window(QMainWindow):
     def resizeEvent(self,event):
         super().resizeEvent(event)
         if self.toast.isVisible():self.toast.place()
+    # Quick effect search: the box lists the effects of this table (only those AE has loaded, once connected).
+    def layer_key_taken(self,key):
+        text=f'“选中图层参数改成中文”的快捷键 {key} 已被其他程序占用，在 AE 中按下不会生效。可在“设置与日志 → 快捷键”中改为其他组合'
+        self.log.appendPlainText(text);self.toast.notify('快捷键被占用',text,error=True)
+    def layer_parameters(self,ae_window=0):
+        """The layer-parameters key over AE: every parameter of the effects on AE's selected layers in Chinese.
+        Checked translations of this AE version first, then another version's for the same parameter, then (the
+        translation service set up) translated now and kept in this version's record; written like the parameter
+        page's Apply (heap-first with a background full check). Like that Apply, every instance of those parameters
+        in the project is renamed, not only the selected layers'."""
+        if self.busy() or self._stopping.is_set():self.quick_notice('参数汉化','当前操作尚未完成，请稍候');return
+        if self.layer_running:self.quick_notice('参数汉化','上一次还在进行，请稍候');return
+        if not self.space.live:self.quick_notice('参数汉化','还没有连接 AE：请先在本软件中连接 AE',error=True);return
+        import time
+        from parameter_names import read_parameters
+        known=self.quick_parameter_names(None);ready=self.settings.ready();settings=self.settings;image=self.space.exe
+        started=time.perf_counter();self.layer_running=True
+        def run():
+            translated={};note=''
+            try:
+                report=read_parameters(expected_image=image,scope='selected');rows=report.get('parameters',[])
+                if not rows:
+                    reason={'noSelectedLayers':'请先在 AE 的合成里选中图层','noActiveComp':'请先打开一个合成并选中图层'}.get(report.get('emptyReason'),'选中的图层上没有可汉化的参数')
+                    self.layer_result.emit(reason,time.perf_counter()-started,{},'');return
+                names={r['id']:known[r['id']] for r in rows if r['id'] in known}
+                todo=[{'id':r['id'],'sourceName':r['name'],'category':'所属效果 '+r['effectMatchName']} for r in rows if r['id'] not in names]
+                if todo and ready:
+                    try:raw=translate_names(todo,settings.key,settings.base_url,settings.model,service=settings.service,usage=self.record_usage,cancelled=self._stopping.is_set,system_prompt=PARAMETER_PROMPT)
+                    except TranslationError as error:raw=error.partial;note='翻译未全部完成：'+str(error)
+                    for key,name in raw.items():
+                        try:translated[key]=validate_label(name)
+                        except ValueError:pass
+                    names.update(translated)
+                elif todo:note=f'{len(todo)} 个参数还没有译名，翻译服务未设置，已跳过'
+                if not names:self.layer_result.emit(note or '没有可写入的译名',time.perf_counter()-started,translated,'');return
+                if self._stopping.is_set():raise RuntimeError('正在退出，未启动新的参数写入')
+                result=self.parameter_session.apply(names,full=False,skip_missing=True);result['names']=names
+            except Exception as error:result=str(error) or type(error).__name__
+            self.layer_result.emit(result,time.perf_counter()-started,translated,note)
+        self.background('layer-parameters',run)
+    def layer_done(self,result,seconds,translated,note):
+        self.layer_running=False
+        if translated:
+            self.parameter_pending.update(translated);self.parameter_enabled.update(translated);self.save_parameters()
+            self.log.appendPlainText(f'已自动翻译选中图层的 {len(translated)} 个参数并保存到当前版本的参数记录')
+        if isinstance(result,dict):
+            same=result.get('unchanged',0);written=result.get('parameters',0)-same
+            text=f'选中图层的参数已改成中文：写入 {written} 个参数（{result.get("changed",0)} 处），{same} 个本来就是中文，{seconds:.2f} 秒'+(f'。{note}' if note else '')
+            self.log.appendPlainText(text);self.quick_notice('参数已汉化',text,error=bool(note))
+            if result.get('heapOnly'):self.schedule_completion(result.get('names',{}))
+        else:
+            text=f'选中图层的参数没有改成中文（{seconds:.2f} 秒）：{result}'+(f'。{note}' if note else '')
+            self.log.appendPlainText(text);self.quick_notice('参数未汉化',text,error=True)
+    def quick_key_taken(self,key):
+        text=f'快速搜索的快捷键 {key} 已被其他程序占用（常见于输入法的中英切换或 FX Console），在 AE 中按下不会弹出搜索框。可在“设置与日志 → 快捷键”中改为其他组合'
+        self.log.appendPlainText(text);self.toast.notify('快速搜索快捷键被占用',text,error=True)
+    def quick_entries(self)->list:
+        return build_entries(self.plugins,self.pending,self.live['effects'] if self.live else None)
+    def open_quick_search(self,ae_window=0):
+        if self.quick.busy:self.quick.raise_();self.quick.activateWindow();return
+        entries=self.quick_entries();pinned,recent=self.quick_sections(entries)
+        self.quick.open(entries,ae_window,pinned=pinned,recent=recent)
+    def quick_sections(self,entries=None)->tuple[list,list]:
+        """Before anything is typed: the current folder's favourites in their order, then the effects quick search added lately (both optional)."""
+        by={e.match_name:e for e in (entries if entries is not None else self.quick_entries())};self.quick.pinned_caption=self.favorites.current
+        pinned=[by[k] for k in self.favorites.favorites if k in by] if self.quick_favorites_on() else []
+        recent=[by[k] for k in self.favorites.latest(set(by),skip_favorites=self.quick_favorites_on())] if self.quick_recent_on() else []
+        return pinned,recent
+    def quick_add(self,entry):
+        """Adds the chosen effect to AE's selected layers on a worker thread; the time counts from Enter."""
+        import time
+        from parameter_names import add_effect
+        if self.busy() or self._stopping.is_set():self.quick.finished('当前操作尚未完成，请稍候');return
+        started=time.perf_counter();exe=self.space.exe if self.space.live else None;window=self.quick.return_to
+        def run():
+            try:result=add_effect(entry.match_name,expected_image=exe,ae_window=window,title=entry.live)
+            except Exception as error:result=str(error) or type(error).__name__
+            self.quick_result.emit(entry,result,time.perf_counter()-started)
+        self.background('quick-add',run)
+    def quick_added(self,entry,result,seconds):
+        record_timing(data_root()/'quick-search-timing.jsonl',seconds,result.get('route','') if isinstance(result,dict) else '',result.get('changed',0) if isinstance(result,dict) else 0,isinstance(result,dict))
+        if isinstance(result,dict):
+            skipped=f"，{result['skipped']} 个图层不能添加已跳过" if result.get('skipped') else ''
+            self.log.appendPlainText(f"快速添加“{entry.title}”（{entry.match_name}）到 {result['changed']} 个图层{skipped}，回车到完成 {seconds:.2f} 秒（{'后台连接' if result.get('route')=='extension' else '转交'}）")
+            # Recorded before the box closes, so it rests showing what the next opening will list.
+            if self.quick_recent_on():self.favorites.used(entry.match_name)
+            self.quick.finished()
+            actual=result.get('hostIdentity')
+            if actual and self.space.exe and actual.get('image','').replace('\\','/').casefold()!=str(self.space.exe).replace('\\','/').casefold():
+                self.log.appendPlainText('效果已添加到触发快捷键的 AE；当前软件选中的版本不同，未自动应用参数译名')
+            else:self.quick_parameters(entry)
+        else:
+            self.log.appendPlainText(f"快速添加“{entry.title}”未完成（{seconds:.2f} 秒）：{result}")
+            self.quick.finished(result)
+    # Parameter names of an effect quick search added: the translations already saved (and checked) on the
+    # parameter page, written in the background. Nothing is translated here; a missing translation is only mentioned.
+    def quick_parameter_names(self,match_name:str|None)->dict[str,str]:
+        """This AE version's checked translations for the effect (None: every effect); a parameter it has none for
+        borrows the checked translation of the same effect and parameter (same internal names) from another AE
+        version, newest first."""
+        def checked(values,enabled):
+            return {key:value.strip() for key,value in values.items() if isinstance(value,str) and value.strip() and key in enabled and (match_name is None or split_identity(key)[0]==match_name)}
+        names=checked(self.parameter_pending,self.parameter_enabled)
+        def version_key(space):
+            text=space.version or ''
+            return tuple(int(p) for p in text.split('.')) if re.fullmatch(r'\d+(?:\.\d+)*',text) else ()
+        for space in sorted((s for s in self.spaces if s.folder!=self.space.folder),key=version_key,reverse=True):
+            other=checked(CandidateStore(space.folder/'parameter-translations.json').values,CandidateStore(space.folder/'parameter-enabled.json',keys=True).values)
+            for key,value in other.items():names.setdefault(key,value)
+        return names
+    def quick_notice(self,title,text,error=False):
+        """Said where it can be seen: the tray when the window is hidden (the user is in AE), else the toast."""
+        if self.tray and self.tray.isVisible() and (not self.isVisible() or self.isMinimized()):
+            self.tray.showMessage(title,text,QSystemTrayIcon.MessageIcon.Warning if error else QSystemTrayIcon.MessageIcon.Information,5000)
+        else:self.toast.notify(title,text,error=error)
+    def quick_translate_on(self)->bool:return self.ui_preferences().get('quickTranslate') is not False
+    def quick_parameters_on(self)->bool:return self.ui_preferences().get('quickParameters') is not False
+    def set_quick_parameters(self,on):
+        self.save_ui_preference('quickParameters',bool(on));self.quick_translate_box.setEnabled(bool(on))
+        if not on:self.quick_full.stop();self.quick_full_keys={}    # no follow-up full scan either
+    def quick_parameters(self,entry):
+        if self._stopping.is_set():return
+        if self.busy():
+            space=self.space
+            QTimer.singleShot(100,lambda:self.quick_parameters(entry) if self.space is space else None);return
+        if not self.space.live or not self.quick_parameters_on():return    # switched off: nothing written, borrowed, translated or scanned
+        names=self.quick_parameter_names(entry.match_name)
+        # Parameters no AE version has a translation for are translated now (setting on, translation service set up).
+        translate=self.quick_translate_on();ready=translate and self.settings.ready()
+        if not names and not ready:
+            text=f'“{entry.title}”的参数还没翻译'+('，翻译服务未设置，无法自动翻译' if translate else '，可到参数页翻译')
+            self.log.appendPlainText(text);self.quick_notice('参数未汉化',text);return
+        import time
+        from parameter_names import FastMiss,read_parameters
+        started=time.perf_counter();settings=self.settings;image=self.space.exe
+        def run():
+            route='cache';translated={};note=''
+            if ready:
+                try:
+                    # The effect's own parameters, from the selected layers it was just added to (the cache is reused).
+                    report=read_parameters(expected_image=image,scope='selected')
+                    todo=[{'id':r['id'],'sourceName':r['name'],'category':'所属效果 '+entry.match_name} for r in report.get('parameters',[]) if r.get('effectMatchName')==entry.match_name and r['id'] not in names]
+                    if todo:
+                        try:raw=translate_names(todo,settings.key,settings.base_url,settings.model,service=settings.service,usage=self.record_usage,cancelled=self._stopping.is_set,system_prompt=PARAMETER_PROMPT)
+                        except TranslationError as error:raw=error.partial;note='翻译未全部完成：'+str(error)
+                        for key,name in raw.items():
+                            try:translated[key]=validate_label(name)
+                            except ValueError:pass
+                        names.update(translated)
+                except Exception as error:note='自动翻译未完成：'+(str(error) or type(error).__name__)
+            if not names:
+                self.quick_params_result.emit(entry,note or '这个效果没有可汉化的参数',time.perf_counter()-started,route,translated,note);return
+            try:
+                if self._stopping.is_set():raise RuntimeError('正在退出，未启动新的参数写入')
+                # Cached structure first; when it misses an instance, a fresh scan of AE's default heap (fast writes
+                # keep their instance-count and read-back guards); only then the full scan.
+                scan_route=lambda result:'heap' if result.get('scanTarget')=='heap' else 'scan'
+                try:
+                    result=self.parameter_session.apply(names,fast=True,skip_missing=True)
+                    if result.get('scanned'):route=scan_route(result)     # nothing cached yet: this attempt scanned
+                except FastMiss as miss:
+                    try:
+                        if miss.scanned:raise
+                        result=self.parameter_session.apply(names,fast=True,rescan=True,skip_missing=True);route=scan_route(result)
+                    except FastMiss:route='scan';result=self.parameter_session.apply(names,skip_missing=True)
+            except Exception as error:result=str(error) or type(error).__name__
+            self.quick_params_result.emit(entry,result,time.perf_counter()-started,route,translated,note)
+        self.background('quick-parameters',run)
+    def quick_params_done(self,entry,result,seconds,route,translated=None,note=''):
+        if translated:
+            # New translations join this AE version's parameter record, checked, like ones made on the parameter page.
+            self.parameter_pending.update(translated);self.parameter_enabled.update(translated);self.save_parameters()
+            self.log.appendPlainText(f"已自动翻译“{entry.title}”的 {len(translated)} 个参数并保存到当前版本的参数记录")
+        if note:self.log.appendPlainText(note);self.quick_notice('参数自动翻译',note,error=True)
+        if isinstance(result,dict):
+            how={'cache':'缓存结构','heap':'默认堆扫描','scan':'完整扫描','full':'补充完整扫描'}[route]
+            self.log.appendPlainText(f"“{entry.title}”的参数名称已写入 {result.get('changed',0)} 处（{result.get('parameters',0)} 个参数，{how}，{seconds:.2f} 秒）")
+            # Written from a cached or heap-only structure: a later full scan also covers copies made since.
+            if route in ('cache','heap'):self.quick_full_keys.update(self.quick_parameter_names(entry.match_name));self.quick_full.start()
+        elif not note:
+            self.log.appendPlainText(f"“{entry.title}”的参数名称未写入（{seconds:.2f} 秒）：{result}");self.quick_notice('参数名称未写入',str(result),error=True)
+    def quick_full_pass(self):
+        """The later full scan after cache-only writes: copies of an effect made after the last scan get the names too."""
+        names,self.quick_full_keys=self.quick_full_keys,{}
+        if not names or self._stopping.is_set():return
+        if self.busy():self.quick_full_keys.update(names);self.quick_full.start();return
+        import time
+        started=time.perf_counter();entry=type('Entry',(),{'title':f'{len({split_identity(k)[0] for k in names})} 个快速添加的效果'})()
+        def run():
+            try:
+                result=self.parameter_session.apply(names,rescan=True,skip_missing=True)
+            except Exception as error:result=str(error) or type(error).__name__
+            self.quick_params_result.emit(entry,result,time.perf_counter()-started,'full',{},'')
+        self.background('quick-parameters-full',run)
+    def schedule_completion(self,names):
+        """After the parameter page wrote from a heap-only structure: a full scan in the background, writing again
+        only if it finds structures outside the default heap."""
+        if self._stopping.is_set():return
+        self.completion_keys.update(names);self.completion.start()
+    def completion_pass(self):
+        names,self.completion_keys=self.completion_keys,{}
+        if not names or self._stopping.is_set():return
+        if self.busy():self.completion_keys.update(names);self.completion.start();return
+        import time
+        started=time.perf_counter()
+        def run():
+            try:result=self.parameter_session.complete(names)
+            except Exception as error:result=str(error) or type(error).__name__
+            self.completion_result.emit(result,time.perf_counter()-started)
+        self.background('parameter-completion',run)
+    def completion_done(self,result,seconds):
+        if not isinstance(result,dict):
+            self.log.appendPlainText(f'参数写入后的补充完整扫描未完成（{seconds:.2f} 秒）：{result}');return
+        if result.get('missed'):
+            self.log.appendPlainText(f"补充完整扫描在默认堆以外找到 {result['missed']} 组参数结构，已补写 {result.get('changed',0)} 处（{seconds:.2f} 秒）")
+        elif result.get('checked'):self.log.appendPlainText(f'补充完整扫描核对完毕：参数结构都在默认堆里，无需补写（{seconds:.2f} 秒）')
+    # Tray: closing the window hides it while the option is on, so the quick search key keeps working.
+    def tray_on_close(self)->bool:return self.ui_preferences().get('trayOnClose') is not False
+    def set_tray_on_close(self,on):
+        self.save_ui_preference('trayOnClose',bool(on))
+        if self.tray:self.tray.setVisible(bool(on))
+    def set_autostart(self,on):
+        try:autostart.set_enabled(bool(on))
+        except (OSError,RuntimeError) as error:
+            self.log.appendPlainText('开机启动设置失败：'+str(error));self.autostart_box.blockSignals(True);self.autostart_box.setChecked(not on);self.autostart_box.blockSignals(False)
+    def make_tray(self):
+        self.tray=None;self.quitting=False;self.tray_told=False
+        if not QSystemTrayIcon.isSystemTrayAvailable():return
+        tray=self.tray=QSystemTrayIcon(QApplication.windowIcon(),self);self.tray_tip()
+        menu=QMenu();menu.addAction('显示窗口',self.show_window);menu.addSeparator();menu.addAction('退出',self.quit_from_tray);tray.setContextMenu(menu);self.tray_menu=menu
+        tray.activated.connect(lambda reason:self.show_window() if reason in (QSystemTrayIcon.ActivationReason.Trigger,QSystemTrayIcon.ActivationReason.DoubleClick) else None)
+        tray.setVisible(self.tray_on_close())
+        # Windows ending the session, or an installer closing the program (Restart Manager), means quit, not hide.
+        QApplication.instance().commitDataRequest.connect(lambda *_:setattr(self,'quitting',True))
+    def tray_tip(self):
+        if getattr(self,'tray',None):self.tray.setToolTip(f'{APP_NAME} {APP_VERSION} · '+self.keymap.tip('quick_search','在 AE 中快速搜索效果'))
+    def show_window(self):
+        self.showNormal() if self.isMinimized() else self.show();self.raise_();self.activateWindow()
+    def quit_from_tray(self):self.quitting=True;self.show_window();self.close()
     def closeEvent(self,event):
-        if self.busy():event.ignore();self.status.setText('请等待当前操作完成后关闭');return
+        if self.tray and self.tray.isVisible() and not self.quitting:
+            event.ignore();self.hide()
+            if not self.tray_told:self.tray_told=True;self.tray.showMessage(APP_NAME,'仍在托盘中运行，快速搜索可用。右键托盘图标可退出。',QSystemTrayIcon.MessageIcon.Information,4000)
+            return
+        if self.busy():
+            self._stopping.set();self.quick_full.stop();self.completion.stop();self.quick_full_keys={};self.completion_keys={}
+            event.ignore();self.status.setText('正在等待当前操作安全收尾，完成后退出');return
         dialog=getattr(self,'adapter_dialog',None)
         if dialog and dialog.validation and dialog.validation.held:
             event.ignore();dialog.restore_validation();self.status.setText('正在恢复验证改名，恢复完成后可关闭');return
@@ -2267,7 +2896,8 @@ class Window(QMainWindow):
         if self.exit_restore.isChecked() and entries and not self.close_after:
             event.ignore();self.close_after=True;self.work(lambda progress:self.restore_names(progress),self.exit_restored);return
         # A running update check is not waited for: it only reads, and its daemon thread ends with the program.
-        event.accept()
+        event.accept();self.quick_key.close();self.layer_key.close();self.quick.hide()
+        if self.tray:self.tray.hide()
         if self.pending_installer:self.launch_installer()
 
 def ui_prefs()->dict:
@@ -2276,10 +2906,34 @@ def ui_prefs()->dict:
     except (OSError,ValueError):return {}
     return value if isinstance(value,dict) else {}
 
+TLS_SELFTEST='--selftest-tls'
+def tls_selftest(report:Path)->int:
+    """The build's check that this bundle can open HTTPS connections at all (translation, model lists, updates), without
+    connecting anywhere: a Python whose ssl module wants a file the bundle lacks fails here. Writes ok or the error."""
+    try:
+        import ssl,urllib.request
+        from updater import tls_context
+        ssl.create_default_context();tls_context();urllib.request.build_opener(urllib.request.HTTPSHandler())
+        report.write_text('ok',encoding='utf8');return 0
+    except Exception as error:
+        report.write_text(f'{type(error).__name__}: {error}',encoding='utf8');return 1
+
 def main():
+    if TLS_SELFTEST in sys.argv:sys.exit(tls_selftest(Path(sys.argv[sys.argv.index(TLS_SELFTEST)+1])))
     app=QApplication(sys.argv);ui_kit.set_theme(ui_prefs().get('darkMode') is True)    # before any widget, so there is no light flash
     # The stylesheet lives on the windows, not the application (ui_kit.restyle): a theme switch then restyles in a
     # fraction of the time. The application keeps no sheet at all -- one on both makes every restyle slower still.
     apply_theme(app,'',ui_kit.is_dark());ui_kit.install(app);ui_kit.restyle(app,ui_kit.stylesheet())
-    window=Window();window.show();sys.exit(app.exec())
+    # One copy at a time: a second start (Start menu, while this one sits in the tray) shows the running window and exits.
+    from PySide6.QtNetwork import QLocalServer,QLocalSocket
+    name='AE-Localizer-'+(os.environ.get('USERNAME') or 'user')
+    other=QLocalSocket();other.connectToServer(name)
+    if other.waitForConnected(300):
+        other.write(b'show');other.flush();other.waitForBytesWritten(300);other.disconnectFromServer();return
+    server=QLocalServer();QLocalServer.removeServer(name);server.listen(name)
+    window=Window()
+    server.newConnection.connect(lambda:(server.nextPendingConnection(),window.show_window()))
+    if autostart.MINIMIZED in sys.argv and window.tray and window.tray.isVisible():pass   # started with Windows: stay in the tray
+    else:window.show()
+    sys.exit(app.exec())
 if __name__=='__main__':main()

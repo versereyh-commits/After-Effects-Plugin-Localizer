@@ -80,6 +80,13 @@ class LegacyEncodingTests(unittest.TestCase):
                                     (live,'_mutex_name','Local\\AEPluginNameLocalizer.Test.'+Path(self.temp.name).name),(runtime,'code_page',lambda:936)]:
             handle=patch.object(module,target,value);handle.start();self.addCleanup(handle.stop)
         self.session=live.NameSession()
+    def test_legacy_profile_accepts_names_that_only_exceed_utf8_limit(self):
+        name='辉'*23
+        try:live.encode_name(name,'mbcs')
+        except ValueError:self.skipTest('system code page cannot encode this Chinese fixture')
+        result=self.session.apply({'S_Glow':name})
+        self.assertEqual(result['applied']['S_Glow'],name)
+        self.assertEqual(self.process.memory[1016],live.encode_name(name,'mbcs'))
     def test_names_the_code_page_cannot_hold_are_skipped_and_named(self):
         result=self.session.apply({'S_Glow':'蓝宝石辉光™','tc Shine':'闪耀'},skip_missing=True)
         self.assertEqual(result['applied'],{'tc Shine':'闪耀'});self.assertEqual(self.process.memory[1016],live.encode_name('S_Glow'))

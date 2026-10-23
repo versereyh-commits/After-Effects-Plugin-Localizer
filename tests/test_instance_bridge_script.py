@@ -14,7 +14,8 @@ const comp=Object.assign(new CompItem(),{id:1,numLayers:1,layer:()=>layer});
 const app={version:'24.2.1x2',project:{file:{fsName:'test.aep'},numItems:1,item:()=>comp,renderQueue:{rendering:false}},beginUndoGroup:()=>events.push('begin'),endUndoGroup:()=>events.push('end')};
 let hash=2166136261;const source='test.aep|1';for(let j=0;j<source.length;j++){hash^=source.charCodeAt(j);hash+=(hash<<1)+(hash<<4)+(hash<<7)+(hash<<8)+(hash<<24);}
 const token=(hash>>>0).toString(16),request={action:q.catalog?'instanceCatalog':'instanceNames',requestId:'test',hostVersion:'24.2.1x2',projectToken:q.wrongProject?'wrong':token,permit:'permit',output:'out',expires:Date.now()+(q.expired?-1:60000),operations:[1,2].map(i=>({compId:1,layerIndex:1,layerId:q.noLayerId?null:10,layerName:'Solid',effectIndex:i,matchName:'CC Drizzle',before:i===2&&q.wrongName?'Custom':'CC Drizzle',after:'细雨'}))};
-vm.runInNewContext(q.template.replace('@@REQUEST@@',JSON.stringify(request)),{app,File,CompItem,ExternalObject:()=>{throw Error('must not load native module');}},{timeout:3000});
+request.targetHost={pid:3,creationTime:'0000000000000004',image:'C:/AE/AfterFX.exe'};request.identityHelper='identity';
+vm.runInNewContext(q.template.replace('@@REQUEST@@',JSON.stringify(request)),{app,File,CompItem,ExternalObject:function(){return {identity:()=>JSON.stringify(request.targetHost)};}},{timeout:3000});
 process.stdout.write(JSON.stringify({result:JSON.parse(files.out),names:effects.map(f=>f.name),values:effects.map(f=>f.value),events}));
 '''
 

@@ -8,7 +8,7 @@ loaded, of another build, or does not take a request within CLAIM_WAIT, callers 
 from __future__ import annotations
 import hashlib,json,os,shutil,time,uuid
 from pathlib import Path
-from runtime import asset_root
+from runtime import asset_root,write_json_atomic
 
 EXTENSION_ID='com.verse.aelocalizer.bridge'
 CLAIM_WAIT=3.0      # seconds the extension has to take a request before the relay is used
@@ -36,15 +36,29 @@ def bridge_id()->str|None:
 def _tree(folder:Path)->dict[str,str]:
     return {p.relative_to(folder).as_posix():hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(folder.rglob('*')) if p.is_file()}
 
-def heartbeat()->dict|None:
-    try:value=json.loads((root()/'heartbeat.json').read_text(encoding='utf-8'))
+def host_root(identity):
+    from host_identity import key
+    return root()/'hosts'/key(identity)
+
+def heartbeat(identity=None)->dict|None:
+    paths=(host_root(identity).glob('heartbeat*.json') if identity else (root()/'hosts').glob('*/heartbeat*.json'))
+    candidates=[]
+    for path in paths:
+        try:value=json.loads(path.read_text(encoding='utf-8'))
+        except (OSError,ValueError):continue
+        if isinstance(value,dict) and type(value.get('time')) in (int,float):candidates.append(value)
+    if candidates:return max(candidates,key=lambda v:v['time'])
+    try:value=json.loads(((host_root(identity) if identity else root())/'heartbeat.json').read_text(encoding='utf-8'))
     except (OSError,ValueError):return None
     return value if isinstance(value,dict) else None
 
-def connected()->bool:
+def connected(identity=None)->bool:
     """AE has this build's extension loaded and running right now."""
-    expected=bridge_id();beat=heartbeat()
+    expected=bridge_id();beat=heartbeat(identity)
     if not expected or not beat or beat.get('bridge')!=expected or not isinstance(beat.get('time'),(int,float)):return False
+    if identity is not None:
+        from host_identity import same
+        if not same(beat.get('identity'),identity):return False
     return abs(time.time()*1000-beat['time'])<FRESH*1000
 
 def status()->str:
@@ -62,6 +76,20 @@ def status()->str:
 # whatever its signature. The user chose to switch it on when installing, so the extension loads even where the
 # self-signed signature would not be accepted; removing the extension puts back only what this program changed.
 CSXS_VERSIONS=(10,11,12,13)    # CEP 10: AE 2021; 11: AE 2022-2024; 12: AE 2025-2026; 13: the next one
+
+def csxs_versions():
+    import winreg,re
+    found=set(CSXS_VERSIONS)
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,r'Software\Adobe') as key:
+            index=0
+            while True:
+                try:name=winreg.EnumKey(key,index)
+                except OSError:break
+                index+=1;match=re.fullmatch(r'CSXS\.(\d+)',name)
+                if match:found.add(int(match[1]))
+    except OSError:pass
+    return sorted(found)
 def _debug_record()->Path:return _appdata()/'AE-Localizer'/'debug-mode.json'
 def _registry_get(version:int)->str|None:
     import winreg
@@ -77,20 +105,23 @@ def _registry_set(version:int,value:str|None):
         else:winreg.SetValueEx(key,'PlayerDebugMode',0,winreg.REG_SZ,value)
 def _read_record()->dict:
     try:value=json.loads(_debug_record().read_text(encoding='utf-8'))
-    except (OSError,ValueError):return {}
-    return value if isinstance(value,dict) else {}
+    except FileNotFoundError:return {}
+    except (OSError,ValueError) as error:raise RuntimeError('扩展调试模式恢复记录无法读取，未修改注册表') from error
+    if not isinstance(value,dict):raise RuntimeError('扩展调试模式恢复记录格式不正确，未修改注册表')
+    return value
 
 def enable_debug_mode()->list[int]:
     """Switches the debug mode on for every CEP version AE uses; returns the versions changed. The value each had
     before (or that it had none) is kept, once, so remove() can put it back; ones already on are not recorded."""
     record=_read_record();changed=[]
-    for version in CSXS_VERSIONS:
+    for version in csxs_versions():
         before=_registry_get(version)
         if before=='1':continue
         record.setdefault(str(version),{'value':before})   # the first original wins over later reinstalls
-        _registry_set(version,'1');changed.append(version)
+        changed.append(version)
     if record:
-        _debug_record().parent.mkdir(parents=True,exist_ok=True);_debug_record().write_text(json.dumps(record),encoding='utf-8')
+        write_json_atomic(_debug_record(),record)
+    for version in changed:_registry_set(version,'1')
     return changed
 
 def restore_debug_mode()->list[int]:

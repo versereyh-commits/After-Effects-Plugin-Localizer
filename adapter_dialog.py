@@ -58,7 +58,7 @@ class AdapterAnalysisDialog(QDialog):
         self.restore_qa_btn=LoaderButton('取消验证并恢复原名','danger');self.restore_qa_btn.setEnabled(False);self.restore_qa_btn.clicked.connect(lambda:self.owner.run_with(self.restore_qa_btn,'rewind','恢复中',self.restore_validation))
         row.addWidget(self.finish_btn);row.addWidget(self.restore_qa_btn);row.addStretch();box.addLayout(row)
         # The same background extension as the settings page offers; installing it here does not depend on the steps above.
-        box=step(4,'AE 后台连接','装进 AE 的看不见的扩展，读写参数时直接在 AE 后台运行：不再另起一个 AE 进程，AE 窗口和焦点保持不变，'
+        box=step(4,'后台连接','装进 AE 的看不见的扩展，读写参数时直接在 AE 后台运行：不再另起一个 AE 进程，AE 窗口和焦点保持不变，'
                  '软件放在带空格的文件夹里也能正常读写。安装后重启一次 AE 生效；设置页也可安装或移除。',tag='推荐安装')
         row=QHBoxLayout();row.setSpacing(8)
         self.bridge_install=button('安装后台连接');self.bridge_install.clicked.connect(lambda:self.owner.install_bridge(self) and self.update_bridge())

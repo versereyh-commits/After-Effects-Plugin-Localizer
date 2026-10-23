@@ -9,6 +9,12 @@ import struct
 import winreg
 
 
+def readable_category(text:str)->str:
+    """A plug-in's category as AE shows it: some are Adobe localization keys, "$$$/AE/Effect/Category/3DChannel=3D Channel",
+    whose text after '=' is the default wording."""
+    if text.startswith('$$$/') and '=' in text:return text.split('=',1)[1].strip()
+    return text
+
 @dataclass
 class Plugin:
     path: str

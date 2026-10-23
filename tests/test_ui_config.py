@@ -12,21 +12,20 @@ import settings_store
 from app_live import CandidateStore
 
 class FakeUser32:
-    def __init__(self,closed=(),highlight=True):self.posts=[];self.closed=set(closed);self.highlight=highlight;self.selected=None;self.cursor=(0,0);self.mouse=[]
+    """Records posted messages. The real cursor and foreground must never be touched: those calls fail the test."""
+    def __init__(self,closed=(),highlight=True):self.posts=[];self.closed=set(closed);self.highlight=highlight;self.selected=None
     def PostMessageW(self,hwnd,message,wparam,lparam):self.posts.append((hwnd,message,wparam));return 1
-    def IsWindow(self,hwnd):return hwnd not in self.closed or not any(h==hwnd and m==0x101 for h,m,w in self.posts)
+    def IsWindow(self,hwnd):
+        if any(h==hwnd and m==0x101 and w==0x1b for h,m,w in self.posts):return False
+        return hwnd not in self.closed or not any(h==hwnd and m==0x101 for h,m,w in self.posts)
     def SendMessageTimeoutW(self,hwnd,message,wparam,lparam,flags,timeout,result):
         if message==0x1e5:self.selected=(hwnd,wparam)
         return 1
     def GetMenuState(self,menu,index,flags):return 0x80 if self.highlight and self.selected and self.selected[1]==index else 0
-    def GetForegroundWindow(self):return 1
-    def SetForegroundWindow(self,hwnd):return 1
-    def GetCursorPos(self,point):
-        target=ae_ui.C.cast(point,ae_ui.C.POINTER(ae_ui.W.POINT)).contents;target.x,target.y=self.cursor;return 1
-    def SetCursorPos(self,x,y):self.cursor=(x,y);return 1
-    def ClientToScreen(self,hwnd,point):return 1
-    def WindowFromPoint(self,point):return 5
-    def mouse_event(self,flag,*args):self.mouse.append(flag)
+    def ScreenToClient(self,hwnd,point):return 1
+    def __getattr__(self,name):
+        if name in ('SetCursorPos','mouse_event','SendInput','SetForegroundWindow'):raise AssertionError(name+' must not be used')
+        raise AttributeError(name)
 
 class ConfigTests(unittest.TestCase):
     def setUp(self):
@@ -93,88 +92,79 @@ class ConfigTests(unittest.TestCase):
         with patch.object(app_live,'read_live',side_effect=RuntimeError('请仅运行一个 AE 2026 进程')):
             self.assertEqual(app_live.with_live({'restored':{},'oldProcessEnded':True}),({'restored':{},'oldProcessEnded':True},None,'请仅运行一个 AE 2026 进程'))
 
+RIGHT_CLICK=[(0x200,0),(0x204,2),(0x205,0)]   # mouse move, right button down, up: messages to the tab's window
+
 class RefreshTests(unittest.TestCase):
-    def patch(self,user,locate,popups,refresh_popup=None):
+    def patch(self,user,tabs,popups,refresh_popup=None,rows=None):
+        """tabs: successive results of the tab lookup (lists of screen points); popups: successive menu lookups."""
         self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
-        if popups and popups[0] is None:popups.pop(0)
         query=refresh_popup or (lambda u,pid:popups.pop(0) if popups else None)
         native_popups=[0]
         def owned(u,pid):native_popups[0]+=1;return [] if native_popups[0]==1 else [9]
-        def adapt(hwnd,pid,u,deadline):
-            result=locate(hwnd,pid,u)
-            return result if isinstance(result,dict) else {'button':result,'header':None}
-        for target,value in [('main_window',lambda pid:1),('_user32',lambda:user),('_native_api',lambda u:None),('_native_windows',lambda *a:([],[])),('_owner',lambda u,h:1),('_identity',lambda *a:('test/AfterFX.exe',10)),('_diagnostic_path',lambda:Path(self.temp.name)/'diagnostic.json'),('_locate_menu_button',adapt),('_refresh_popup',query),('_popups',owned)]:
+        def inspect(hwnd,pid,u,deadline):
+            result=tabs.pop(0) if len(tabs)>1 else tabs[0]
+            return result() if callable(result) else result
+        rows=rows or [{'hwnd':5,'visible':True,'rect':(0,0,500,500)}]
+        for target,value in [('main_window',lambda pid:1),('_user32',lambda:user),('_native_api',lambda u:None),('_native_windows',lambda *a:(rows,[])),('_owner',lambda u,h:1),('_identity',lambda *a:('test/AfterFX.exe',10)),('_diagnostic_path',lambda:Path(self.temp.name)/'diagnostic.json'),('_inspect',inspect),('_hit_target',lambda *a:5),('_refresh_popup',query),('_popups',owned)]:
             handle=patch.object(ae_ui,target,value);handle.start();self.addCleanup(handle.stop)
-    def test_slow_locator_never_clicks_after_timeout(self):
-        user=FakeUser32();entered=threading.Event();done=threading.Event()
-        def slow(hwnd,pid,u):entered.set();time.sleep(.4);done.set();return 5,0
-        self.patch(user,slow,[])
-        with self.assertRaisesRegex(RuntimeError,'定位 AE 效果面板菜单超时'):ae_ui.refresh_effects(1,timeout=.1)
-        self.assertTrue(entered.is_set());self.assertTrue(done.wait(2));time.sleep(.1)
-        self.assertEqual(user.posts,[])
-    def test_locator_error_is_reported_without_clicks(self):
-        user=FakeUser32()
-        def missing(hwnd,pid,u):raise RuntimeError('请在 AE 中打开“效果和预设”面板，再应用名称')
-        self.patch(user,missing,[])
-        with self.assertRaisesRegex(RuntimeError,'效果和预设'):ae_ui.refresh_effects(1,timeout=1)
-        self.assertEqual(user.posts,[])
-    def test_refresh_selects_menu_item_once(self):
+    def test_refresh_opens_the_menu_by_messages_and_confirms_the_item(self):
         user=FakeUser32(closed={9})
-        self.patch(user,lambda hwnd,pid,u:(5,0),[None,(9,77,3,94)])
+        self.patch(user,[[(100,20)]],[None,(9,77,3,94)])
         result=ae_ui.refresh_effects(1,timeout=1)
         self.assertTrue(result['nativePaletteRefreshed']);self.assertEqual(result['commandId'],94);self.assertFalse(result['panelOpened'])
-        # Palette button is clicked; the menu item is chosen by position and Enter, never by a posted mouse click.
-        self.assertEqual(user.selected,(9,3))
-        self.assertEqual(user.mouse,[2,4]);self.assertEqual(user.posts,[(9,0x100,0x0d),(9,0x101,0x0d)])
+        self.assertEqual([(m,w) for h,m,w in user.posts if h==5],RIGHT_CLICK);self.assertEqual(user.selected,(9,3))
+        self.assertEqual([p for p in user.posts if p[0]==9],[(9,0x100,0x0d),(9,0x101,0x0d)])
     def test_unconfirmed_highlight_never_presses_enter(self):
         user=FakeUser32(highlight=False)
-        self.patch(user,lambda hwnd,pid,u:(5,0),[None,(9,77,3,94)])
+        self.patch(user,[[(100,20)]],[None,(9,77,3,94)])
         with self.assertRaisesRegex(RuntimeError,'未能选中'):ae_ui.refresh_effects(1,timeout=1)
         self.assertNotIn((9,0x100,0x0d),user.posts);self.assertIn((9,0x100,0x1b),user.posts)
-    def test_menu_found_after_deadline_is_not_clicked(self):
-        user=FakeUser32();calls=[]
-        def late(u,pid):
-            calls.append(1)
-            time.sleep(.3);return 9,77,3,94
-        self.patch(user,lambda hwnd,pid,u:(5,0),[],late)
-        with self.assertRaisesRegex(RuntimeError,'超时'):ae_ui.refresh_effects(1,timeout=.2)
+    def test_menu_without_refresh_is_dismissed_without_enter(self):
+        user=FakeUser32();self.patch(user,[[(100,20)]],[])
+        with self.assertRaisesRegex(RuntimeError,'未找到可用'):ae_ui.refresh_effects(1)
         self.assertNotIn((9,0x100,0x0d),user.posts);self.assertIn((9,0x100,0x1b),user.posts)
-    def test_unreadable_menu_stops_before_clicking(self):
+    def test_menu_found_after_deadline_is_not_chosen(self):
+        user=FakeUser32()
+        def late(u,pid):time.sleep(.3);return 9,77,3,94
+        self.patch(user,[[(100,20)]],[],late)
+        with self.assertRaisesRegex(RuntimeError,'超时'):ae_ui.refresh_effects(1,timeout=.2)
+        self.assertNotIn((9,0x100,0x0d),user.posts)
+    def test_unreadable_menu_stops_before_choosing(self):
         user=FakeUser32()
         def stalled(u,pid):raise RuntimeError('AE 菜单无响应，已停止操作')
-        self.patch(user,lambda hwnd,pid,u:(5,0),[],stalled)
+        self.patch(user,[[(100,20)]],[],stalled)
         with self.assertRaisesRegex(RuntimeError,'无响应'):ae_ui.refresh_effects(1,timeout=1)
         self.assertNotIn((9,0x100,0x0d),user.posts)
-
-    def test_closed_panel_is_opened_once_and_rediscovered(self):
-        user=FakeUser32(closed={9});states=[{'button':None,'header':None},{'button':(5,0),'header':None}]
-        self.patch(user,lambda *a:states.pop(0),[(9,77,3,94)])
+    def test_slow_tab_lookup_times_out_without_any_message(self):
+        user=FakeUser32();self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
+        entered=threading.Event();done=threading.Event()
+        def slow(hwnd,pid,u,deadline):entered.set();time.sleep(.4);done.set();return [(100,20)]
+        for target,value in [('main_window',lambda pid:1),('_user32',lambda:user),('_native_api',lambda u:None),('_owner',lambda u,h:1),('_identity',lambda *a:('test/AfterFX.exe',10)),('_diagnostic_path',lambda:Path(self.temp.name)/'d.json'),('_locate_tab',slow),('_popups',lambda u,pid:[]),('_native_windows',lambda *a:([],[]))]:
+            handle=patch.object(ae_ui,target,value);handle.start();self.addCleanup(handle.stop)
+        with self.assertRaisesRegex(RuntimeError,'超时'):ae_ui.refresh_effects(1,timeout=.1)
+        self.assertTrue(done.wait(2));self.assertEqual(user.posts,[])
+    def test_closed_panel_is_opened_with_the_window_command_once(self):
+        user=FakeUser32(closed={9});self.patch(user,[[],[(100,20)]],[(9,77,3,94)])
         with patch.object(ae_ui,'_panel_command',return_value={'checked':False,'command':1234}):result=ae_ui.refresh_effects(1,timeout=1)
         self.assertTrue(result['panelOpened']);self.assertEqual(user.posts.count((1,0x111,1234)),1)
-    def test_collapsed_panel_expands_without_toggling_window_command(self):
-        user=FakeUser32(closed={9});states=[{'button':None,'header':(5,2)},{'button':(5,0),'header':None}]
-        self.patch(user,lambda *a:states.pop(0),[(9,77,3,94)])
-        with patch.object(ae_ui,'_panel_command',return_value={'checked':True,'command':1234}):result=ae_ui.refresh_effects(1,timeout=1)
-        self.assertTrue(result['panelExpanded']);self.assertFalse(any(m==0x111 for _,m,_ in user.posts))
-    def test_checked_but_unidentified_panel_is_not_toggled_closed(self):
-        user=FakeUser32();self.patch(user,lambda *a:{'button':None,'header':None},[])
+    def test_open_panel_without_a_visible_tab_is_not_toggled(self):
+        user=FakeUser32();self.patch(user,[[]],[])
         with patch.object(ae_ui,'_panel_command',return_value={'checked':True,'command':1234}):
             with self.assertRaisesRegex(RuntimeError,'已打开'):ae_ui.refresh_effects(1)
         self.assertEqual(user.posts,[])
-    def test_mismatched_menu_is_dismissed_without_enter(self):
-        user=FakeUser32();self.patch(user,lambda *a:(5,0),[])
-        with self.assertRaisesRegex(RuntimeError,'未找到可用'):ae_ui.refresh_effects(1)
-        self.assertNotIn((9,0x100,0x0d),user.posts);self.assertIn((9,0x100,0x1b),user.posts)
-    def test_restarted_host_stops_before_any_input(self):
-        user=FakeUser32();self.patch(user,lambda *a:(5,0),[])
+    def test_two_tabs_stop_before_any_message(self):
+        user=FakeUser32();self.patch(user,[[(100,20),(300,20)]],[])
+        with self.assertRaisesRegex(RuntimeError,'多个'):ae_ui.refresh_effects(1)
+        self.assertEqual(user.posts,[])
+    def test_restarted_host_stops_before_any_message(self):
+        user=FakeUser32();self.patch(user,[[(100,20)]],[])
         with patch.object(ae_ui,'_identity',side_effect=[('test',10),RuntimeError('AE 已重新启动')]):
             with self.assertRaisesRegex(RuntimeError,'重新启动'):ae_ui.refresh_effects(1)
         self.assertEqual(user.posts,[])
-    def test_overlay_from_another_process_blocks_mouse_input(self):
-        user=FakeUser32();self.patch(user,lambda *a:(5,0),[])
-        with patch.object(user,'WindowFromPoint',return_value=99),patch.object(ae_ui,'_owner',side_effect=lambda u,h:2 if h==99 else 1):
-            with self.assertRaisesRegex(RuntimeError,'遮挡'):ae_ui.refresh_effects(1)
-        self.assertEqual(user.mouse,[])
+    def test_tab_window_is_the_smallest_visible_ae_window_under_the_point(self):
+        rows=[{'hwnd':1,'visible':True,'rect':(0,0,1000,1000)},{'hwnd':2,'visible':True,'rect':(50,0,400,40)},
+              {'hwnd':3,'visible':False,'rect':(90,10,110,30)},{'hwnd':4,'visible':True,'rect':(500,0,600,40)}]
+        self.assertEqual(ae_ui._panel_window(rows,(100,20)),2);self.assertIsNone(ae_ui._panel_window(rows,(2000,20)))
 
 class NativeDiscoveryTests(unittest.TestCase):
     def test_main_and_floating_windows_are_both_discovered(self):

@@ -18,12 +18,12 @@ class BridgeCase(unittest.TestCase):
         (self.base/'bridge.id').write_text('abc',encoding='ascii')
         # A fake HKCU: {version: PlayerDebugMode value}; a missing key is no value.
         self.registry={}
-        for target,value in (('_appdata',lambda:self.root/'appdata'),('bundled',lambda:self.base),('_registry_get',lambda version:self.registry.get(version)),
+        for target,value in (('_appdata',lambda:self.root/'appdata'),('bundled',lambda:self.base),('csxs_versions',lambda:list(cep_bridge.CSXS_VERSIONS)),('_registry_get',lambda version:self.registry.get(version)),
                              ('_registry_set',lambda version,value:self.registry.pop(version,None) if value is None else self.registry.__setitem__(version,value))):
             handle=patch.object(cep_bridge,target,value);handle.start();self.addCleanup(handle.stop)
     def beat(self,age=0.0,bridge='abc'):
         cep_bridge.root().mkdir(parents=True,exist_ok=True)
-        (cep_bridge.root()/'heartbeat.json').write_text(json.dumps({'time':(time.time()-age)*1000,'bridge':bridge,'host':'24.2.1'}),encoding='utf-8')
+        (cep_bridge.root()/'heartbeat.json').write_text(json.dumps({'time':(time.time()-age)*1000,'bridge':bridge,'host':'24.2.1','identity':{'pid':3,'creationTime':'0000000000000004','image':str(Path('AfterFX.exe').absolute()).replace('\\','/')}}),encoding='utf-8')
 
 class StatusTests(BridgeCase):
     def test_install_and_states(self):
@@ -57,6 +57,24 @@ class StatusTests(BridgeCase):
         self.registry.update({v:'1' for v in cep_bridge.CSXS_VERSIONS})
         cep_bridge.install(debug_mode=True);self.assertFalse(cep_bridge._debug_record().exists())
         cep_bridge.remove();self.assertEqual(self.registry,{v:'1' for v in cep_bridge.CSXS_VERSIONS})
+    def test_debug_record_is_saved_before_any_registry_write(self):
+        seen=[]
+        def set_value(version,value):
+            saved=json.loads(cep_bridge._debug_record().read_text(encoding='utf8'))
+            self.assertIn(str(version),saved);seen.append(version)
+        with patch.object(cep_bridge,'csxs_versions',return_value=[10,14]),patch.object(cep_bridge,'_registry_set',set_value):cep_bridge.enable_debug_mode()
+        self.assertEqual(seen,[10,14])
+    def test_record_failure_leaves_registry_unchanged(self):
+        with patch.object(cep_bridge,'write_json_atomic',side_effect=PermissionError()):
+            with self.assertRaises(PermissionError):cep_bridge.enable_debug_mode()
+        self.assertEqual(self.registry,{})
+    def test_existing_csxs_versions_are_discovered(self):
+        import winreg
+        # Override BridgeCase's test-only fixed list with the production function.
+        original=__import__('importlib').util.spec_from_file_location('_bridge_dynamic',cep_bridge.__file__)
+        module=__import__('importlib').util.module_from_spec(original);original.loader.exec_module(module)
+        with patch.object(winreg,'OpenKey') as key,patch.object(winreg,'EnumKey',side_effect=['CSXS.14','Other',OSError()]):
+            self.assertIn(14,module.csxs_versions())
     def test_account_folder_with_chinese_and_spaces(self):
         appdata=self.root/'用户 张三'/'AppData'/'Roaming'
         with patch.object(cep_bridge,'_appdata',lambda:appdata):
@@ -94,7 +112,7 @@ class ExtensionScriptTests(unittest.TestCase):
         out=subprocess.run(['node',str(mock),str(self.source)],capture_output=True,text=True,encoding='utf-8',timeout=30)
         self.assertEqual(out.returncode,0,out.stderr);result=json.loads(out.stdout)
         self.assertEqual(result['heartbeat']['host'],'24.2.1');self.assertTrue(result['claimed'])
-        script=result['scripts'][0];self.assertTrue(script.startswith('var request={"action":"codec"'))
+        script=result['scripts'][-1];self.assertTrue(script.startswith('var request={"action":"codec"'))
     @unittest.skipUnless(__import__('shutil').which('node'),'Node.js is not installed')
     def test_user_folder_with_chinese_and_spaces(self):
         # Many users' Windows account names are Chinese; CEP hands such paths over URL-encoded.
@@ -102,7 +120,7 @@ class ExtensionScriptTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='张三 的 ') as tmp:
             out=subprocess.run(['node',str(Path(__file__).parent/'cep_mock.cjs'),str(self.source)],capture_output=True,text=True,encoding='utf-8',timeout=30,env={**os.environ,'TEMP':tmp,'TMP':tmp})
         self.assertEqual(out.returncode,0,out.stderr);result=json.loads(out.stdout)
-        self.assertTrue(result['heartbeat']);self.assertTrue(result['claimed']);self.assertIn('张三 的 ',result['scripts'][0])
+        self.assertTrue(result['heartbeat']);self.assertTrue(result['claimed']);self.assertIn('张三 的 ',result['scripts'][-1])
 
 class FakeExtension(threading.Thread):
     """Claims requests the way cep/main.js does and answers them; `mode` decides how."""
@@ -111,20 +129,21 @@ class FakeExtension(threading.Thread):
     def run(self):
         time.sleep(self.delay)
         while not self.stop.is_set():
-            for folder in cep_bridge.root().glob('*'):
+            for request_file in cep_bridge.root().rglob('request.json'):
+                folder=request_file.parent
                 request=folder/'request.json'
                 if not request.exists() or self.mode=='ignore':continue
                 try:request.replace(folder/'claimed.json')
                 except OSError:continue
                 data=json.loads((folder/'claimed.json').read_text(encoding='ascii'));self.seen.append(data)
-                if self.mode=='answer':Path(data['output']).write_text(json.dumps({'changed':2,'requestId':data['requestId'],'action':data['action']}),encoding='utf-8')
+                if self.mode=='answer':Path(data['output']).write_text(json.dumps({'changed':2,'requestId':data['requestId'],'action':data['action'],'hostIdentity':data['targetHost']}),encoding='utf-8')
                 else:(folder/'bridge-error.json').write_text('{"error":"evalScript"}',encoding='utf-8')
             time.sleep(.02)
 
 class RunThroughBridgeTests(BridgeCase):
     def setUp(self):
         super().setUp()
-        assets=self.root/'assets';(assets/'native').mkdir(parents=True);(assets/'native'/'ae_parameters_v8.dll').touch();(assets/'scripts').mkdir()
+        assets=self.root/'assets';(assets/'native').mkdir(parents=True);(assets/'native'/'ae_parameters_v8.dll').touch();(assets/'native'/'ae_host_identity_v1.dll').touch();(assets/'scripts').mkdir()
         (assets/'scripts'/'parameter_bridge.jsx').write_text('var request=@@REQUEST@@,result=0;',encoding='utf8')
         self.launches=[];self.kept=[]
         test=self
@@ -135,32 +154,37 @@ class RunThroughBridgeTests(BridgeCase):
         def launch(args,**kwargs):
             self.launches.append(args);script=Path(args[-1])
             request=json.loads(script.read_text(encoding='ascii').split('var request=',1)[1].split(',result=',1)[0])
-            Path(request['output']).write_text('{"changed":1}',encoding='utf8');return SimpleNamespace(pid=8,poll=lambda:0)
+            Path(request['output']).write_text(json.dumps({'changed':1,'hostIdentity':request['targetHost'],'requestId':request['requestId'],'action':request['action']}),encoding='utf8');return SimpleNamespace(pid=8,poll=lambda:0)
         import ae_ui
         for target,attr,value in ((names,'asset_root',lambda:assets),(names,'bridge_root',lambda:self.root/'relay'),(names.subprocess,'Popen',launch),
                                   (names,'file_version',lambda path:'26.0.0.67'),(ae_ui,'WindowKeeper',Keeper)):
             handle=patch.object(target,attr,value);handle.start();self.addCleanup(handle.stop)
         self.p=SimpleNamespace(pid=3,image='AfterFX.exe',creation_time=4)
+    def beat(self,age=0.0,bridge='abc'):
+        super().beat(age,bridge)
+        from host_identity import target
+        directory=cep_bridge.host_root(target(self.p));directory.mkdir(parents=True,exist_ok=True)
+        (directory/'heartbeat.json').write_bytes((cep_bridge.root()/'heartbeat.json').read_bytes())
     def extension(self,**kwargs):
         ext=FakeExtension(**kwargs);ext.start();self.addCleanup(ext.join,2);self.addCleanup(ext.stop.set);return ext
     def test_connected_extension_runs_the_request_without_a_second_ae(self):
         self.beat();ext=self.extension()
         result=names.run_native(self.p,[{'after':'中文'}],action='labels')
         self.assertEqual(result['changed'],2);self.assertEqual(self.launches,[]);self.assertEqual(self.kept,[])   # no relay, no window keeping needed
-        request=ext.seen[0];folder=cep_bridge.root()/request['requestId']
+        request=ext.seen[0];folder=cep_bridge.host_root(request['targetHost'])/request['requestId']
         self.assertEqual(request['operations'],[{'after':'中文'}]);self.assertTrue(request['output'].startswith(folder.as_posix()+'/'))
         self.assertTrue(request['permit'].startswith(folder.as_posix()+'/'))
         self.assertFalse(folder.exists())                          # the request folder is cleaned up
     def test_not_connected_uses_the_relay(self):
         self.beat(age=cep_bridge.FRESH+5)
-        self.assertEqual(names.run_native(self.p,[],action='codec'),{'changed':1})
+        self.assertEqual(names.run_native(self.p,[],action='codec')['changed'],1)
         self.assertEqual(len(self.launches),1);self.assertEqual(self.kept,[3]);self.assertTrue(Path(self.launches[0][-1]).is_relative_to(self.root/'relay'))
     def test_request_not_taken_in_time_falls_back_to_the_relay(self):
         self.beat();self.extension(mode='ignore')
         with patch.object(cep_bridge,'CLAIM_WAIT',.2):result=names.run_native(self.p,[],action='codec')
-        self.assertEqual(result,{'changed':1});self.assertEqual(len(self.launches),1)
+        self.assertEqual(result['changed'],1);self.assertEqual(len(self.launches),1)
         # The same request ran once, through the relay, from its own folder.
-        self.assertEqual(Path(self.launches[0][-1]).parent.parent,cep_bridge.root());self.assertEqual(list(cep_bridge.root().glob('*/request.json')),[])
+        self.assertEqual(Path(self.launches[0][-1]).parent.parent,cep_bridge.host_root(__import__('host_identity').target(self.p)));self.assertEqual(list(cep_bridge.root().glob('*/request.json')),[])
     def test_claimed_at_the_last_moment_is_not_run_twice(self):
         self.beat();ext=self.extension(delay=.25)
         with patch.object(cep_bridge,'CLAIM_WAIT',.25),patch.object(cep_bridge,'withdraw',side_effect=lambda folder:False):
@@ -169,7 +193,7 @@ class RunThroughBridgeTests(BridgeCase):
     def test_ae_refusing_the_script_is_reported(self):
         self.beat();self.extension(mode='refuse')
         with self.assertRaisesRegex(cep_bridge.Rejected,'对话框'):names.run_native(self.p,[],action='codec')
-        self.assertEqual(self.launches,[]);self.assertEqual([p for p in cep_bridge.root().iterdir() if p.is_dir()],[])
+        self.assertEqual(self.launches,[]);self.assertEqual(list(cep_bridge.root().rglob('request.json')),[])
 
 from test_gui import GuiCase
 import app_live

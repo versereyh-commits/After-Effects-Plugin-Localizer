@@ -29,11 +29,67 @@ class ParameterTests(unittest.TestCase):
         for module,attribute,value in [(names,'_host_names',host_names),(names,'data_root',lambda:self.root),(names,'current_process',lambda:nullcontext(self.process)),(names,'_process_lock',lambda:nullcontext()),(names,'ParameterCatalog',lambda p:self.catalog),(names,'run_native',run),(runtime,'native_probe',lambda:{'processes':[{'pid':3}]})]:
             handle=patch.object(module,attribute,value);handle.start();self.addCleanup(handle.stop)
         self.session=names.ParameterSession()
+    # quick_search's fast path: the cached structure is used only while it holds every instance AE shows.
+    def fast_host(self,extra=()):
+        def host_names(p,strict=True):
+            result={}
+            for row in self.rows:
+                if not row.get('copy'):result.setdefault(row['id'],[]).append(row['name'])
+            for name in extra:result.setdefault(self.key,[]).append(name)
+            return result
+        return patch.object(names,'_host_names',host_names)
+    def test_fast_apply_writes_from_the_cache_and_trusts_its_shape(self):
+        names._shape_context.pop((3,4),None)
+        with self.fast_host():result=self.session.apply({self.key:'滴落率'},fast=True)
+        self.assertEqual(result['changed'],2);self.assertEqual({r['name'] for r in self.rows},{'滴落率'});self.assertIn((3,4),names._shape_context)
+    def test_fast_apply_with_fewer_cached_instances_than_ae_shows_writes_nothing(self):
+        with self.fast_host(extra=['Drip Rate']):
+            with self.assertRaises(names.FastMiss) as miss:self.session.apply({self.key:'滴落率'},fast=True)
+        self.assertEqual(self.calls,[]);self.assertFalse(miss.exception.scanned)   # the cache was used, no scan yet
+    def test_fast_apply_reads_back_and_reports_an_instance_left_over(self):
+        self.rows[1]['copy']=True    # memory holds a copy, so the count passes, but AE also shows an instance not in the cache
+        with self.fast_host(extra=['Drip Rate']):
+            with self.assertRaises(names.FastMiss):self.session.apply({self.key:'滴落率'},fast=True)
+        self.assertEqual(len(self.calls),1);self.assertIn(self.key,self.session.journal()['entries'])   # the record stays for restoring
     def test_apply_restore_preserves_values_and_internal_ids(self):
         before=copy.deepcopy(self.rows);result=self.session.apply({self.key:'滴落率'})
         self.assertEqual(result,{'changed':2,'parameters':1});self.assertEqual({r['value'] for r in self.rows},{1})
         self.assertEqual(self.session.restore(),{'restored':1,'pending':0});self.assertEqual(self.rows,before)
         self.assertEqual(self.session.journal()['entries'],{})
+    def test_fast_results_and_misses_say_whether_and_how_they_scanned(self):
+        def rows(**kw):
+            if kw.get('rescan'):self.catalog.timings={'scanCount':1,'scanTarget':'heap'}
+            return copy.deepcopy(self.rows)
+        self.catalog.rows=rows;self.catalog.timings={'scanCount':0}
+        with self.fast_host():result=self.session.apply({self.key:'滴落率'},fast=True,rescan=True)
+        self.assertEqual((result['scanned'],result['scanTarget']),(True,'heap'))
+        with self.fast_host(extra=['滴落率']):
+            with self.assertRaises(names.FastMiss) as miss:self.session.apply({self.key:'强度'},fast=True,rescan=True)
+        self.assertTrue(miss.exception.scanned)
+    def heap_kind(self,kind):
+        handle=patch.dict(names._scan_kind,{(3,4):kind});handle.start();self.addCleanup(handle.stop)
+        handle=patch.dict(names._cache,{(3,4):{1}});handle.start();self.addCleanup(handle.stop)
+    def test_page_write_from_the_heap_says_so(self):
+        self.heap_kind('heap');seen=[];self.catalog.rows=lambda **kw:seen.append(kw.get('full'))or copy.deepcopy(self.rows)
+        result=self.session.apply({self.key:'滴落率'},full=False);self.assertEqual(seen,[False]);self.assertTrue(result['heapOnly'])
+    def complete_with(self,missed):
+        self.heap_kind('heap');roots=[]
+        def scan(full=False):roots.append(full);self.catalog.timings={'scanMs':3000,'scanHeapMissed':missed};names._scan_kind[(3,4)]='full'
+        self.catalog.roots=scan
+        with patch.object(names,'record_read_timing') as record:result=self.session.complete({self.key:'滴落率'})
+        self.assertEqual(roots,[True]);self.assertEqual(record.call_args.args[0]['scanHeapMissed'],missed);return result
+    def test_complete_writes_nothing_when_the_heap_held_everything(self):
+        self.assertEqual(self.complete_with(0),{'missed':0,'checked':True});self.assertEqual(self.calls,[])
+    def test_complete_writes_again_when_the_full_scan_found_more(self):
+        result=self.complete_with(1);self.assertEqual((result['missed'],result['changed']),(1,2));self.assertEqual({r['name'] for r in self.rows},{'滴落率'})
+    def test_complete_has_nothing_to_do_after_a_full_structure(self):
+        self.heap_kind('full');self.catalog.roots=lambda **kw:self.fail('no scan')
+        self.assertEqual(self.session.complete({self.key:'滴落率'}),{'missed':0,'checked':False})
+    def test_writes_and_restores_need_a_full_scan_but_fast_writes_may_use_the_heap(self):
+        seen=[];self.catalog.rows=lambda **kw:seen.append(kw.get('full'))or copy.deepcopy(self.rows)
+        self.session.apply({self.key:'滴落率'});self.session.restore()
+        with self.fast_host():self.session.apply({self.key:'滴落率'},fast=True)
+        self.assertEqual(seen,[True,True,False])
     def test_legacy_encoding_names_the_parameter_and_character(self):
         self.catalog.profile=SimpleNamespace(encoding='mbcs')
         with patch.object(runtime,'data_root',lambda:self.root),patch.object(runtime,'code_page',lambda:936):
@@ -149,17 +205,17 @@ class TransportTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,'工程身份'):names._host_names(process)
     def test_ascii_request_unicode_data_and_cleanup(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root=Path(tmp);(root/'native').mkdir();(root/'native'/'ae_parameters_v8.dll').touch();(root/'scripts').mkdir()
+            root=Path(tmp);(root/'native').mkdir();(root/'native'/'ae_parameters_v8.dll').touch();(root/'native'/'ae_host_identity_v1.dll').touch();(root/'scripts').mkdir()
             (root/'scripts'/'parameter_bridge.jsx').write_text((Path(names.__file__).parent/'scripts'/'parameter_bridge.jsx').read_text(encoding='utf8'),encoding='utf8')
             captured=[]
             def launch(args,**kwargs):
                 path=Path(args[-1]);raw=path.read_bytes();self.assertFalse(raw.startswith(b'\xef\xbb\xbf'));source=raw.decode('ascii')
                 request=json.loads(source.split('var request=',1)[1].split(',result=',1)[0]);captured.append(request)
-                Path(request['output']).write_text('{"changed":1}',encoding='utf8')
+                Path(request['output']).write_text(json.dumps({'changed':1,'hostIdentity':request['targetHost'],'requestId':request['requestId'],'action':request['action']}),encoding='utf8')
                 return SimpleNamespace(pid=8,poll=lambda:0,terminate=lambda:self.fail('completed relay terminated'))
             with patch.object(names,'asset_root',lambda:root),patch.object(names,'bridge_root',lambda:root/'ipc'),patch.object(names.subprocess,'Popen',launch),patch.object(names,'file_version',return_value='26.0.0.67'),patch.object(cep_bridge,'_appdata',lambda:root/'appdata'):
-                result=names.run_native(SimpleNamespace(pid=3,image='AfterFX.exe'),[{'after':'中文"\\\u2028'}])
-            self.assertEqual(result,{'changed':1});self.assertEqual(captured[0]['operations'][0]['after'],'中文"\\\u2028');self.assertEqual(list((root/'ipc').iterdir()),[])
+                result=names.run_native(SimpleNamespace(pid=3,image='AfterFX.exe',creation_time=4),[{'after':'中文"\\\u2028'}])
+            self.assertEqual(result['changed'],1);self.assertEqual(captured[0]['operations'][0]['after'],'中文"\\\u2028');self.assertEqual(list((root/'ipc').iterdir()),[])
     def test_ae_window_state_is_kept_around_the_hand_over(self):
         import ae_ui
         events=[]
@@ -168,13 +224,13 @@ class TransportTests(unittest.TestCase):
             def check(self):events.append('check')
             def settle(self):events.append('settle')
         with tempfile.TemporaryDirectory() as tmp:
-            root=Path(tmp);(root/'native').mkdir();(root/'native'/'ae_parameters_v8.dll').touch();(root/'scripts').mkdir()
+            root=Path(tmp);(root/'native').mkdir();(root/'native'/'ae_parameters_v8.dll').touch();(root/'native'/'ae_host_identity_v1.dll').touch();(root/'scripts').mkdir()
             (root/'scripts'/'parameter_bridge.jsx').write_text('var request=@@REQUEST@@,result=0;',encoding='utf8')
             def launch(args,**kwargs):
                 events.append('launch');request=json.loads(Path(args[-1]).read_text(encoding='ascii').split('var request=',1)[1].split(',result=',1)[0])
-                Path(request['output']).write_text('{}',encoding='utf8');return SimpleNamespace(pid=8,poll=lambda:0)
+                Path(request['output']).write_text(json.dumps({'hostIdentity':request['targetHost'],'requestId':request['requestId'],'action':request['action']}),encoding='utf8');return SimpleNamespace(pid=8,poll=lambda:0)
             with patch.object(names,'asset_root',lambda:root),patch.object(names,'bridge_root',lambda:root/'ipc'),patch.object(names.subprocess,'Popen',launch),                 patch.object(names,'file_version',return_value='26.0.0.67'),patch.object(ae_ui,'WindowKeeper',Keeper),patch.object(cep_bridge,'_appdata',lambda:root/'appdata'):
-                names.run_native(SimpleNamespace(pid=3,image='AfterFX.exe'),[])
+                names.run_native(SimpleNamespace(pid=3,image='AfterFX.exe',creation_time=4),[])
         # Read before the hand-over, watched while waiting, settled after the relay is done.
         self.assertEqual(events,[('keep',3),'launch','check','settle'])
 
@@ -183,7 +239,7 @@ class TimeoutDiagnosticTests(unittest.TestCase):
     def run_timeout(self,poll=lambda:0,enter=False,mismatch='',bridge=False,native=None):
         import ae_ui,win_process
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup);root=Path(self.tmp.name)
-        (root/'native').mkdir();(root/'native'/'ae_parameters_v8.dll').touch();(root/'scripts').mkdir()
+        (root/'native').mkdir();(root/'native'/'ae_parameters_v8.dll').touch();(root/'native'/'ae_host_identity_v1.dll').touch();(root/'scripts').mkdir()
         (root/'scripts'/'parameter_bridge.jsx').write_text('var request=@@REQUEST@@,result=0;',encoding='utf8')
         stopped=[]
         (root/'temp').mkdir()
@@ -201,10 +257,14 @@ class TimeoutDiagnosticTests(unittest.TestCase):
                  patch.object(cep_bridge,'connected',return_value=bridge),patch.object(cep_bridge,'withdraw',return_value=False),patch.object(cep_bridge,'CLAIM_WAIT',.05),
                  patch.dict(os.environ,{'TEMP':str(root/'temp')})]
         for handle in patches:handle.start();self.addCleanup(handle.stop)
-        with self.assertRaises(TimeoutError) as caught:names.run_native(SimpleNamespace(pid=3,image='AfterFX.exe'),[],timeout=.3,action='selection',scope='selected')
+        with self.assertRaises(TimeoutError) as caught:names.run_native(SimpleNamespace(pid=3,image='AfterFX.exe',creation_time=4),[],timeout=.3,action='selection',scope='selected')
         message=str(caught.exception);path=Path(message.split('诊断记录：',1)[1]);details=json.loads(path.read_text(encoding='utf-8'))
         self.assertNotIn(self.tmp.name,json.dumps(details,ensure_ascii=False))
         return message,details,stopped
+    def test_locked_cleanup_does_not_hide_timeout_diagnostic(self):
+        with patch.object(Path,'unlink',side_effect=PermissionError()):
+            message,details,_=self.run_timeout()
+        self.assertIn('诊断记录',message);self.assertEqual(details['kind'],'parameter-timeout')
     def test_ae_never_ran_the_relayed_script(self):
         message,details,_=self.run_timeout()
         self.assertIn('AE 没有执行转交的脚本（转交进程已退出，退出码 0）',message);self.assertIn('允许脚本写入文件和访问网络',message)
@@ -263,7 +323,7 @@ class TimeoutDiagnosticTests(unittest.TestCase):
     def test_the_bridge_script_marks_each_step(self):
         source=(Path(names.__file__).parent/'scripts'/'parameter_bridge.jsx').read_text(encoding='utf8')
         marked=set(re.findall(r"stage\('(\w+)'\)",source))
-        self.assertEqual(marked,set(names.STAGES)-{'1'});self.assertLess(source.index("stage('loadHelper')"),source.index('new ExternalObject'))
+        self.assertEqual(marked,set(names.STAGES)-{'1'});self.assertLess(source.index("stage('loadHelper')"),source.index('lib=new ExternalObject'))
     def test_different_administrator_rights_are_named(self):
         message,_,_=self.run_timeout(mismatch='AE 与本程序的管理员权限不同')
         self.assertIn('AE 没有执行脚本：AE 与本程序的管理员权限不同',message)
@@ -305,13 +365,13 @@ class RelayPathTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,'不含空格的文件夹.*后台连接'):runtime.relay_script(folder)
     def test_run_native_hands_over_a_path_without_spaces_and_removes_it(self):
         import ae_ui
-        assets=self.root/'assets';(assets/'native').mkdir(parents=True);(assets/'native'/'ae_parameters_v8.dll').touch();(assets/'scripts').mkdir()
+        assets=self.root/'assets';(assets/'native').mkdir(parents=True);(assets/'native'/'ae_parameters_v8.dll').touch();(assets/'native'/'ae_host_identity_v1.dll').touch();(assets/'scripts').mkdir()
         (assets/'scripts'/'parameter_bridge.jsx').write_text('var request=@@REQUEST@@,result=0;',encoding='utf8')
         handed=[]
         def launch(args,**kwargs):
             path=Path(args[-1]);handed.append(path);self.assertNotIn(' ',str(path))
             request=json.loads(path.read_text(encoding='ascii').split('var request=',1)[1].split(',result=',1)[0])
-            self.assertIn('ae O.o  2026',request['output']);Path(request['output']).write_text('{"changed":0}',encoding='utf8')
+            self.assertIn('ae O.o  2026',request['output']);Path(request['output']).write_text(json.dumps({'changed':0,'hostIdentity':request['targetHost'],'requestId':request['requestId'],'action':request['action']}),encoding='utf8')
             return SimpleNamespace(pid=8,poll=lambda:0)
         class Keeper:
             def __init__(self,pid):pass
@@ -320,7 +380,7 @@ class RelayPathTests(unittest.TestCase):
         with patch.object(names,'asset_root',lambda:assets),patch.object(names,'bridge_root',lambda:self.root/'ae O.o  2026'/'ae-bridge'),patch.object(names.subprocess,'Popen',launch),\
              patch.object(names,'file_version',return_value='26.0.0.67'),patch.object(ae_ui,'WindowKeeper',Keeper),patch.object(cep_bridge,'_appdata',lambda:self.root/'appdata'),\
              patch.object(runtime,'short_path',lambda p:str(p)),patch.object(runtime,'data_root',lambda:self.root/'data'):
-            self.assertEqual(names.run_native(SimpleNamespace(pid=3,image='AfterFX.exe'),[]),{'changed':0})
+            self.assertEqual(names.run_native(SimpleNamespace(pid=3,image='AfterFX.exe',creation_time=4),[])['changed'],0)
         self.assertEqual(handed[0].parent,self.root/'data'/'relay');self.assertFalse(handed[0].exists())
         self.assertEqual(list((self.root/'ae O.o  2026'/'ae-bridge').iterdir()),[])
 

@@ -58,9 +58,18 @@ class BilingualNameTests(unittest.TestCase):
     def test_pairs_english_with_chinese_when_it_fits(self):
         self.assertEqual(bilingual_name('Gaussian Blur','高斯模糊'),'Gaussian Blur (高斯模糊)')
         self.assertEqual(bilingual_name(' CC Bender ',' CC 弯曲 '),'CC Bender (CC 弯曲)')
-    def test_falls_back_to_chinese(self):
+    def test_long_names_shorten_the_english(self):
+        # AE's name field holds 47 bytes; the Chinese stays whole and the English gives way.
         long_english='Very Long Third Party Effect Name'
-        self.assertEqual(bilingual_name(long_english,'很长的第三方效果名称'),'很长的第三方效果名称')
+        both=bilingual_name(long_english,'很长的第三方效果名称')
+        self.assertEqual(both,'Very Long T… (很长的第三方效果名称)');self.assertEqual(len(both.encode('utf8')),47)
+        self.assertEqual(bilingual_name('Sapphire Glow Dissolve Extra','蓝宝石辉光溶解'),'Sapphire Glow Dissol… (蓝宝石辉光溶解)')
+        self.assertEqual(bilingual_name('Sapphire Glow Dissolve: Extra','辉光溶解一二三四五'),'Sapphire Glow… (辉光溶解一二三四五)')   # no dangling space or colon
+        for english,chinese in (('Lumetri Color Grading Panel Extended','颜色'),('A'*60,'中'*12),('Glow Dissolve Pro','一二三四五六七八九十')):
+            self.assertLessEqual(len(bilingual_name(english,chinese).encode('utf8')),47,english)
+    def test_falls_back_to_chinese(self):
+        # Less than three letters of English would be left: the Chinese alone.
+        self.assertEqual(bilingual_name('Long Effect Name','一二三四五六七八九十十一十二'),'一二三四五六七八九十十一十二')
         self.assertEqual(bilingual_name('Glow','glow 辉光'),'glow 辉光')
         self.assertEqual(bilingual_name('','辉光'),'辉光');self.assertEqual(bilingual_name('Glow',''),'')
         self.assertLessEqual(len(bilingual_name('Lumetri Color','Lumetri 颜色').encode('utf8')),47)
