@@ -75,7 +75,7 @@ def status()->str:
 # Adobe's extension debug mode (HKCU\Software\Adobe\CSXS.<n>\PlayerDebugMode = "1") makes AE load an extension
 # whatever its signature. The user chose to switch it on when installing, so the extension loads even where the
 # self-signed signature would not be accepted; removing the extension puts back only what this program changed.
-CSXS_VERSIONS=(10,11,12,13)    # CEP 10: AE 2021; 11: AE 2022-2024; 12: AE 2025-2026; 13: the next one
+CSXS_VERSIONS=(8,9,10,11,12,13)    # CEP 8: AE 2018; 9: AE 2019-2020; 10: AE 2021; 11: AE 2022-2024; 12: AE 2025-2026; 13: the next one
 
 def csxs_versions():
     import winreg,re

@@ -6,13 +6,8 @@ running registry must independently match the scripting catalog before use.
 from pathlib import Path
 import hashlib,struct
 import capstone
-from adapter_analysis import ModuleTools
-from ae_profiles import Profile,nameless
-
-def unique(values,label):
-    values=set(values)
-    if len(values)!=1:raise ValueError(label+'未找到唯一证据')
-    return values.pop()
+from adapter_analysis import ModuleTools,unique
+from ae_profiles import Profile,nameless,fc_fields,fc_size,fc_object,catalog_addresses
 
 class Resolver(ModuleTools):
     def symbol(self,module,prefix,suffix=None):
@@ -27,30 +22,15 @@ class Resolver(ModuleTools):
     def writable(self,module,rva):
         section=self.module(module)['pe'].get_section_by_rva(rva)
         return bool(section and section.Characteristics&0x80000000)
-    def primary_vtable(self,typename):
-        pe=self.module('FLT.dll')['pe'];image=pe.get_memory_mapped_image();result=[];at=0;needle=typename.encode()+b'\0'
-        while True:
-            at=image.find(needle,at)
-            if at<0:break
-            descriptor=at-16;at+=1;start=0
-            while True:
-                found=image.find(struct.pack('<I',descriptor),start)
-                if found<0:break
-                start=found+1;col=found-12
-                if col<0 or col+24>len(image):continue
-                signature,offset,_,_,_,self_rva=struct.unpack_from('<IIIIII',image,col)
-                if signature!=1 or offset!=0 or self_rva!=col:continue
-                ref=struct.pack('<Q',pe.OPTIONAL_HEADER.ImageBase+col);position=0
-                while True:
-                    position=image.find(ref,position)
-                    if position<0:break
-                    vt=position+8;position+=1
-                    section=pe.get_section_by_rva(vt)
-                    if vt%8 or not section or section.Characteristics&0x80000000:continue
-                    function=struct.unpack_from('<Q',image,vt)[0]-pe.OPTIONAL_HEADER.ImageBase
-                    function_section=pe.get_section_by_rva(function)
-                    if function_section and function_section.Characteristics&0x20000000:result.append(vt)
-        return unique(result,typename+'主虚表')
+    def primary_vtable(self,typename):return unique(self.vtables('FLT.dll',typename),typename+'主虚表')
+    def registry_list(self)->bool:
+        """Whether the catalog is AE 2018's LIST.dll list of inline objects: its by-ID lookup then returns the object
+        itself (FLT_FCSpec*, through LIST_GetAddress); later builds return a shared_ptr held in a vector."""
+        names={'?FLTp_GetFCAddress@@YAPEAVFLT_FCSpec@@F@Z':True,'?FLTp_GetFCAddress@@YA?AV?$shared_ptr@VFLT_FCSpec@@@boost@@F@Z':False}
+        symbols=getattr(getattr(self.module('FLT.dll')['pe'],'DIRECTORY_ENTRY_EXPORT',None),'symbols',[])
+        found={names[n] for n in (s.name.decode('ascii','replace') for s in symbols if s.name and not s.forwarder) if n in names}
+        if len(found)!=1:raise ValueError('效果目录容器未找到唯一证据')
+        return found.pop()
     def manager(self):
         # The integer-ID overload obtains the registry manager through a tiny
         # getter. Do not mistake unrelated security-cookie RIP references for it.
@@ -69,7 +49,8 @@ class Resolver(ModuleTools):
                 if self.writable('FLT.dll',rva):result.append(rva)
         return unique(result,'效果目录管理器')
     def match_pool(self):
-        start=self.symbol('TDB.dll','?GetName@TDB_MatchName@@',suffix='QEBAPEBEXZ');seen=set();result=[]
+        # const unsigned char* since AE 2019; const char* in AE 2018.
+        start=self.symbol('TDB.dll','?GetName@TDB_MatchName@@',suffix=('QEBAPEBEXZ','QEBAPEBDXZ'));seen=set();result=[]
         def walk(rva,depth):
             if depth>2 or rva in seen:return
             seen.add(rva)
@@ -119,11 +100,16 @@ class Resolver(ModuleTools):
         fields={e['field']:e['value'] for e in self.getters()}
         missing=[k for k in ('name_get','match_get','category_get','parent_get','stream_match_get','count_get','display_get','group_vector') if k not in fields]
         if missing:raise ValueError('未找到唯一的名称接口：'+'、'.join(missing))
-        for field,value in (('name_offset',16),('match_offset',64),('category_offset',96),('parent_offset',32),('guid_offset',8)):
-            if fields.get(field)!=value:raise ValueError('当前名称字段族不匹配：'+field)
+        # The three name fields keep their sizes (48, 32, 64 bytes); only where they start may differ (AE 2018: +4).
+        name=fields.get('name_offset')
+        for field,value in (('name_offset',name if type(name) is int and 8<=name<=64 else None),('match_offset',(name or 0)+48),('category_offset',(name or 0)+80),('parent_offset',32),('guid_offset',8)):
+            if value is None or fields.get(field)!=value:raise ValueError('当前名称字段族不匹配：'+field)
+        fc_vtable,fc_tag,fc_tail=self.fc_layout(name)
         count=fields['count_get'];raw=self.span('TDB.dll',count,19,code=True)
         if raw.startswith(bytes.fromhex('488b81')):
             if raw[7:10]!=bytes.fromhex('482b81') or raw[14:19]!=bytes.fromhex('48c1f803c3'):raise ValueError('命名参数向量指令不匹配')
+            # The same vector as the indexed group's (what the native helper compares the getter with).
+            if struct.unpack_from('<I',raw,3)[0]!=fields['group_vector']+8 or struct.unpack_from('<I',raw,10)[0]!=fields['group_vector']:raise ValueError('命名参数向量位置不匹配')
             named=True;tree=False;count_bytes=raw[:14];named_map=fields['group_vector']+8
         elif raw[:2]==bytes.fromhex('8b81') and raw[6]==0xc3:
             named=False;count_bytes=raw[:7];named_map=struct.unpack_from('<I',raw,2)[0]-8
@@ -141,11 +127,44 @@ class Resolver(ModuleTools):
         codec=self.exe.parent/'U.dll'
         if codec.is_symlink() or not codec.is_file():raise ValueError('名称编码模块缺失或是链接')
         return Profile(version=self.version,host_version=host_version,flt_sha=self.modules['FLT.dll']['sha256'],tdb_sha=self.modules['TDB.dll']['sha256'],
-            manager=self.manager(),registry_vector=0,fc_vtable=self.primary_vtable('.?AVFLT_FCSpec@@'),root_vtable=self.primary_vtable('.?AVFLT_FCSeqSpec@@'),
+            manager=self.manager(),registry_vector=0,fc_vtable=fc_vtable,root_vtable=self.primary_vtable('.?AVFLT_FCSeqSpec@@'),
             name_get=fields['name_get'],match_get=fields['match_get'],category_get=fields['category_get'],parent_get=fields['parent_get'],stream_match_get=fields['stream_match_get'],
             count_get=count,count_bytes=count_bytes,display_get=fields['display_get'],match_pool=self.match_pool(),display_cache=self.display_cache(fields['display_get']),group_vector=fields['group_vector'],
             named_vector=named,named_map=named_map,codec_sha=hashlib.sha256(codec.read_bytes()).hexdigest(),native_dynamic=True,enabled=False,
-            named_tree=tree)
+            named_tree=tree,name_base=name,fc_tag=fc_tag,fc_tail=fc_tail,registry_list=self.registry_list())
+    def fc_layout(self,name):
+        """How a catalog object is recognised as an FLT_FCSpec: (vtable, tag, tail). AE 2019 and later give the class
+        a vtable (+0, display name at +16). AE 2018's has none -- no RTTI, a non-virtual destructor -- and its
+        default constructor writes one tag word at +0 and again after the names, and zeroes each name field."""
+        if self.vtables('FLT.dll','.?AVFLT_FCSpec@@'):
+            if name!=16:raise ValueError('当前名称字段族不匹配：name_offset')
+            return self.primary_vtable('.?AVFLT_FCSpec@@'),0,0
+        self.symbol('FLT.dll','??1FLT_FCSpec@@QEAA@XZ')   # non-virtual destructor, or this is no known family
+        regs={};words={};zeroed=set()
+        for ins in self.instructions('FLT.dll',self.symbol('FLT.dll','??0FLT_FCSpec@@QEAA@XZ'),1024):
+            ops=ins.operands
+            if len(ops)!=2:continue
+            if ops[0].type==capstone.CS_OP_REG:
+                reg=_family(ins.reg_name(ops[0].reg))
+                if ins.mnemonic=='mov' and ops[1].type==capstone.CS_OP_IMM:regs[reg]=ops[1].imm
+                elif ins.mnemonic=='xor' and ops[1].type==capstone.CS_OP_REG and ops[0].reg==ops[1].reg:regs[reg]=0
+                else:regs.pop(reg,None)
+            elif ins.mnemonic=='mov' and ops[0].type==capstone.CS_OP_MEM and ins.reg_name(ops[0].mem.base)=='rcx' and not ops[0].mem.index and ops[1].type==capstone.CS_OP_REG:
+                value=regs.get(_family(ins.reg_name(ops[1].reg)))
+                if value is None:continue
+                if ops[0].size==2 and value:words.setdefault(value&0xffff,set()).add(ops[0].mem.disp)
+                if ops[0].size==1 and value==0:zeroed.add(ops[0].mem.disp)
+        tags=[(tag,places) for tag,places in words.items() if 0 in places and len(places)==2]
+        if len(tags)!=1 or not {name,name+48,name+80}<=zeroed:raise ValueError('效果对象类型标记未找到唯一证据')
+        tag,places=tags[0];tail=max(places)
+        if tail<name+144 or tail>0x400:raise ValueError('效果对象类型标记位置不合理（%#x）'%tail)
+        return 0,tag,tail
+
+def _family(reg:str)->str:
+    """The 64-bit register a capstone register name is part of (eax, ax, al -> rax; r8d, r8w -> r8)."""
+    if reg.startswith('r') and reg[1:2].isdigit():return reg.rstrip('dwb')
+    return {'al':'rax','ax':'rax','eax':'rax','bl':'rbx','bx':'rbx','ebx':'rbx','cl':'rcx','cx':'rcx','ecx':'rcx','dl':'rdx','dx':'rdx','edx':'rdx',
+            'sil':'rsi','si':'rsi','esi':'rsi','dil':'rdi','di':'rdi','edi':'rdi','bpl':'rbp','bp':'rbp','ebp':'rbp'}.get(reg,reg)
 
 def _readings(raw:bytes,encoding:str)->set[str]:
     """How AE's scripting may report a name field: in the build's encoding, or — only for bytes that encoding
@@ -158,6 +177,27 @@ def _readings(raw:bytes,encoding:str)->set[str]:
     try:found.add(raw.decode('cp1252'))
     except UnicodeDecodeError:pass
     return found
+
+# AE 2020 (17.5) hands its byte names to scripting without decoding them: each byte becomes one UTF-16 unit as a
+# signed char, so a byte b >= 0x80 arrives as U+FF00+b (GBK 声道 C9 F9 B5 C0 -> U+FFC9 U+FFF9 U+FFB5 U+FFC0).
+# Lossless, and only U+FF80..U+FFFF can be such a byte.
+SIGNED=0xff00
+def _signed(raw:bytes)->str:return ''.join(chr(b) if b<0x80 else chr(SIGNED+b) for b in raw)
+def _signed_bytes(text:str)->bytes|None:
+    """The bytes behind a name in that form, or None when it is not one (any other character, or no high byte)."""
+    if not any(ord(c)>=0xff80 for c in text) or any(0x80<=ord(c)<0xff80 for c in text):return None
+    return bytes(ord(c)-SIGNED if ord(c)>=0xff80 else ord(c) for c in text)
+def host_text(text:str,encoding:str)->str:
+    """A name AE's scripting reported, as text: AE 2020's byte form decoded in the build's encoding (strictly; bytes
+    it cannot read leave the text as reported). Only builds keeping names in the system code page do this; UTF-8
+    builds' names (which may hold real halfwidth forms, U+FF61..) come back unchanged."""
+    raw=_signed_bytes(text) if isinstance(text,str) and encoding=='mbcs' else None
+    if raw is None:return text
+    try:return raw.decode(encoding)
+    except (UnicodeDecodeError,LookupError):return text
+def _host_forms(raw:bytes,encoding:str)->set[str]:
+    """The strings AE's scripting may report for these bytes: _readings, or AE 2020's form of the same bytes."""
+    raw=raw.split(b'\0',1)[0];return _readings(raw,encoding)|{_signed(raw)}
 
 class CatalogMismatch(ValueError):
     """No unique registry vector. `details` says how the closest candidates differed from AE's own catalog:
@@ -176,12 +216,12 @@ def _differences(rows,expected,encoding,key_encoding=None):
         count+=1
         if len(examples)<EXAMPLES:examples.append(item)
     for name,key,category in rows:
-        keys=[k for k in _readings(key,key_encoding) if k in expected]
+        keys=[k for k in _host_forms(key,key_encoding) if k in expected]
         if len(keys)!=1 or keys[0] in seen:
             note({'field':'matchName','memoryHex':key.split(b'\0',1)[0].hex(),'memoryText':sorted(_readings(key,key_encoding))});continue
         seen.add(keys[0]);shown,group=expected[keys[0]]
         for field,raw,want in (('displayName',name,shown),('category',category,group)):
-            if want not in _readings(raw,encoding):
+            if want not in _host_forms(raw,encoding):
                 note({'matchName':keys[0],'field':field,'memoryHex':raw.split(b'\0',1)[0].hex(),'memoryText':sorted(_readings(raw,encoding)),'host':want})
     for key in sorted(set(expected)-seen)[:max(0,EXAMPLES-len(examples))]:examples.append({'matchName':key,'field':'missing'})
     return count+len(set(expected)-seen),examples
@@ -229,17 +269,17 @@ def registry_layout(process,profile,host_catalog):
     total=len(expected)+len(unnamed)
     matches=[];vectors=[];candidates=[]
     for offset in range(0,129,8):
-        try:begin,end=struct.unpack('<QQ',process.read(manager+offset,16))
-        except (RuntimeError,OSError,struct.error):continue
-        if begin<end and (end-begin)%16==0 and (end-begin)//16<32768:vectors.append({'offset':offset,'count':(end-begin)//16})
-        if end-begin!=total*16:continue
+        try:addresses=catalog_addresses(process,profile,manager+offset)
+        except (ValueError,RuntimeError,OSError,struct.error):continue
+        vectors.append({'offset':offset,'count':len(addresses)})
+        if len(addresses)!=total:continue
         candidate={'offset':offset};candidates.append(candidate)
         try:
-            values=struct.unpack('<'+'Q'*(total*2),process.read(begin,end-begin));rows=[];keys=set()
-            for index,address in enumerate(values[::2]):
-                raw=process.read(address,160)
-                if struct.unpack_from('<Q',raw)[0]!=base+profile.fc_vtable:raise ValueError(f'第 {index+1} 项对象类型不符')
-                fields=(raw[16:64],raw[64:96],raw[96:160])
+            rows=[];keys=set()
+            for index,address in enumerate(addresses):
+                raw=process.read(address,fc_size(profile))
+                if not fc_object(profile,base,raw):raise ValueError(f'第 {index+1} 项对象类型不符')
+                fields=tuple(raw[a:b] for a,b in fc_fields(profile))
                 for label,field in zip(('displayName','matchName','category'),fields):
                     if b'\0' not in field:raise ValueError(f'第 {index+1} 项{FIELD_LABELS[label]}没有结尾符（{field.hex()}）')
                 if fields[1].split(b'\0',1)[0] and fields[1] in keys:raise ValueError(f'第 {index+1} 项内部标识重复（{fields[1].split(bytes(1),1)[0].hex()}）')
@@ -254,7 +294,7 @@ def registry_layout(process,profile,host_catalog):
             count,examples=_differences(named,expected,encoding,key_encoding)
             left=list(unnamed_rows)
             for name,key,category in bare:
-                pair=next((u for u in left if u[0] in _readings(name,encoding) and u[1] in _readings(category,encoding)),None)
+                pair=next((u for u in left if u[0] in _host_forms(name,encoding) and u[1] in _host_forms(category,encoding)),None)
                 if pair:left.remove(pair);continue
                 count+=1
                 if len(examples)<EXAMPLES:examples.append({'field':'unnamed','matchNameHex':key.split(b'\0',1)[0].hex(),'memoryText':sorted(_readings(name,encoding))})

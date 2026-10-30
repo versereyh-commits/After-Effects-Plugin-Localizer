@@ -135,18 +135,26 @@ def pascal_string(value: bytes) -> str:
         return raw.decode("cp1252", errors="replace")
 
 
+def zstring_default(text: str) -> str:
+    """AE 2018's own effects name themselves with Adobe localizable strings, `$$$/AE/Effect/Name/Blend=Blend`;
+    AE shows the translation for its language or else the text after '='. The plugin's own name is that text."""
+    if text.startswith("$$$/") and "=" in text:
+        return text.split("=", 1)[1]
+    return text
+
+
 def inspect_plugin(path: Path) -> list[Plugin]:
     result = []
     for resource_path, data in resources(path):
         if str(resource_path[0]).upper() != "PIPL":
             continue
         props = pipl_properties(data)
-        name = pascal_string(props.get("name", b""))
+        name = zstring_default(pascal_string(props.get("name", b"")))
         match = pascal_string(props.get("eMNA", b""))
         # Only effect plugins; other PiPL kinds have no effect match name.
         if not name or not match:
             continue
-        result.append(Plugin(str(path), name, match, pascal_string(props.get("catg", b"")), str(resource_path[1]), int(resource_path[-1])))
+        result.append(Plugin(str(path), name, match, zstring_default(pascal_string(props.get("catg", b""))), str(resource_path[1]), int(resource_path[-1])))
     return result
 
 

@@ -34,6 +34,14 @@ class ResolverTests(fixtures.AnalysisTests):
         self.put('FLT.dll',832,struct.pack('<QQ',0x140001100,0x140001000))
     def test_primary_rtti_recovers_vtable(self):
         self.rtti();self.assertEqual(self.resolver.primary_vtable('.?AVFLT_FCSeqSpec@@'),0x1148)
+    def test_mapped_image_is_reused_only_for_the_same_bytes(self):
+        self.rtti();pe=self.resolver.modules['FLT.dll']['pe']
+        with patch.object(pe,'get_memory_mapped_image',wraps=pe.get_memory_mapped_image) as mapped:
+            self.resolver.primary_vtable('.?AVFLT_FCSeqSpec@@');self.resolver.primary_vtable('.?AVFLT_FCSeqSpec@@')
+            self.assertEqual(mapped.call_count,1)
+            self.put('FLT.dll',864,struct.pack('<QQ',0x140001100,0x140001000))
+            with self.assertRaises(ValueError):self.resolver.primary_vtable('.?AVFLT_FCSeqSpec@@')
+            self.assertEqual(mapped.call_count,2)
     def test_secondary_rtti_cannot_be_used_as_primary(self):
         self.rtti(offset=8)
         with self.assertRaises(ValueError):self.resolver.primary_vtable('.?AVFLT_FCSeqSpec@@')
@@ -54,7 +62,7 @@ class NamedListPlacementTests(unittest.TestCase):
         r.getters=lambda:[{'field':k,'value':v} for k,v in fields.items()];r.span=lambda module,rva,size,code=False:count_instruction.ljust(size,b'\xcc')
         r.exe=Path(folder.name)/'AfterFX.exe';r.modules={'FLT.dll':{'sha256':'f'},'TDB.dll':{'sha256':'t'}};r.version='26.5.0.89'
         r.manager=lambda:0x100;r.primary_vtable=lambda name:0x200;r.match_pool=lambda:0x300;r.display_cache=lambda entry:0x88
-        r.named_container=lambda:tree;r.tree_evidence=lambda named_map:None
+        r.named_container=lambda:tree;r.tree_evidence=lambda named_map:None;r.fc_layout=lambda name:(0x200,0,0);r.registry_list=lambda:False
         return r
     def test_list_right_after_the_vector_as_up_to_26_0(self):
         profile=self.resolver(bytes.fromhex('8b8130020000c3')).complete_static('')
@@ -93,6 +101,80 @@ class NamedContainerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'命名参数树结构不匹配'):self.resolver([self.LOOKUP%('Tree','Tree')],code).tree_evidence(0x228)
         with self.assertRaisesRegex(ValueError,'命名参数树结构不匹配'):self.resolver([self.LOOKUP%('Tree','Tree')],code[:11]+code[15:]).tree_evidence(0x220)
 
+class AE2018LayoutTests(unittest.TestCase):
+    """AE 2018 (15.1): FLT_FCSpec without a vtable, names 4 bytes later, and no exported count getter for the
+    named group."""
+    # xor edx,edx; mov r8d,0x1e99; mov word [rcx],r8w; xor eax,eax; mov word [rcx+0x120],r8w;
+    # mov byte [rcx+0x14],al; mov byte [rcx+0x44],al; mov byte [rcx+0x64],al; ret
+    CTOR='31d2'+'41b8991e0000'+'66448901'+'31c0'+'6644898120010000'+'884114'+'884144'+'884164'+'c3'
+    def resolver(self,code,rtti=False):
+        import capstone
+        r=Resolver.__new__(Resolver);r.dis=capstone.Cs(capstone.CS_ARCH_X86,capstone.CS_MODE_64);r.dis.detail=True
+        r.vtables=lambda module,name:[0x200] if rtti else [];r.primary_vtable=lambda name:0x200
+        r.symbol=lambda module,prefix,suffix=None:0x1000
+        r.instructions=lambda module,rva,size=256:list(r.dis.disasm(bytes.fromhex(code),rva))
+        return r
+    def test_tag_words_and_zeroed_names_come_from_the_constructor(self):
+        self.assertEqual(self.resolver(self.CTOR).fc_layout(20),(0,0x1e99,0x120))
+        self.assertEqual(self.resolver(self.CTOR,rtti=True).fc_layout(16),(0x200,0,0))
+        with self.assertRaisesRegex(ValueError,'名称字段族不匹配'):self.resolver(self.CTOR,rtti=True).fc_layout(20)
+    def test_missing_evidence_stops(self):
+        for code in (self.CTOR.replace('6644898120010000',''),           # the tag only once
+                     self.CTOR.replace('884144','')):                    # the internal name not zeroed
+            with self.assertRaisesRegex(ValueError,'效果对象类型标记未找到唯一证据'):self.resolver(code).fc_layout(20)
+        with self.assertRaisesRegex(ValueError,'效果对象类型标记未找到唯一证据'):self.resolver(self.CTOR).fc_layout(16)
+    def test_object_helpers_follow_the_profile(self):
+        from ae_profiles import fc_fields,fc_size,fc_object,fc_guard
+        old=SimpleNamespace(fc_vtable=0x200,name_base=16,fc_tag=0,fc_tail=0)
+        new=SimpleNamespace(fc_vtable=0,name_base=20,fc_tag=0x1e99,fc_tail=0x120)
+        self.assertEqual((fc_fields(old),fc_size(old)),(((16,64),(64,96),(96,160)),160))
+        self.assertEqual((fc_fields(new),fc_size(new)),(((20,68),(68,100),(100,164)),0x122))
+        raw=bytearray(0x122);raw[:2]=raw[0x120:]=b'\x99\x1e'
+        self.assertTrue(fc_object(new,0x100000,bytes(raw)));self.assertFalse(fc_object(new,0x100000,bytes(raw[:0x121])))
+        self.assertFalse(fc_object(SimpleNamespace(fc_vtable=0,name_base=20,fc_tag=0,fc_tail=0x120),0x100000,bytes(raw)))
+        raw[20:30]=b'Alpha'.ljust(10,b'\0');guard=fc_guard(new,bytes(raw));raw[20:30]=b'Beta'.ljust(10,b'\0')
+        self.assertEqual(fc_guard(new,bytes(raw)),guard,'the display name is not part of the guard');self.assertEqual(len(guard),20+96)
+    def test_catalog_container_comes_from_the_lookup_return_type(self):
+        def kind(*names):
+            r=Resolver.__new__(Resolver);symbols=[SimpleNamespace(name=n.encode(),forwarder=None,address=0x1000) for n in names]
+            r.module=lambda name:{'pe':SimpleNamespace(DIRECTORY_ENTRY_EXPORT=SimpleNamespace(symbols=symbols))};return r.registry_list()
+        self.assertTrue(kind('?FLTp_GetFCAddress@@YAPEAVFLT_FCSpec@@F@Z'))
+        self.assertFalse(kind('?FLTp_GetFCAddress@@YA?AV?$shared_ptr@VFLT_FCSpec@@@boost@@F@Z'))
+        for names in ((),('?FLTp_GetFCAddress@@YAPEAVFLT_FCSpec@@F@Z','?FLTp_GetFCAddress@@YA?AV?$shared_ptr@VFLT_FCSpec@@@boost@@F@Z')):
+            with self.assertRaisesRegex(ValueError,'效果目录容器未找到唯一证据'):kind(*names)
+    def test_count_getter_found_in_the_named_group_vtable(self):
+        from adapter_analysis import ModuleTools
+        base=0x180000000;image=bytearray(0x3000)
+        struct.pack_into('<3Q',image,0x2000,base+0x1100,base+0x1200,base+0x1300)   # indexed: slot 1 = exported count
+        struct.pack_into('<3Q',image,0x2100,base+0x1100,base+0x1400,base+0x1300)   # named: its own override
+        symbols=[SimpleNamespace(name=b'?GetNumStreams@TDB_IndexedStreamGroup@@UEBAIXZ',forwarder=None,address=0x1200)]
+        pe=SimpleNamespace(OPTIONAL_HEADER=SimpleNamespace(ImageBase=base),DIRECTORY_ENTRY_EXPORT=SimpleNamespace(symbols=symbols),
+                           get_section_by_rva=lambda rva:SimpleNamespace(Characteristics=0x20000000) if 0x1000<=rva<0x2000 else None)
+        tools=ModuleTools.__new__(ModuleTools);tables={'.?AVTDB_IndexedStreamGroup@@':[0x2000],'.?AVTDB_NamedStreamGroup@@':[0x2100]}
+        tools.module=lambda name:{'pe':pe,'_mapped_image':bytes(image)};tools.vtables=lambda module,name:tables[name]
+        self.assertEqual(tools.named_count()['value'],0x1400)
+        tables['.?AVTDB_NamedStreamGroup@@']=[0x2000];self.assertIsNone(tools.named_count(),'the same function is not an override')
+        tables['.?AVTDB_NamedStreamGroup@@']=[0x2100,0x2200];self.assertIsNone(tools.named_count())
+    def test_static_profile_carries_the_2018_layout(self):
+        import tempfile
+        from pathlib import Path
+        folder=tempfile.TemporaryDirectory();self.addCleanup(folder.cleanup);(Path(folder.name)/'U.dll').write_bytes(b'u')
+        fields=dict(name_get=1,match_get=2,category_get=3,parent_get=4,stream_match_get=5,count_get=0x500,display_get=6,group_vector=0x198,
+                    name_offset=20,match_offset=68,category_offset=100,parent_offset=32,guid_offset=8)
+        count=bytes.fromhex('488b81a0010000482b819801000048c1f803c3')   # mov rax,[rcx+0x1a0]; sub rax,[rcx+0x198]; sar rax,3; ret
+        r=self.resolver(self.CTOR)
+        r.getters=lambda:[{'field':k,'value':v} for k,v in fields.items()];r.span=lambda module,rva,size,code=False:count
+        r.exe=Path(folder.name)/'AfterFX.exe';r.modules={'FLT.dll':{'sha256':'f'},'TDB.dll':{'sha256':'t'}};r.version='15.1.2.69'
+        r.manager=lambda:0x100;r.match_pool=lambda:0x300;r.display_cache=lambda entry:0xe8;r.registry_list=lambda:True
+        p=r.complete_static('')
+        self.assertEqual((p.name_base,p.fc_vtable,p.fc_tag,p.fc_tail,p.named_vector,p.named_map,p.registry_list),(20,0,0x1e99,0x120,True,0x1a0,True))
+        for key,value in (('match_offset',64),('category_offset',96)):
+            with self.assertRaisesRegex(ValueError,'名称字段族不匹配：'+key):
+                r.getters=lambda:[{'field':k,'value':value if k==key else v} for k,v in fields.items()];r.complete_static('')
+        r.getters=lambda:[{'field':k,'value':v} for k,v in fields.items()]
+        r.span=lambda module,rva,size,code=False:count.replace(bytes.fromhex('a0010000'),bytes.fromhex('a8010000'))
+        with self.assertRaisesRegex(ValueError,'命名参数向量位置不匹配'):r.complete_static('')
+
 # Avoid repeating the base class tests through inheritance during discovery.
 for _name in list(fixtures.AnalysisTests.__dict__):
     if _name.startswith('test_'):setattr(ResolverTests,_name,None)
@@ -105,7 +187,7 @@ class RegistryOffsetTests(fixtures.AnalysisTests):
         self.memory[0x300000]=struct.pack('<QQQQ',0x400000,0,0x400100,0)
         for at,key,name in ((0x400000,'A','Alpha'),(0x400100,'B','Beta')):
             data=bytearray(160);struct.pack_into('<Q',data,0,0x100200);data[16:16+len(name)]=name.encode();data[64]=ord(key);data[96:100]=b'Test';self.memory[at]=bytes(data)
-        self.process=SimpleNamespace(modules=lambda:[{'name':'FLT.dll','base':0x100000}],u64=lambda a:struct.unpack('<Q',self.memory[a])[0],read=lambda a,n:self.memory[a][:n] if a in self.memory else (_ for _ in ()).throw(RuntimeError('not mapped')))
+        self.process=SimpleNamespace(modules=lambda:[{'name':'FLT.dll','base':0x100000}],u64=lambda a:struct.unpack('<Q',self.process.read(a,8))[0],read=lambda a,n:self.memory[a][:n] if a in self.memory else (_ for _ in ()).throw(RuntimeError('not mapped')))
     def test_vector_is_selected_only_by_full_catalog(self):self.assertEqual(registry_offset(self.process,self.profile,self.host),32)
     def test_two_matching_vectors_are_rejected(self):
         self.memory[0x200010]=self.memory[0x200020]
@@ -146,6 +228,27 @@ class RegistryOffsetTests(fixtures.AnalysisTests):
         with self.assertRaisesRegex(CatalogMismatch,'第 1 项显示名称没有结尾符'):registry_offset(self.process,self.profile,self.host)
     def test_wrong_object_type_is_rejected(self):
         data=bytearray(self.memory[0x400000]);struct.pack_into('<Q',data,0,0);self.memory[0x400000]=bytes(data)
+        with self.assertRaises(ValueError):registry_offset(self.process,self.profile,self.host)
+    def test_ae_2018_objects_are_typed_by_their_tag_words(self):
+        # AE 2018: no vtable; the tag word at +0 and +0x120, names 4 bytes later than in later builds.
+        self.profile=SimpleNamespace(manager=0x100,fc_vtable=0,name_base=20,fc_tag=0x1e99,fc_tail=0x120)
+        for at,key,name in ((0x400000,'A','Alpha'),(0x400100,'B','Beta')):
+            data=bytearray(0x122);data[:2]=data[0x120:0x122]=b'\x99\x1e';data[20:20+len(name)]=name.encode();data[68]=ord(key);data[100:104]=b'Test';self.memory[at]=bytes(data)
+        self.assertEqual(registry_offset(self.process,self.profile,self.host),32)
+        data=bytearray(self.memory[0x400000]);data[0x120]=0;self.memory[0x400000]=bytes(data)
+        with self.assertRaisesRegex(ValueError,'第 1 项对象类型不符'):registry_offset(self.process,self.profile,self.host)
+    def list_2018(self,lock=1):
+        """AE 2018: the manager's field holds a LIST handle; the objects (0x128 bytes) sit inline in its block."""
+        self.profile=SimpleNamespace(manager=0x100,fc_vtable=0,name_base=20,fc_tag=0x1e99,fc_tail=0x120,registry_list=True)
+        header=bytearray(0x48);struct.pack_into('<i',header,0x10,2);struct.pack_into('<i',header,0x18,0x128);struct.pack_into('<H',header,0x2a,lock)
+        block=bytearray(header);TAG=(0x1e99).to_bytes(2,"little")
+        for key,name in (('A','Alpha'),('B','Beta')):
+            data=bytearray(0x128);data[:2]=data[0x120:0x122]=TAG;data[20:20+len(name)]=name.encode();data[68]=ord(key);data[100:104]=b'Test';block+=data
+        self.memory={0x100100:struct.pack('<Q',0x200000),0x200008:struct.pack('<Q',0x500000),0x500000:struct.pack('<Q',0x600000)}
+        self.memory[0x600000]=bytes(block);self.memory[0x600048]=bytes(block[0x48:]);self.memory[0x600048+0x128]=bytes(block[0x48+0x128:])
+    def test_ae_2018_catalog_list_is_read_in_place(self):
+        self.list_2018();self.assertEqual(registry_offset(self.process,self.profile,self.host),8)
+        self.list_2018(lock=0)   # an unlocked list may move under a write: never used
         with self.assertRaises(ValueError):registry_offset(self.process,self.profile,self.host)
     def test_a_plugin_ae_lists_twice_is_compared_once(self):
         # Two copies of one plugin (Plug-ins and Common\Plug-ins\7.0\MediaCore): AE lists it twice, memory once.
@@ -191,6 +294,22 @@ class RegistryOffsetTests(fixtures.AnalysisTests):
         bad=next(t.encode('utf8') for t in ('渐变色调','聚光灯','稳定器','选择色调','油','画中画') if not _decodes(t.encode('utf8'),'mbcs'))
         self.add_unnamed(key=b'NWBL '+bad)
         self.assertEqual(registry_layout(self.process,self.profile,self.host),{'offset':32,'matchEncoding':'mbcs'})
+    def test_ae_2020_reports_each_byte_as_a_signed_character(self):
+        # AE 2020 (17.5, Chinese): GBK 声道 (C9 F9 B5 C0) reaches scripting as U+FFC9 U+FFF9 U+FFB5 U+FFC0.
+        signed=lambda raw:''.join(chr(b) if b<0x80 else chr(0xff00+b) for b in raw)
+        name,group='3D 声道'.encode('gbk'),'风格化'.encode('gbk')
+        self.rename(0x400000,name=name);data=bytearray(self.memory[0x400000]);data[96:160]=group.ljust(64,b'\0');self.memory[0x400000]=bytes(data)
+        self.host[0].update(displayName=signed(name),category=signed(group))
+        self.assertEqual(registry_offset(self.process,self.profile,self.host),32)
+        self.host[0]['category']=signed('风格话'.encode('gbk'))   # other bytes: still exact
+        with self.assertRaises(ValueError):registry_offset(self.process,self.profile,self.host)
+    def test_signed_names_read_back_as_text_only_in_code_page_builds(self):
+        from adapter_resolver import host_text
+        signed=''.join(chr(b) if b<0x80 else chr(0xff00+b) for b in '3D 声道'.encode('gbk'))
+        self.assertEqual(host_text(signed,'mbcs'),'3D 声道' if '3D 声道'.encode('mbcs',errors='replace')=='3D 声道'.encode('gbk') else signed)
+        self.assertEqual(host_text(signed,'utf8'),signed)
+        for text in ('Glow','辉光','Ａ全角','ｶﾀｶﾅ','ｿ'):self.assertEqual(host_text(text,'mbcs'),text)   # not that form
+        self.assertEqual(host_text('ﾀ￿','mbcs'),'ﾀ￿')   # bytes the code page cannot read stay as reported
     def test_ordinary_catalogs_keep_one_encoding(self):
         from adapter_resolver import registry_layout
         self.assertEqual(registry_layout(self.process,self.profile,self.host),{'offset':32,'matchEncoding':''})

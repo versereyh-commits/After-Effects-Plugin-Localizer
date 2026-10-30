@@ -70,7 +70,8 @@ class AdapterAnalysisDialog(QDialog):
         self.output=QPlainTextEdit();self.output.setReadOnly(True);self.output.setPlaceholderText('点击“开始自动识别”。离线识别成功后，再由你启动自检。');log.box.addWidget(self.output,1)
         self.status=label('就绪；识别阶段只读；自检由你手动启动，验证通过才启用。','muted',True);log.box.addWidget(self.status);body.addWidget(log,6)
         outer.addLayout(body,1)
-        foot=QHBoxLayout();foot.setContentsMargins(SHADOW,4,SHADOW,0);foot.addStretch()
+        foot=QHBoxLayout();foot.setContentsMargins(SHADOW,4,SHADOW,0)
+        self.existing_btn=button('直接连接 AE（已适配）','primary');self.existing_btn.setVisible(space.live);self.existing_btn.setToolTip('此构建已有适配，无需重复自检；正常连接仍核验实际模块和宿主。也可继续重新识别。');self.existing_btn.clicked.connect(self.connect_existing);foot.addWidget(self.existing_btn);foot.addStretch()
         close=button('关闭');close.clicked.connect(self.reject);foot.addWidget(close);outer.addLayout(foot)
         self.update_bridge()
     BRIDGE_STATE={'unavailable':'这个版本没有附带后台连接扩展','missing':'未安装','outdated':'与本软件版本不一致，请重新安装',
@@ -97,6 +98,10 @@ class AdapterAnalysisDialog(QDialog):
             if state=='done':ui_kit.themed_pixmap(badge,'check','ON_INK',12)
             else:badge.setProperty('themeIcon',None);badge.setText(str(number))
             repolish(badge,state=state)
+    def connect_existing(self):
+        if not self.space.live or not self.can_analyze():return
+        # Accepted asks the owner to enter its existing guarded connect path, not to enable a candidate.
+        self.accept()
     def reuse_analysis(self):
         if not self.can_analyze():return
         self.begin_analysis('reuse')
@@ -107,7 +112,7 @@ class AdapterAnalysisDialog(QDialog):
         self.analysis_done(report)
     def begin_analysis(self,kind):
         self.cancel_event.clear();self.running=True;self.task_kind=kind;self.report=None;self.completed=False
-        self.native_check.setEnabled(False);self.native_check.setChecked(False)
+        self.native_check.setEnabled(False);self.native_check.setChecked(False);self.existing_btn.setEnabled(False)
         self.finish_btn.setEnabled(False);self.refresh_native_btn.setEnabled(False)
         for widget in (self.start_btn,self.ai_btn,self.reuse_btn,self.export_btn,self.validate_btn):widget.setEnabled(False)
         self.cancel_btn.setEnabled(True);self.output.clear()
@@ -148,7 +153,7 @@ class AdapterAnalysisDialog(QDialog):
         self.owner.work(lambda progress:self.ai_work(progress,config),self.analysis_done,failure=self.failed)
         self.owner.job.progress.connect(self.status.setText)
     def stopped(self):
-        self.running=False;self.start_btn.setEnabled(True);self.reuse_btn.setEnabled(True);self.ai_btn.setEnabled(bool(self.offline_failure) and self.task_kind!='validation');self.cancel_btn.setEnabled(False);QTimer.singleShot(0,self,self.sync_steps)
+        self.running=False;self.existing_btn.setEnabled(bool(self.space.live and not (self.validation and self.validation.held)));self.start_btn.setEnabled(True);self.reuse_btn.setEnabled(True);self.ai_btn.setEnabled(bool(self.offline_failure) and self.task_kind!='validation');self.cancel_btn.setEnabled(False);QTimer.singleShot(0,self,self.sync_steps)
     def analysis_done(self,report):
         if self.cancel_event.is_set():self.stopped();self.status.setText('识别已取消；未接收候选');return
         source=report.get('analysisSource','ai');guide=''
@@ -182,7 +187,7 @@ class AdapterAnalysisDialog(QDialog):
     def validation_work(self,function,callback):
         if self.running or self.owner.busy():return
         if self.validation:self.validation.cancel_requested.clear()
-        self.running=True;self.task_kind='validation';self.ai_btn.setEnabled(False);self.reuse_btn.setEnabled(False);self.start_btn.setEnabled(False);self.validate_btn.setEnabled(False);self.finish_btn.setEnabled(False);self.refresh_native_btn.setEnabled(False);self.restore_qa_btn.setEnabled(False);self.cancel_btn.setEnabled(True)
+        self.running=True;self.existing_btn.setEnabled(False);self.task_kind='validation';self.ai_btn.setEnabled(False);self.reuse_btn.setEnabled(False);self.start_btn.setEnabled(False);self.validate_btn.setEnabled(False);self.finish_btn.setEnabled(False);self.refresh_native_btn.setEnabled(False);self.restore_qa_btn.setEnabled(False);self.cancel_btn.setEnabled(True)
         self.owner.work(function,callback,failure=self.validation_failed);self.owner.job.progress.connect(self.status.setText);QTimer.singleShot(0,self,self.sync_steps)
     def validate(self):
         if self.running or self.owner.busy() or self.report is None or self.report['state']!='candidate':return

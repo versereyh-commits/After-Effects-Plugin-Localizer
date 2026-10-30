@@ -99,5 +99,15 @@ class NoticeTests(GuiCase):
     def test_notice_dialog_has_a_single_button(self):
         dialog=ui_kit.Prompt(self.window,'标题','内容','知道了',cancel=False);self.addCleanup(dialog.deleteLater)
         self.assertEqual([b.text() for b in dialog.findChildren(QPushButton)],['知道了'])
+    def test_long_notes_scroll_inside_the_screen(self):
+        # Many versions' notes at once used to grow the dialog past the screen, hiding 知道了.
+        notes=release_notes.html([(f'1.{n}',['很长的一条更新说明，'*12]*4) for n in range(30)])
+        dialog=ui_kit.Prompt(self.window,'标题',notes,'知道了',cancel=False);self.addCleanup(dialog.deleteLater)
+        screen=dialog.screen().availableGeometry().height()
+        self.assertLessEqual(dialog.sizeHint().height(),screen-ui_kit.PROMPT_FRAME)
+        self.assertLess(dialog.text_area.minimumHeight(),dialog.text_area.widget().heightForWidth(404))
+        # Short text is shown whole, without a scroll area cutting it.
+        short=ui_kit.Prompt(self.window,'标题','内容','知道了',cancel=False);self.addCleanup(short.deleteLater)
+        self.assertEqual(short.text_area.minimumHeight(),short.text_area.widget().heightForWidth(404))
 
 if __name__=='__main__':unittest.main()

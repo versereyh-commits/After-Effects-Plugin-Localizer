@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from contextvars import ContextVar
 from contextlib import contextmanager
 from pathlib import Path
+import struct
 
 @dataclass(frozen=True)
 class Profile:
@@ -41,8 +42,45 @@ class Profile:
     # The named group keeps its streams in a std::map (AE 26.5) instead of an unordered_map's list; named_map is
     # then the tree's head, and its size is the count getter's field.
     named_tree:bool=False
+    # Where an effect's catalog object keeps its display name; the internal name follows 48 bytes later and the
+    # category 80. AE 2018 (15.1) adds 4 bytes in front: its FLT_FCSpec has no vtable but a tag word the
+    # constructor writes at +0 and again at +fc_tail, which then stands in for fc_vtable (0) as the type check.
+    name_base:int=16
+    fc_tag:int=0
+    fc_tail:int=0
+    # AE 2018 keeps the catalog in a legacy LIST.dll list (a locked handle of inline FLT_FCSpec objects) rather than
+    # a vector of shared_ptr; registry_vector is then where the manager keeps the list's handle.
+    registry_list:bool=False
 
 def match_encoding(profile)->str:return getattr(profile,'match_encoding','') or profile.encoding
+
+def _fc(profile):return getattr(profile,'name_base',16),getattr(profile,'fc_tag',0),getattr(profile,'fc_tail',0)
+def fc_fields(profile):
+    """The byte ranges of an effect object's display name, internal name and category."""
+    base=_fc(profile)[0];return (base,base+48),(base+48,base+80),(base+80,base+144)
+def fc_size(profile)->int:
+    base,_,tail=_fc(profile);return max(base+144,0 if profile.fc_vtable else tail+2)
+def fc_object(profile,module_base,raw)->bool:
+    """Whether bytes read from a catalog entry start an FLT_FCSpec: its vtable, or (AE 2018) both tag words."""
+    if profile.fc_vtable:return int.from_bytes(raw[:8],'little')==module_base+profile.fc_vtable
+    _,tag,tail=_fc(profile)
+    return bool(tag) and tail>=2 and len(raw)>=tail+2 and raw[:2]==raw[tail:tail+2]==tag.to_bytes(2,'little')
+def catalog_addresses(process,profile,slot)->list[int]:
+    """Where each catalog object is, from the manager's field at `slot`. A vector of shared_ptr (object, control
+    block) since AE 2019. AE 2018: a LIST.dll handle; its header holds the item count (+0x10), item size (+0x18) and
+    lock count (+0x2a; LIST_GetAddress refuses an unlocked list, which may move), the objects inline from +0x48.
+    Raises ValueError when the field holds no such catalog."""
+    if getattr(profile,'registry_list',False):
+        header=process.u64(process.u64(slot));raw=process.read(header,0x48)
+        count,size=struct.unpack_from('<i',raw,0x10)[0],struct.unpack_from('<i',raw,0x18)[0]
+        if not 1<=count<32768 or size%8 or not fc_size(profile)<=size<=0x400 or not struct.unpack_from('<H',raw,0x2a)[0]:raise ValueError('效果目录列表结构不符')
+        return [header+0x48+index*size for index in range(count)]
+    begin,end=struct.unpack('<QQ',process.read(slot,16))
+    if end<begin or (end-begin)%16 or not 1<=(end-begin)//16<32768:raise ValueError('效果目录向量结构不符')
+    return list(struct.unpack(f'<{(end-begin)//8}Q',process.read(begin,end-begin))[::2])
+def fc_guard(profile,raw)->bytes:
+    """What must stay the same for a write: everything up to the end of the category except the display name."""
+    base=_fc(profile)[0];return raw[:base]+raw[base+48:base+144]
 
 PROFILES={
     # Built in from this build's own automatic adaptation (static resolution + full owned-QA self-check with all

@@ -41,12 +41,12 @@ class StatusTests(BridgeCase):
         self.assertEqual([p.name for p in cep_bridge.installed().parent.iterdir()],[EXT])
         cep_bridge.remove();self.assertEqual(cep_bridge.status(),'missing');cep_bridge.remove()
     def test_debug_mode_is_switched_on_and_only_our_changes_are_put_back(self):
-        # Before: CSXS.10 has it off, CSXS.11 already on (another plugin), CSXS.12 never set, CSXS.13 off.
+        # Before: CSXS.10 has it off, CSXS.11 already on (another plugin), CSXS.8, 9 and 12 never set, CSXS.13 off.
         self.registry.update({10:'0',11:'1',13:'0'})
         cep_bridge.install()                                           # the startup update never touches it
         self.assertEqual(self.registry,{10:'0',11:'1',13:'0'})
         cep_bridge.install(debug_mode=True)
-        self.assertEqual(self.registry,{10:'1',11:'1',12:'1',13:'1'})
+        self.assertEqual(self.registry,{8:'1',9:'1',10:'1',11:'1',12:'1',13:'1'})
         cep_bridge.install(debug_mode=True)                            # a reinstall keeps the first originals
         self.registry[13]='0'                                          # the user switched one off by hand meanwhile
         cep_bridge.remove()

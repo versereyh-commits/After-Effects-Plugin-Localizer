@@ -2,8 +2,8 @@
 from dataclasses import replace
 from pathlib import Path
 import json,shutil,time,uuid,threading
-from ae_profiles import trial_adapter
-from adapter_resolver import CatalogMismatch,Resolver,registry_layout
+from ae_profiles import trial_adapter,match_encoding
+from adapter_resolver import CatalogMismatch,Resolver,registry_layout,host_text
 from adapter_host import HostBridge
 from parameter_names import bridge_root,ParameterSession,ParameterCatalog,identity,_host_names,run_native,module_read_blocked
 from live_names import NameSession,read_live,_save
@@ -89,7 +89,7 @@ class ValidationRun:
                 problem=legacy_text_problem([EFFECT_LABEL,PARAMETER_LABEL,*DRIZZLE_LABELS.values()])
                 if problem:raise RuntimeError(problem)
             with trial_adapter(self.profile,self.projects):
-                self.bridge.assert_owned();live=read_live(expected_image=self.exe)['effects'];host=self.bridge.call('catalog')['effects']
+                self.bridge.assert_owned();live=read_live(expected_image=self.exe)['effects'];host=self.host_catalog()
                 # Effects without an internal name are left out of the live read, so they are left out here too.
                 mapping=lambda rows:{r['matchName']:(r['displayName'],r['category']) for r in rows if r['matchName']}
                 self.check('catalogMatches',mapping(live)==mapping(host))
@@ -144,8 +144,12 @@ class ValidationRun:
     def check_names(self,rows):
         names={identity(row['effect'],row['matchName']):row['name'] for row in rows}
         self.check('translatedNames',all(names.get(k)==v for k,v in self.labels.items()))
-        catalog=self.bridge.call('catalog')['effects']
+        catalog=self.host_catalog()
         if not all(any(row['matchName']==key and row['displayName']==value for row in catalog) for key,value in self.effect_names.items()):raise RuntimeError('宿主效果中文名称回读失败')
+    def host_catalog(self):
+        """AE's catalog with its names as text: AE 2020 reports them as raw bytes (adapter_resolver.host_text)."""
+        names,keys=self.profile.encoding,match_encoding(self.profile)
+        return [{**row,'matchName':host_text(row['matchName'],keys),'displayName':host_text(row['displayName'],names),'category':host_text(row['category'],names)} for row in self.bridge.call('catalog')['effects']]
     def refresh(self):
         from ae_ui import refresh_effects
         self.bridge.assert_owned()

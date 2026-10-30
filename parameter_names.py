@@ -10,7 +10,7 @@ from ctypes import wintypes as W
 import hashlib,json,os,struct,subprocess,time,uuid,sys,threading
 from pathlib import Path
 from live_names import current_process,Registry,_lock,_process_lock,_save,module_digest,profile_for
-from runtime import asset_root,data_root,relay_script,write_json_atomic,unencodable,encoding_problem
+from runtime import asset_root,data_root,relay_script,write_json_atomic,unencodable,encoding_problem,start_host
 from ae_profiles import get_profile,trial_projects
 from runtime import file_version
 
@@ -455,7 +455,7 @@ def run_native(p,operations,timeout=25,action='labels',project_token=None,scope=
         # The hand-over makes AE show its main window again; keep it maximized / minimized as the user left it.
         from ae_ui import WindowKeeper
         keeper=WindowKeeper(p.pid)
-        launcher=subprocess.Popen([p.image,'-r',str(script)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,creationflags=subprocess.CREATE_NO_WINDOW)
+        launcher=start_host([p.image,'-r',str(script)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,creationflags=subprocess.CREATE_NO_WINDOW)
     claim_by=None
     if use_bridge:cep_bridge.submit(folder,request);claim_by=time.monotonic()+cep_bridge.CLAIM_WAIT
     else:relay()

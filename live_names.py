@@ -8,7 +8,7 @@ import hashlib,json,os,struct,threading
 from win_process import Process
 from ae_ui import main_window
 from runtime import data_root,native_probe,file_version,write_json_atomic,unencodable,encoding_problem
-from ae_profiles import get_profile,supported_text,PROFILES,runtime_allowed,nameless,match_encoding,ambiguous,mismatch_text
+from ae_profiles import get_profile,supported_text,PROFILES,runtime_allowed,nameless,match_encoding,ambiguous,mismatch_text,fc_fields,fc_size,fc_object,fc_guard,catalog_addresses
 
 PROFILE_SHA='68b229950e95dedf630f5d09653715268e8beba4830590433abe7cb58e78a357'
 MANAGER_RVA=0x14dee0
@@ -123,29 +123,30 @@ class Registry:
                 actual=codec['codec']
                 with _verify_lock:_codecs[key]=actual
             if actual!=(1 if self.profile.encoding=='utf8' else 2):raise RuntimeError('本机适配的实际名称编码发生变化，已停止操作')
-        for rva,expected in ((self.profile.name_get,b'\x48\x8d\x41\x10\xc3'),(self.profile.match_get,b'\x48\x8d\x41\x40\xc3'),(self.profile.category_get,b'\x48\x8d\x41\x60\xc3')):
-            if p.read(self.base+rva,len(expected))!=expected:raise RuntimeError('AE 名称字段接口校验失败，未执行写入')
+        for rva,(start,_) in zip((self.profile.name_get,self.profile.match_get,self.profile.category_get),fc_fields(self.profile)):
+            # lea rax,[rcx+field]; ret
+            if p.read(self.base+rva,5)!=bytes((0x48,0x8d,0x41,start,0xc3)):raise RuntimeError('AE 名称字段接口校验失败，未执行写入')
         self.manager=p.u64(self.base+self.profile.manager)
     def records(self):
-        begin,end=struct.unpack('<QQ',self.p.read(self.manager+self.profile.registry_vector,16))
-        if end<begin or (end-begin)%16 or not 1<=(end-begin)//16<32768:raise RuntimeError('AE 效果目录结构不符，未执行写入')
-        vector=self.p.read(begin,end-begin)
-        rows=[self.read_record(address) for address in struct.unpack(f'<{len(vector)//8}Q',vector)[::2] if address]
+        try:addresses=catalog_addresses(self.p,self.profile,self.manager+self.profile.registry_vector)
+        except ValueError:raise RuntimeError('AE 效果目录结构不符，未执行写入') from None
+        rows=[self.read_record(address) for address in addresses if address]
         # Effects AE reports without an internal name -- empty, or bytes this build cannot read (seen on AE 2021) --
         # cannot be told apart, renamed or restored, so they are left out, untouched, and only listed in `unnamed`.
-        bare=[nameless(r['guard'][16:48],match_encoding(self.profile)) for r in rows]
+        base=fc_fields(self.profile)[0][0] # the guard keeps the bytes before the name, then the internal name
+        bare=[nameless(r['guard'][base:base+32],match_encoding(self.profile)) for r in rows]
         self.unnamed=[r['displayName'] for r,b in zip(rows,bare) if b]
         return [r for r,b in zip(rows,bare) if not b]
     def read_record(self,address):
-        data=self.p.read(address,160)
-        if struct.unpack_from('<Q',data)[0]!=self.base+self.profile.fc_vtable:raise RuntimeError('AE 效果目录对象类型不符，未执行写入')
-        fields=[]
-        for start,end_field in ((16,64),(64,96),(96,160)):
+        data=self.p.read(address,fc_size(self.profile))
+        if not fc_object(self.profile,self.base,data):raise RuntimeError('AE 效果目录对象类型不符，未执行写入')
+        fields=[];spans=fc_fields(self.profile)
+        for start,end_field in spans:
             raw=data[start:end_field]
             if b'\0' not in raw:raise RuntimeError('AE 效果名称字段未终止，未执行写入')
             # The internal name is read the way AE reads it (see Profile.match_encoding), so keys match AE's own.
-            fields.append(decode_name(raw,match_encoding(self.profile) if start==64 else self.profile.encoding))
-        return {'address':address,'displayName':fields[0],'matchName':fields[1],'category':fields[2],'guard':data[:16]+data[64:160]}
+            fields.append(decode_name(raw,match_encoding(self.profile) if start==spans[1][0] else self.profile.encoding))
+        return {'address':address,'nameAt':address+spans[0][0],'displayName':fields[0],'matchName':fields[1],'category':fields[2],'guard':fc_guard(self.profile,data)}
     def unchanged(self,row):
         # One catalog snapshot is taken before a batch; each object is then re-read just before its write.
         now=self.read_record(row['address'])
@@ -187,7 +188,7 @@ def read_live(expected_image=None):
     with (current_process(expected_image=expected_image) if expected_image else current_process()) as p:
         registry=Registry(p);records=registry.records()
         profile=registry.profile
-        return {'pid':p.pid,'creationTime':p.creation_time,'image':p.image,'version':profile.version,'profileSha256':profile.flt_sha,'effects':[{k:v for k,v in r.items() if k not in ('address','guard')} for r in records],
+        return {'pid':p.pid,'creationTime':p.creation_time,'image':p.image,'version':profile.version,'profileSha256':profile.flt_sha,'effects':[{k:v for k,v in r.items() if k not in ('address','guard','nameAt')} for r in records],
                 'unnamedEffects':list(getattr(registry,'unnamed',[]))}
 
 class NameSession:
@@ -254,7 +255,7 @@ class NameSession:
             journal.update({'pid':p.pid,'creationTime':p.creation_time,'image':p.image,'profileSha256':profile.flt_sha if profile else PROFILE_SHA,'encoding':encoding})
             for key,value in encoded.items():
                 if key not in by_key:raise ValueError('当前 AE 未加载此效果：'+key)
-                row=by_key[key];before=p.read(row['address']+16,FIELD_SIZE)
+                row=by_key[key];before=p.read(row['nameAt'],FIELD_SIZE)
                 try:_name_bytes(before.hex(),encoding,strict=False)
                 except RuntimeError:raise RuntimeError('AE 当前名称字段格式异常，未执行写入：'+key) from None
                 if before==value:unchanged.append(key);continue
@@ -269,9 +270,9 @@ class NameSession:
             try:
                 snapshot={r['matchName']:r['address'] for r in registry.records()}
                 for row,before,value in staged:
-                    if snapshot.get(row['matchName'])!=row['address'] or not registry.unchanged(row) or p.read(row['address']+16,FIELD_SIZE)!=before:
+                    if snapshot.get(row['matchName'])!=row['address'] or not registry.unchanged(row) or p.read(row['nameAt'],FIELD_SIZE)!=before:
                         raise RuntimeError('AE 目录在操作期间发生变化，已停止')
-                    attempted.append((row,before));p.write_buffer(row['address']+16,value)
+                    attempted.append((row,before));p.write_buffer(row['nameAt'],value)
                 # AE's palette is refreshed only when the user asks for it (the refresh button).
                 verified=registry.records()
                 if {r['matchName']:r['displayName'] for r in verified}!=final:raise RuntimeError('更名后目录校验不一致')
@@ -282,7 +283,7 @@ class NameSession:
                     try:
                         actual=registry.target(row['matchName'])
                         if actual['address']!=row['address'] or actual['guard']!=row['guard']:raise RuntimeError('回滚目标守卫不符')
-                        p.write_buffer(row['address']+16,_name_bytes(before.hex(),encoding,strict=False))
+                        p.write_buffer(row['nameAt'],_name_bytes(before.hex(),encoding,strict=False))
                     except Exception:failed.append(row['matchName'])
                 if failed:
                     retained=json.loads(json.dumps(previous))
@@ -309,15 +310,15 @@ class NameSession:
                 if len(rows)!=len(records):raise RuntimeError('效果内部标识不唯一，未执行恢复')
                 for key in wanted:
                     if key not in rows:raise RuntimeError('当前 AE 中未找到唯一的效果：'+key)
-                    entry=journal['entries'][key];current=p.read(rows[key]['address']+16,FIELD_SIZE)
+                    entry=journal['entries'][key];current=p.read(rows[key]['nameAt'],FIELD_SIZE)
                     if current.hex() not in (entry['appliedHex'],entry['originalHex']):raise RuntimeError('效果名称已被外部修改，未强制恢复：'+key)
                 try:
                     for key in wanted:
                         entry=journal['entries'][key];row=rows[key]
                         if not registry.unchanged(row):raise RuntimeError('AE 目录在操作期间发生变化，已停止：'+key)
-                        p.write_buffer(row['address']+16,_name_bytes(entry['originalHex'],journal.get('encoding','utf8'),strict=False))
+                        p.write_buffer(row['nameAt'],_name_bytes(entry['originalHex'],journal.get('encoding','utf8'),strict=False))
                         actual=registry.read_record(row['address'])
-                        if actual['matchName']!=key or actual['guard']!=row['guard'] or actual['displayName']!=entry['originalName'] or p.read(row['address']+16,FIELD_SIZE).hex()!=entry['originalHex'].lower():
+                        if actual['matchName']!=key or actual['guard']!=row['guard'] or actual['displayName']!=entry['originalName'] or p.read(row['nameAt'],FIELD_SIZE).hex()!=entry['originalHex'].lower():
                             raise RuntimeError('效果目录恢复回读不一致，记录已保留：'+key)
                         restored[key]=entry['originalName'];del journal['entries'][key]
                 finally:

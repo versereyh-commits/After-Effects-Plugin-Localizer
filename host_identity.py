@@ -32,3 +32,39 @@ def same(actual,expected):
 def key(value):
     if not valid(value):raise RuntimeError('AE 进程身份无效，未提交请求')
     return str(value['pid'])+'-'+value['creationTime']
+
+
+def running_pids():
+    """Enumerate AE process IDs without reading modules or process memory.
+
+    Inaccessible AE processes remain in the set; only a confirmed exited snapshot entry is ignored.
+    """
+    class Entry(C.Structure):
+        _fields_=[('dwSize',W.DWORD),('cntUsage',W.DWORD),('th32ProcessID',W.DWORD),('th32DefaultHeapID',C.c_size_t),('th32ModuleID',W.DWORD),('cntThreads',W.DWORD),('th32ParentProcessID',W.DWORD),('pcPriClassBase',C.c_long),('dwFlags',W.DWORD),('szExeFile',W.WCHAR*260)]
+    k=C.WinDLL('kernel32',use_last_error=True)
+    k.CreateToolhelp32Snapshot.argtypes=[W.DWORD,W.DWORD];k.CreateToolhelp32Snapshot.restype=C.c_void_p
+    k.Process32FirstW.argtypes=[C.c_void_p,C.POINTER(Entry)];k.Process32FirstW.restype=W.BOOL
+    k.Process32NextW.argtypes=[C.c_void_p,C.POINTER(Entry)];k.Process32NextW.restype=W.BOOL
+    k.OpenProcess.argtypes=[W.DWORD,W.BOOL,W.DWORD];k.OpenProcess.restype=C.c_void_p
+    k.GetExitCodeProcess.argtypes=[C.c_void_p,C.POINTER(W.DWORD)];k.GetExitCodeProcess.restype=W.BOOL
+    k.CloseHandle.argtypes=[C.c_void_p]
+    snapshot=k.CreateToolhelp32Snapshot(2,0)
+    if snapshot in (None,C.c_void_p(-1).value):raise C.WinError(C.get_last_error())
+    found=set();entry=Entry();entry.dwSize=C.sizeof(entry)
+    try:
+        more=k.Process32FirstW(snapshot,C.byref(entry))
+        if not more and C.get_last_error()!=18:raise C.WinError(C.get_last_error())
+        while more:
+            if entry.szExeFile.casefold()=='afterfx.exe':
+                pid=int(entry.th32ProcessID);handle=k.OpenProcess(0x1000,False,pid);ended=False
+                if handle:
+                    try:
+                        code=W.DWORD()
+                        ended=bool(k.GetExitCodeProcess(handle,C.byref(code))) and code.value!=259
+                    finally:k.CloseHandle(handle)
+                elif C.get_last_error()==87:ended=True # PID disappeared after the snapshot.
+                if not ended:found.add(pid)
+            more=k.Process32NextW(snapshot,C.byref(entry))
+        if C.get_last_error()!=18:raise C.WinError(C.get_last_error())
+        return found
+    finally:k.CloseHandle(snapshot)

@@ -1,7 +1,7 @@
 import json,struct,tempfile,threading,unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import patch,Mock
 import adapter_analysis as analysis
 from ae_profiles import PROFILES
 
@@ -25,6 +25,8 @@ class AnalysisTests(unittest.TestCase):
         self.tools.modules['FLT.dll']['pe'].DIRECTORY_ENTRY_EXPORT=SimpleNamespace(symbols=symbols)
         self.config={'service':'ollama','key':'','base_url':'http://localhost:1/v1','model':'test'}
         check=patch.object(analysis,'file_version',lambda p:'23.0.0.59');check.start();self.addCleanup(check.stop)
+    def reuse_tools(self):
+        self.tools.complete_static=Mock();return self.tools
     def inspect(self):return self.tools.call('inspect',{})
     def selected(self):
         self.inspect();return [key for key,value in self.tools.evidence.items() if value.get('field')]
@@ -90,28 +92,36 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual(loaded['kind'],'ae-adapter-analysis');self.assertFalse(loaded['runtimeEnabled'])
     def test_cached_report_is_revalidated_without_network(self):
         report=self.run_agent(lambda *args:self.finish());folder=Path(self.temp.name)/'reports';analysis.save_report(report,folder)
-        with patch.object(analysis,'ModuleTools',return_value=self.tools),patch('adapter_resolver.Resolver') as resolver:loaded=analysis.load_report(self.exe,folder)
+        with patch('adapter_resolver.Resolver',return_value=self.reuse_tools()) as resolver:loaded=analysis.load_report(self.exe,folder)
         self.assertEqual(loaded['candidateReadConfig'],report['candidateReadConfig']);self.assertFalse(loaded['runtimeEnabled'])
+    def test_cached_report_uses_one_parser_and_checks_changes_after_completion(self):
+        report=self.run_agent(lambda *args:self.finish());folder=Path(self.temp.name)/'reports';analysis.save_report(report,folder)
+        tools=self.reuse_tools()
+        with patch('adapter_resolver.Resolver',return_value=tools) as resolver,patch.object(analysis,'ModuleTools') as extra_parser:
+            analysis.load_report(self.exe,folder);resolver.assert_called_once_with(self.exe);extra_parser.assert_not_called()
+        tools=self.reuse_tools();tools.complete_static.side_effect=lambda _: (self.exe.parent/'FLT.dll').write_bytes(b'changed')
+        with patch('adapter_resolver.Resolver',return_value=tools):
+            with self.assertRaisesRegex(ValueError,'模块发生变化'):analysis.load_report(self.exe,folder)
     def test_cached_invented_field_is_rejected(self):
         report=self.run_agent(lambda *args:self.finish());report['candidateReadConfig']['manager']=123;folder=Path(self.temp.name)/'reports';analysis.save_report(report,folder)
-        with patch.object(analysis,'ModuleTools',return_value=self.tools):
+        with patch('adapter_resolver.Resolver',return_value=self.reuse_tools()):
             with self.assertRaises(ValueError):analysis.load_report(self.exe,folder)
     def test_cached_claim_of_runtime_enable_is_rejected(self):
         report=self.run_agent(lambda *args:self.finish());report['runtimeEnabled']=True;folder=Path(self.temp.name)/'reports';analysis.save_report(report,folder)
-        with patch.object(analysis,'ModuleTools',return_value=self.tools):
+        with patch('adapter_resolver.Resolver',return_value=self.reuse_tools()):
             with self.assertRaises(ValueError):analysis.load_report(self.exe,folder)
     def test_legacy_report_defaults_to_ai_and_static_is_rechecked(self):
         report=self.run_agent(lambda *args:self.finish());report.pop('analysisSource');folder=Path(self.temp.name)/'reports';analysis.save_report(report,folder)
-        with patch.object(analysis,'ModuleTools',return_value=self.tools),patch('adapter_resolver.Resolver') as resolver:
+        with patch('adapter_resolver.Resolver',return_value=self.reuse_tools()) as resolver:
             loaded=analysis.load_report(self.exe,folder);resolver.return_value.complete_static.assert_called_once_with('')
         self.assertEqual(loaded.get('analysisSource','ai'),'ai')
     def test_code_report_can_be_reused_without_model(self):
         report=self.run_agent(lambda *args:self.finish());report['analysisSource']='code';folder=Path(self.temp.name)/'reports';analysis.save_report(report,folder)
-        with patch.object(analysis,'ModuleTools',return_value=self.tools),patch('adapter_resolver.Resolver'),patch.object(analysis,'analysis_turn',side_effect=AssertionError('network')):
+        with patch('adapter_resolver.Resolver',return_value=self.reuse_tools()),patch.object(analysis,'analysis_turn',side_effect=AssertionError('network')):
             self.assertEqual(analysis.load_report(self.exe,folder)['analysisSource'],'code')
     def test_cached_candidate_requires_supported_static_structure(self):
         report=self.run_agent(lambda *args:self.finish());folder=Path(self.temp.name)/'reports';analysis.save_report(report,folder)
-        with patch.object(analysis,'ModuleTools',return_value=self.tools),patch('adapter_resolver.Resolver') as resolver:
+        with patch('adapter_resolver.Resolver',return_value=self.reuse_tools()) as resolver:
             resolver.return_value.complete_static.side_effect=ValueError('unknown layout')
             with self.assertRaises(ValueError):analysis.load_report(self.exe,folder)
     def test_loaded_read_rejects_writable_section_before_process_access(self):

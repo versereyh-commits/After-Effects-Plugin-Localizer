@@ -2,10 +2,11 @@
 from pathlib import Path
 import json,subprocess,time,uuid
 from ae_paths import path_key
-from runtime import native_probe,file_version,asset_root,relay_script,write_json_atomic
+from runtime import native_probe,file_version,asset_root,relay_script,write_json_atomic,start_host
 from parameter_names import bridge_root
 from ae_ui import WindowKeeper
 from win_process import Process
+from host_identity import running_pids
 
 class HostBridge:
     def __init__(self,exe,folder):
@@ -16,7 +17,16 @@ class HostBridge:
         try:self.folder.mkdir(parents=True,exist_ok=True)
         except OSError as error:raise RuntimeError('软件所在目录不可写，无法创建 QA 交换目录；请把完整软件目录放在可写位置（例如安装到当前用户目录）后重试') from error
     def process(self):
-        probe=native_probe();running=probe.get('processes',[])
+        # Keep the single-host gate on every call, but avoid the diagnostic probe's module scans
+        # after binding. The target Process below still rechecks path, version and creation time.
+        probe=None
+        if self.identity is not None:
+            try:pids=running_pids()
+            except OSError:pids=None
+            if pids=={self.identity[0]}:
+                probe={'processes':[{'pid':self.identity[0],'imagePath':str(self.exe)}]}
+        if probe is None:probe=native_probe()
+        running=probe.get('processes',[])
         def reject(message):
             self.diagnostic('host_rejected',processes=running,message=message)
             raise RuntimeError(message+'；诊断记录：'+str(self.folder/'host-diagnostic.json'))
@@ -67,7 +77,7 @@ class HostBridge:
         script.write_text(source,encoding='ascii')
         # The hand-over makes AE show its main window again; keep it as the user left it.
         keeper=WindowKeeper(pid)
-        relay=subprocess.Popen([str(self.exe),'-r',str(script)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,creationflags=subprocess.CREATE_NO_WINDOW)
+        relay=start_host([str(self.exe),'-r',str(script)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,creationflags=subprocess.CREATE_NO_WINDOW)
         self._relay_pid=relay.pid;self.diagnostic('request_started',action=action,requestId=request_id,hostPid=pid)
         try:
             until=time.monotonic()+55;last_phase='等待 AE 进入脚本'

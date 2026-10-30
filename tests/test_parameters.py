@@ -341,6 +341,32 @@ class UnnamedEffectParameterTests(unittest.TestCase):
             with patch.object(names,'run_native',return_value={'projectToken':'t','parameters':[{'id':bad,'name':'n'}]}),patch.dict(names._project_context,{},clear=True):
                 with self.assertRaisesRegex(ValueError,'参数标识格式错误'):names._host_names(SimpleNamespace(pid=91,creation_time=92))
 
+class HostEnvironmentTests(unittest.TestCase):
+    """AfterFX.exe started for the -r relay must not inherit our own DLL folders: with them AE 2018 loaded our
+    Qt6Core.dll and showed "无法定位程序输入点 ucnv_open"."""
+    def test_own_folders_leave_path_and_qt_variables(self):
+        place=lambda *parts:os.path.join(os.sep,*parts)   # rooted on the current drive; no machine's own paths
+        bundle=place('apps','AE汉化工具','_internal');system=place('windows','system32');tools=place('tools')
+        environ={'Path':os.pathsep.join([os.path.join(bundle,'PySide6'),bundle,system,tools]),
+                 'QT_PLUGIN_PATH':os.path.join(bundle,'PySide6','plugins'),'QML2_IMPORT_PATH':os.path.join(bundle,'PySide6','qml'),'OTHER':'x'}
+        with patch.object(runtime,'_own_folders',lambda:[Path(bundle)]):clean=runtime.host_environment(environ)
+        self.assertEqual(clean['Path'],os.pathsep.join([system,tools]))
+        self.assertNotIn('QT_PLUGIN_PATH',clean);self.assertNotIn('QML2_IMPORT_PATH',clean);self.assertEqual(clean['OTHER'],'x')
+        # A user's own Qt setting elsewhere stays; a lookalike folder name is not ours.
+        environ.update(QT_PLUGIN_PATH=place('qt','plugins'),Path=bundle+'_old'+os.pathsep+os.path.join(bundle,'PySide6'))
+        with patch.object(runtime,'_own_folders',lambda:[Path(bundle)]):clean=runtime.host_environment(environ)
+        self.assertEqual((clean['QT_PLUGIN_PATH'],clean['Path']),(place('qt','plugins'),bundle+'_old'))
+    def test_frozen_start_clears_the_inherited_dll_directory_only_for_the_launch(self):
+        calls=[]
+        class Kernel:
+            def GetDllDirectoryW(self,size,buffer):buffer.value='bundle';return len(buffer.value)
+            def SetDllDirectoryW(self,value):calls.append(('set',value))
+        def popen(args,**options):calls.append(('popen',options['env']['PATH']));return 'process'
+        with patch.object(runtime.sys,'frozen',True,create=True),patch.object(runtime.ctypes,'windll',SimpleNamespace(kernel32=Kernel()),create=True),\
+             patch.object(runtime.subprocess,'Popen',popen),patch.object(runtime,'host_environment',lambda:{'PATH':'clean'}):
+            self.assertEqual(runtime.start_host(['AfterFX.exe','-r','x.jsx']),'process')
+        self.assertEqual(calls,[('set',None),('popen','clean'),('set','bundle')])
+
 class RelayPathTests(unittest.TestCase):
     """AE runs nothing handed over with -r from a path with a space (checked on AE 2024), so the script moves."""
     def setUp(self):

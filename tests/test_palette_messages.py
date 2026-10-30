@@ -64,6 +64,7 @@ class RoutingTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
         h=patch.dict(m._calibrated,{},clear=True);h.start();self.addCleanup(h.stop)
+        h=patch.dict(m._verified,{},clear=True);h.start();self.addCleanup(h.stop)
     def call(self,u=None,calibrate=False,inspect_error=None,late=False):
         u=u or cases.FakeUser32(closed={9});calls=[0]
         def popups(user,pid):calls[0]+=1;return [] if calls[0]==1 else [9]
@@ -90,5 +91,71 @@ class RoutingTests(unittest.TestCase):
         u=cases.FakeUser32(closed={9})
         with self.assertRaisesRegex(RuntimeError,'超时'):self.call(u,late=True)
         self.assertFalse(any(h==9 and w==0x0d for h,msg,w in u.posts))
+
+class Refresh131Tests(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
+        for cache in (m._verified,m._calibrated):
+            h=patch.dict(cache,{},clear=True);h.start();self.addCleanup(h.stop)
+        self.rows=GeometryTests.rows(self);self.header=m.search_headers(self.rows)[0];self.key=(1,10,'test')
+    def run_refresh(self,*,drop=0,missing=False,timeout=3,cache=False,stalled=False,changed=False,right=False):
+        u=cases.FakeUser32(closed={9});clock=[0.0];inspect=Mock(return_value=[])
+        def attempts():return sum(h==3 and msg in (0x202,0x205) for h,msg,w in u.posts)
+        def popups(*a):return [9] if attempts()>drop and not missing else []
+        def popup(*a):return (9,77,3,94) if popups() else None
+        def send(*a):
+            if stalled:return 0
+            return cases.FakeUser32.SendMessageTimeoutW(u,*a)
+        u.SendMessageTimeoutW=send
+        if right:self.header=dict(self.header,button=False)
+        if cache:m._verified[self.key]=m._locator_stamp(self.header,self.rows,96)
+        if changed:self.rows[-1]['rect']=(30,135,250,155)
+        self.user=u;self.inspect=inspect
+        with ExitStack() as stack:
+            for name,value in [('_identity',lambda *a:('test',10)),('main_window',lambda p:1),('_owner',lambda *a:1),('_native_windows',lambda *a:(self.rows,[1])),('_inspect',inspect),('_popups',popups),('_refresh_popup',popup),('_diagnostic_path',lambda:Path(self.temp.name)/'d.json')]:stack.enter_context(patch.object(ui,name,value))
+            stack.enter_context(patch.object(m,'search_headers',return_value=[self.header]))
+            stack.enter_context(patch.object(m.time,'monotonic',lambda:clock[0]))
+            stack.enter_context(patch.object(m.time,'sleep',lambda seconds:clock.__setitem__(0,clock[0]+seconds)))
+            return m._run(u,1,timeout,'test',10,False,None)
+    def test_dropped_first_menu_click_retries_only_open(self):
+        result=self.run_refresh(drop=1,right=True)
+        self.assertTrue(result['nativePaletteRefreshed'])
+        self.assertEqual(sum(h==3 and msg==0x205 for h,msg,w in self.user.posts),2)
+        self.assertEqual(self.user.posts.count((9,0x100,0x0d)),1)
+    def test_missing_menu_has_at_most_three_open_attempts_no_enter(self):
+        with self.assertRaisesRegex(RuntimeError,'未找到可用'):self.run_refresh(missing=True,right=True)
+        self.assertEqual(sum(h==3 and msg==0x205 for h,msg,w in self.user.posts),3)
+        self.assertNotIn((9,0x100,0x0d),self.user.posts)
+    def test_left_menu_button_is_never_toggled_twice(self):
+        with self.assertRaises(RuntimeError):self.run_refresh(missing=True)
+        self.assertEqual(sum(h==3 and msg==0x202 for h,msg,w in self.user.posts),1)
+    def test_timeout_does_not_send_a_late_retry(self):
+        with self.assertRaisesRegex(RuntimeError,'超时'):self.run_refresh(missing=True,timeout=.2)
+        self.assertEqual(sum(h==3 and msg==0x202 for h,msg,w in self.user.posts),1)
+    def test_unchanged_verified_header_skips_uia_but_checks_menu(self):
+        result=self.run_refresh(cache=True)
+        self.assertEqual(result['locator'],'verified-header-cache');self.inspect.assert_not_called()
+        self.assertEqual(self.user.selected,(9,3))
+    def test_layout_change_runs_discovery_again(self):
+        self.run_refresh(cache=True,changed=True);self.inspect.assert_called_once()
+    def test_verified_success_populates_session_cache(self):
+        self.run_refresh();self.assertIn(self.key,m._verified)
+    def test_cached_menu_failure_rediscovery_once_then_fails(self):
+        with self.assertRaises(RuntimeError):self.run_refresh(cache=True,missing=True,timeout=4)
+        self.inspect.assert_called_once();self.assertNotIn(self.key,m._verified)
+    def test_unresponsive_select_stops_without_retry_or_enter(self):
+        with self.assertRaisesRegex(RuntimeError,'无响应'):self.run_refresh(cache=True,stalled=True)
+        self.assertEqual(sum(h==3 and msg==0x202 for h,msg,w in self.user.posts),1)
+        self.assertNotIn((9,0x100,0x0d),self.user.posts);self.assertNotIn(self.key,m._verified)
+    def test_restarted_identity_and_dpi_never_reuse_header(self):
+        for key,density in [((1,11,'test'),96),((1,10,'other'),96),(self.key,120)]:
+            m._verified[self.key]=m._locator_stamp(self.header,self.rows,96)
+            self.assertIsNone(m._reuse_locator(key,[self.header],self.rows,density))
+    def test_rebuilt_or_hidden_ancestor_invalidates_cache(self):
+        for mode in ('rebuild','hidden'):
+            rows=GeometryTests.rows(self);m._verified[self.key]=m._locator_stamp(self.header,rows,96)
+            if mode=='rebuild':rows[-1]['hwnd']=88
+            else:rows[1]['visible']=False
+            self.assertIsNone(m._reuse_locator(self.key,m.search_headers(rows),rows,96))
 
 if __name__=='__main__':unittest.main()

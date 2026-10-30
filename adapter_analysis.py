@@ -47,6 +47,11 @@ def search_args(args,maximum,default):
     if not isinstance(query,str) or len(query)>120 or any(ord(c)<32 for c in query):raise ValueError('搜索文字格式无效')
     return query.casefold(),integer(args.get('limit',default),1,maximum)
 
+def unique(values,label):
+    values=set(values)
+    if len(values)!=1:raise ValueError(label+'未找到唯一证据')
+    return values.pop()
+
 class ModuleTools:
     def __init__(self,exe,version_of=file_version):
         item=locate(exe);self.exe=Path(item['exe']);self.version=version_of(self.exe)
@@ -79,6 +84,35 @@ class ModuleTools:
                 data=m['data'][offset:offset+size]
                 if len(data)==size:return data
         raise ValueError('读取范围不在模块文件有效节内')
+    def vtables(self,name,typename):
+        """Every primary MSVC vtable (complete-object locator at offset 0) of `typename` in module `name`."""
+        module=self.module(name);pe=module['pe']
+        # Both RTTI lookups use the same immutable module bytes; avoid copying its mapped image twice.
+        if module.get('_mapped_source') is not module['data']:
+            module['_mapped_image']=pe.get_memory_mapped_image();module['_mapped_source']=module['data']
+        image=module['_mapped_image'];result=[];at=0;needle=typename.encode()+b'\0'
+        while True:
+            at=image.find(needle,at)
+            if at<0:break
+            descriptor=at-16;at+=1;start=0
+            while True:
+                found=image.find(struct.pack('<I',descriptor),start)
+                if found<0:break
+                start=found+1;col=found-12
+                if col<0 or col+24>len(image):continue
+                signature,offset,_,_,_,self_rva=struct.unpack_from('<IIIIII',image,col)
+                if signature!=1 or offset!=0 or self_rva!=col:continue
+                ref=struct.pack('<Q',pe.OPTIONAL_HEADER.ImageBase+col);position=0
+                while True:
+                    position=image.find(ref,position)
+                    if position<0:break
+                    vt=position+8;position+=1
+                    section=pe.get_section_by_rva(vt)
+                    if vt%8 or not section or section.Characteristics&0x80000000:continue
+                    function=struct.unpack_from('<Q',image,vt)[0]-pe.OPTIONAL_HEADER.ImageBase
+                    function_section=pe.get_section_by_rva(function)
+                    if function_section and function_section.Characteristics&0x20000000:result.append(vt)
+        return result
     def observe(self,kind,module,value,*,field=None,source=None):
         entry={'kind':kind,'module':module,'value':value}
         if field:entry['field']=field
@@ -148,7 +182,32 @@ class ModuleTools:
                         end,begin=(o[1].mem.disp for o in operands)
                         if 0<=begin<=4096 and end-begin==8:
                             result.append(self.observe('getter_offset',name,begin,field='group_vector',source=observation['evidenceId']))
+        if not any(e.get('field')=='count_get' for e in result):
+            slot=self.named_count()
+            if slot:result.append(self.observe('vtable_slot',slot['module'],slot['value'],field='count_get',source=slot['source']))
         return result
+    def named_count(self):
+        """AE 2018 exports no GetNumStreams for the named group. Both groups override the same virtual of
+        TDB_StreamGroup, so the named group's override sits in the slot where the indexed group's vtable holds its
+        exported one. None unless each step is unique."""
+        pe=self.module('TDB.dll')['pe'];base=pe.OPTIONAL_HEADER.ImageBase
+        symbols=getattr(getattr(pe,'DIRECTORY_ENTRY_EXPORT',None),'symbols',[])
+        exported=[s.address for s in symbols if s.name and not s.forwarder and s.name.decode('ascii','replace').startswith('?GetNumStreams@TDB_IndexedStreamGroup@@')]
+        indexed=self.vtables('TDB.dll','.?AVTDB_IndexedStreamGroup@@');named=self.vtables('TDB.dll','.?AVTDB_NamedStreamGroup@@')
+        if len(exported)!=1 or len(set(indexed))!=1 or len(set(named))!=1:return None
+        image=self.module('TDB.dll')['_mapped_image']
+        def slots(vt):
+            out=[]
+            for index in range(128):
+                if vt+8*index+8>len(image):break
+                target=struct.unpack_from('<Q',image,vt+8*index)[0]-base;section=pe.get_section_by_rva(target) if 0<=target<len(image) else None
+                if not section or not section.Characteristics&0x20000000:break
+                out.append(target)
+            return out
+        left=slots(indexed[0]);right=slots(named[0])
+        at=[i for i,target in enumerate(left) if target==exported[0]]
+        if len(at)!=1 or at[0]>=len(right) or right[at[0]]==exported[0]:return None
+        return {'module':'TDB.dll','value':right[at[0]],'source':'?GetNumStreams@TDB_IndexedStreamGroup@@ vtable slot %d'%at[0]}
     def inspect(self,args):
         self._inspected=True
         modules={name:{'sha256':m['sha256'],'machine':'x64','imageSize':m['pe'].OPTIONAL_HEADER.SizeOfImage} for name,m in self.modules.items()}
@@ -250,7 +309,8 @@ def save_report(report,folder):
 
 def load_report(exe,folder):
     """Reuse a local candidate only when all selected fields are reproducible."""
-    tools=ModuleTools(exe)
+    from adapter_resolver import Resolver
+    tools=Resolver(exe)
     try:
         modules={name:m['sha256'] for name,m in tools.modules.items()}
         digest=hashlib.sha256(json.dumps(modules,sort_keys=True).encode()).hexdigest()[:16]
@@ -265,9 +325,7 @@ def load_report(exe,folder):
         if not isinstance(fields,dict) or not fields or any(k not in expected or expected[k]!=v for k,v in fields.items()):raise ValueError('上次候选字段无法重新核验')
         if not isinstance(report.get('summary'),str) or not isinstance(report.get('missing'),list) or not all(isinstance(v,str) for v in report['missing']) or not isinstance(report.get('trace'),list) or not all(isinstance(v,dict) and v.get('tool') in TOOLS for v in report['trace']):raise ValueError('候选说明格式异常，请重新分析')
         if report.get('analysisSource','ai') not in ('code','ai'):raise ValueError('候选来源无效')
-        from adapter_resolver import Resolver
-        resolver=Resolver(exe)
-        try:resolver.complete_static('');resolver.verify_files()
-        finally:resolver.close()
-        tools.verify_files();return report
+        # One immutable file snapshot and one PE parser per module for this load.
+        # The final full hash check still rejects changes during validation.
+        tools.complete_static('');tools.verify_files();return report
     finally:tools.close()

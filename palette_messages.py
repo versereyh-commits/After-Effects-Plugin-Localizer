@@ -11,6 +11,7 @@ import json,threading,time
 import ae_ui as ui
 
 _calibrated={}
+_verified={} # session-only: a successful menu locator, never a command ID
 _lock=threading.Lock()
 
 @contextmanager
@@ -90,6 +91,30 @@ def cached_candidate(key,headers,density):
             return dict(c,kind='calibrated-button',point=(round(r[0]+saved['x']*size[0]),round(r[1]+saved['y']*size[1])))
     _calibrated.pop(key,None);return None
 
+def _locator_stamp(candidate,rows,density):
+    """Bind a locator to its native ancestors and geometry; moving/rebuilding a panel invalidates it."""
+    by={r['hwnd']:r for r in rows};chain=[];current=by.get(candidate.get('anchor'));seen=set()
+    while current:
+        h=current['hwnd']
+        if h in seen or not current.get('visible'):return None
+        seen.add(h);chain.append((h,current.get('parent'),current.get('class'),current.get('title'),tuple(current['rect'])))
+        current=by.get(current.get('parent'))
+    if not chain or candidate.get('edit') not in by:return None
+    edit=by[candidate['edit']]
+    layout=tuple(sorted((r['hwnd'],r.get('parent') or 0,r.get('class',''),r.get('title',''),tuple(r['rect'])) for r in rows if r.get('visible')))
+    return (density,tuple(chain),candidate['edit'],edit.get('parent'),tuple(edit['rect']),tuple(candidate['point']),layout)
+
+
+def _reuse_locator(key,headers,rows,density):
+    saved=_verified.get(key)
+    if saved:
+        for candidate in headers:
+            stamp=_locator_stamp(candidate,rows,density)
+            if stamp and stamp==saved:return dict(candidate,kind='verified-header-cache')
+        _verified.pop(key,None)
+    return None
+
+
 def refresh(pid,timeout=10,*,expected_image=None,creation_time=None,calibrate=False,progress=None):
     if not _lock.acquire(False):raise RuntimeError('列表刷新或校准正在进行，请稍候')
     try:
@@ -98,7 +123,7 @@ def refresh(pid,timeout=10,*,expected_image=None,creation_time=None,calibrate=Fa
     finally:_lock.release()
 
 def _run(u,pid,timeout,image,created,calibrate,progress):
-    started=time.monotonic();deadline=started+timeout;path=ui._diagnostic_path();trace=[];owned=set();opened=False;stage='验证宿主'
+    started=time.monotonic();deadline=started+timeout;path=ui._diagnostic_path();trace=[];owned=set();opened=False;stage='验证宿主';key=None;fast=False
     def check(target=None):
         if time.monotonic()>=deadline:raise TimeoutError('AE 效果列表刷新超时，未继续操作')
         ui._identity(pid,image,created)
@@ -145,9 +170,18 @@ def _run(u,pid,timeout,image,created,calibrate,progress):
             for seconds in range(5,0,-1):
                 if progress:progress(f'请把鼠标停在 AE“效果和预设”的 ≡ 按钮上，{seconds} 秒后校准；不用点击')
                 time.sleep(1);check()
-        stage='定位效果面板';candidates=locate()
+        stage='定位效果面板'
+        # A cache hit still enumerates native windows and verifies the actual menu every time.
+        # Manual calibration takes priority, and UIA is skipped only for an unchanged, proven header.
+        candidates=[]
+        if not calibrate and key not in _calibrated:
+            rows,tops=ui._native_windows(u,pid);check()
+            cached=_reuse_locator(key,search_headers(rows,density/96),rows,density)
+            if cached:candidates=[cached];fast=True;trace.append({'locatorCache':'hit'})
+        if not candidates:candidates=locate()
         if not candidates and not calibrate:
-            command=ui._panel_command(u,main);trace.append({'windowMenu':command})
+            check(main)
+            command=ui._panel_command(u,main);check(main);trace.append({'windowMenu':command})
             if command['checked']:raise RuntimeError('效果和预设面板已打开，但没有找到它的标签或可核对的搜索标题：请展开面板，或使用“更多 → 校准刷新菜单按钮”')
             check(main)
             if not u.PostMessageW(main,0x111,command['command'],0):raise RuntimeError('无法打开效果和预设面板')
@@ -157,25 +191,34 @@ def _run(u,pid,timeout,image,created,calibrate,progress):
             target=c['target'];check(target);p=W.POINT(*c['point'])
             if not u.ScreenToClient(target,C.byref(p)):raise RuntimeError('无法换算菜单位置')
             packed=((p.y&65535)<<16)|(p.x&65535);down,up,keys=(0x201,0x202,1) if c.get('button') else (0x204,0x205,2)
-            pressed=False
-            try:
-                for message,mask in ((0x200,0),(down,keys),(up,0)):
-                    check(target)
-                    if not u.PostMessageW(target,message,mask,packed):raise RuntimeError('AE 面板消息发送失败')
-                    if message==down:pressed=True
-                    if message==up:pressed=False
-            finally:
-                if pressed and u.IsWindow(target) and ui._owner(u,target)==pid:u.PostMessageW(target,up,0,packed)
-            stage='核对刷新菜单';popup=None;until=min(deadline,time.monotonic()+.8)
+            def click_menu():
+                pressed=False
+                try:
+                    for message,mask in ((0x200,0),(down,keys),(up,0)):
+                        check(target)
+                        if not u.PostMessageW(target,message,mask,packed):raise RuntimeError('AE 面板消息发送失败')
+                        if message==down:pressed=True
+                        if message==up:pressed=False
+                finally:
+                    if pressed and u.IsWindow(target) and ui._owner(u,target)==pid:u.PostMessageW(target,up,0,packed)
+            click_menu()
+            stage='核对刷新菜单';popup=None;until=min(deadline,time.monotonic()+1.3);clicked=time.monotonic();attempts=1
             while time.monotonic()<until:
                 check();owned.update(ui._popups(u,pid));popup=ui._refresh_popup(u,pid);check()
                 if popup:break
                 if owned:time.sleep(.05);check();popup=ui._refresh_popup(u,pid);check();break
+                # Retry only an unopened menu. A visible menu or uncertain command must never be dispatched twice.
+                if not c.get('button') and attempts<3 and time.monotonic()-clicked>=.4*attempts:
+                    click_menu();attempts+=1
                 time.sleep(.03)
-            trace.append({'locator':c['kind'],'menuOpened':bool(owned),'refreshItemFound':bool(popup)})
+            check()
+            trace.append({'locator':c['kind'],'menuOpened':bool(owned),'refreshItemFound':bool(popup),'menuOpenAttempts':attempts})
             if not popup:
                 if c['kind']=='calibrated-button':_calibrated.pop(key,None)
+                if c['kind']=='verified-header-cache':_verified.pop(key,None)
                 if not dismiss():raise RuntimeError('本次临时菜单未关闭，已停止')
+                if fast:
+                    fast=False;check();candidates.extend(locate())
                 continue
             handle,menu,index,command_id=popup
             if handle not in owned:raise RuntimeError('刷新菜单不属于本次操作')
@@ -183,8 +226,10 @@ def _run(u,pid,timeout,image,created,calibrate,progress):
                 r=c['header'];_calibrated[key]={'stamp':(c['anchor'],c['edit'],(r[2]-r[0],r[3]-r[1]),density),'x':(c['point'][0]-r[0])/(r[2]-r[0]),'y':(c['point'][1]-r[1])/(r[3]-r[1])}
                 if not dismiss():_calibrated.pop(key,None);raise RuntimeError('校准菜单未关闭，未保存校准')
                 stage='校准完成';return {'calibrated':True,'nativePaletteRefreshed':False,'commandId':command_id,'dispatchMethod':'calibration-only','contentVerified':False,'diagnosticPath':str(path)}
+            # Recheck the deadline after menu discovery and before every dispatch.
             stage='执行刷新菜单';check(handle);ignored=C.c_size_t();remaining=max(1,min(250,int((deadline-time.monotonic())*1000)))
             if not u.SendMessageTimeoutW(handle,0x1e5,index,0,0x0003,remaining,C.byref(ignored)):raise RuntimeError('AE 菜单无响应，未追加操作')
+            check(handle)
             if not u.GetMenuState(menu,index,0x400)&0x80:raise RuntimeError('未能选中“刷新列表”菜单项，未执行操作')
             for message in (0x100,0x101):
                 check(handle)
@@ -193,9 +238,18 @@ def _run(u,pid,timeout,image,created,calibrate,progress):
             check()
             if u.IsWindow(handle):raise RuntimeError('AE 菜单未关闭，刷新结果不确定')
             owned.clear();stage='完成'
+            if c.get('anchor') and c.get('edit'):
+                rows,_=ui._native_windows(u,pid);check()
+                stamp=_locator_stamp(c,rows,density)
+                if stamp:
+                    # One entry per host PID; stale identities cannot accumulate across restarts.
+                    for old in list(_verified):
+                        if old[0]==pid:_verified.pop(old,None)
+                    _verified[key]=stamp
             return {'nativePaletteRefreshed':True,'commandId':command_id,'panelOpened':opened,'panelExpanded':False,'dispatchMethod':'menu-messages','locator':c['kind'],'contentVerified':False,'diagnosticPath':str(path)}
         raise RuntimeError('菜单中未找到可用的“刷新列表”，未执行其他菜单项；可使用“更多 → 校准刷新菜单按钮”')
     except Exception as error:
+        if key is not None:_verified.pop(key,None)
         trace.append({'error':str(error)});raise RuntimeError(str(error)+'；诊断记录：'+str(path)) from None
     finally:
         dismiss()

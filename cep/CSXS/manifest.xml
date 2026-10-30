@@ -1,6 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- Invisible background extension: hands AE汉化工具's parameter requests to AE without the AfterFX.exe -r relay,
-     which makes AE restore its maximized window. No panel, no menu entry; it starts with AE. -->
+     which makes AE restore its maximized window. No panel, no menu entry; it starts with AE. From AE 2018 (15.x, CEP 8):
+     the script it runs and its ExtendScript calls are the same ones the relay runs there. The required CSXS stays at 6.0:
+     AE 2018 15.1.2 does not register an extension asking for CSXS 8.0 (tested 2026-10-30), though it runs CEP 8. -->
 <ExtensionManifest Version="7.0" ExtensionBundleId="com.verse.aelocalizer" ExtensionBundleVersion="1.0.0" ExtensionBundleName="AE Localizer Bridge"
                    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
   <ExtensionList>
@@ -8,13 +10,13 @@
   </ExtensionList>
   <ExecutionEnvironment>
     <HostList>
-      <Host Name="AEFT" Version="[18.0,99.9]"/>
+      <Host Name="AEFT" Version="[15.0,99.9]"/>
     </HostList>
     <LocaleList>
       <Locale Code="All"/>
     </LocaleList>
     <RequiredRuntimeList>
-      <RequiredRuntime Name="CSXS" Version="9.0"/>
+      <RequiredRuntime Name="CSXS" Version="6.0"/>
     </RequiredRuntimeList>
   </ExecutionEnvironment>
   <DispatchInfoList>

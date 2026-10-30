@@ -307,6 +307,7 @@ QWidget {{ font-size:13px; color:{INK}; }}
 QMainWindow,QDialog,QMessageBox,QFileDialog {{ background:{CANVAS}; }}
 QScrollArea#pageScroll,QScrollArea#pageScroll > QWidget,QWidget#scrollPage {{ background:transparent; border:none; }}
 QScrollArea#reorder,QScrollArea#reorder > QWidget,QWidget#reorderBody {{ background:transparent; border:none; }}
+QScrollArea#promptScroll,QScrollArea#promptScroll > QWidget {{ background:transparent; border:none; }}
 QDialog,QMessageBox,QFileDialog,QMenu,QCheckBox,QComboBox QAbstractItemView {{ color:{INK}; }}
 QCheckBox:disabled {{ color:{FAINT}; }}
 QLabel#muted,QLabel#hint {{ color:{MUTED}; font-size:12px; }}
@@ -692,11 +693,15 @@ class Legend(QWidget):
         row.addStretch()
 
 # Prompts: confirmation and one-line input in the app's own look.
+PROMPT_FRAME=96
 class Prompt(QDialog):
     def __init__(self,parent,title,text,ok_text='确定',danger=False,value=None,label_text='',extra=(),cancel=True):
         super().__init__(parent);self.setObjectName('prompt');self.setWindowTitle(title);self.setMinimumWidth(460);self.choice=None
         col=QVBoxLayout(self);col.setContentsMargins(28,24,28,22);col.setSpacing(10)
-        col.addWidget(label(title,'promptTitle'));body=label(text,'promptText',True);body.setVisible(bool(text));col.addWidget(body)
+        col.addWidget(label(title,'promptTitle'));body=label(text,'promptText',True)
+        # Long text (release notes) scrolls inside the prompt so its buttons never leave the screen.
+        self.text_area=QScrollArea();self.text_area.setObjectName('promptScroll');self.text_area.setWidgetResizable(True);self.text_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.text_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff);self.text_area.setWidget(body);body.setAutoFillBackground(False);self.text_area.setVisible(bool(text));col.addWidget(self.text_area)
         self.edit=None
         if value is not None:
             if label_text:col.addWidget(label(label_text,'field'))
@@ -708,6 +713,14 @@ class Prompt(QDialog):
         ok=button(ok_text,'danger' if danger else 'primary');ok.clicked.connect(self.accept);ok.setDefault(True);row.addWidget(ok);col.addLayout(row)
         if danger:ok.setStyleSheet(f'QPushButton {{ background:{DANGER}; border-color:{DANGER}; color:{PAPER}; font-weight:600; }} QPushButton:hover {{ background:{DANGER_HOVER}; border-color:{DANGER_HOVER}; }}')
         (self.edit or ok).setFocus()
+        if text:self.fit_text(body,max(self.minimumWidth()-56,row.sizeHint().width()))
+    def fit_text(self,body,width):
+        """Shows the whole text when it fits; otherwise caps it so title, text and buttons stay inside the screen."""
+        need=body.heightForWidth(width) if body.hasHeightForWidth() else body.sizeHint().height()
+        self.text_area.setMaximumHeight(0);chrome=self.layout().sizeHint().height()
+        screen=(self.parentWidget() or self).screen().availableGeometry()
+        room=max(120,screen.height()-chrome-PROMPT_FRAME) # PROMPT_FRAME: the window's own title bar and a gap to the screen edges.
+        self.text_area.setFixedHeight(min(need,room))
 
 def confirm(parent,title,text,ok_text='确定',danger=False)->bool:
     return Prompt(parent,title,text,ok_text,danger).exec()==QDialog.DialogCode.Accepted

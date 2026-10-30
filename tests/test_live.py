@@ -24,7 +24,7 @@ class FakeRegistry:
     EFFECTS=[(1000,'S_Glow','Sapphire Lighting'),(2000,'tc Shine','RG Blurs and Glows')]
     def __init__(self,process):self.p=process
     def records(self):
-        return [{'address':address,'displayName':live.decode_name(self.p.memory[address+16],'utf8'),'matchName':key,'category':category,'guard':b'stable-identity'} for address,key,category in self.EFFECTS]
+        return [{'address':address,'nameAt':address+16,'displayName':live.decode_name(self.p.memory[address+16],'utf8'),'matchName':key,'category':category,'guard':b'stable-identity'} for address,key,category in self.EFFECTS]
     def target(self,key):return next(x for x in self.records() if x['matchName']==key)
     def read_record(self,address):return next(x for x in self.records() if x['address']==address)
     unchanged=live.Registry.unchanged
@@ -58,7 +58,7 @@ class UnnamedEffectTests(unittest.TestCase):
         process=FakeProcess();temp=tempfile.TemporaryDirectory();self.addCleanup(temp.cleanup)
         class WithUnnamed(FakeRegistry):
             def records(self):
-                rows=FakeRegistry.records(self)+[{'address':9000,'displayName':'渐变色调','matchName':'','category':'X','guard':b'g'}]*2
+                rows=FakeRegistry.records(self)+[{'address':9000,'nameAt':9016,'displayName':'渐变色调','matchName':'','category':'X','guard':b'g'}]*2
                 self.unnamed=[r['displayName'] for r in rows if not r['matchName']];return [r for r in rows if r['matchName']]
         for target,value in [('data_root',lambda:Path(temp.name)),('current_process',lambda **kw:process),('Registry',WithUnnamed),('main_window',lambda pid:1),
                              ('native_probe',lambda:{'processes':[{'pid':123}]}),('_mutex_name','Local\\AEPluginNameLocalizer.Test.'+Path(temp.name).name)]:

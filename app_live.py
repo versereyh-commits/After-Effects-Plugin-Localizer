@@ -29,7 +29,7 @@ from ui_kit import confirm,choose,inform,ask_text,Prompt,SchemeDelegate,SchemeRo
 from ui_kit import (SHADOW,STATUS_MARK,Banner,DiamondDelegate,Breather,EmptyState,FadeStack,Legend,LoaderButton,MetricTile,UsageTile,NavRail,Pill,SearchField,Spinner,StatusTag,Surface,
                     button,divider,elastic,fade_in,icon,label,logo,menu_button,page_head,repolish,soft_path,table_style)
 
-APP_VERSION='1.3.0'
+APP_VERSION='1.3.1'
 APP_NAME='AE汉化工具'
 # Installed copies: the current folder name, and the folder older versions used (an upgrade keeps it).
 INSTALL_FOLDERS=('AE汉化工具','AE插件名称汉化')
@@ -1428,7 +1428,12 @@ class Window(QMainWindow):
         if not space.exe:self.error('请先定位有效的 AE 安装');return
         from adapter_dialog import AdapterAnalysisDialog
         self.adapter_dialog=AdapterAnalysisDialog(self,space)
-        try:self.adapter_dialog.exec()
+        try:
+            if self.adapter_dialog.exec()==QDialog.DialogCode.Accepted:
+                target=next((s for s in self.spaces if s is space),None)
+                if target is None or not target.live or self.busy():return
+                self.choose_version(self.spaces.index(target))
+                self.connect_live() # Existing connection still validates the running modules and host.
         finally:self.adapter_dialog=None
     def reload_installations(self,selected_exe):
         if self.busy():QTimer.singleShot(50,lambda:self.reload_installations(selected_exe));return

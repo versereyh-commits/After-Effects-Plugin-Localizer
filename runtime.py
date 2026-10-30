@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 
@@ -26,6 +27,52 @@ def short_path(path: Path) -> str:
         if ctypes.windll.kernel32.GetShortPathNameW(str(path), buffer, len(buffer)):return buffer.value
     except (AttributeError, OSError):pass
     return str(path)
+
+
+def _own_folders() -> list[Path]:
+    """Folders holding this program's own DLLs: the frozen bundle (PyInstaller puts it first on PATH and makes it
+    the DLL directory) and PySide6's package (which puts itself first on PATH)."""
+    found = [Path(getattr(sys, "_MEIPASS"))] if getattr(sys, "_MEIPASS", None) else []
+    try:
+        import PySide6
+        found.append(Path(PySide6.__file__).parent)
+    except ImportError:pass
+    return found
+
+
+def host_environment(environ=None) -> dict:
+    """The environment for starting AfterFX.exe: ours without the folders our own Qt and Python live in, and
+    without Qt's plugin paths into them. AE inherits a child's environment; with our PATH, AE 2018 loaded our
+    Qt6Core.dll, whose ICU imports its own unversioned icuuc.dll cannot satisfy (an error box in AE)."""
+    environ = dict(os.environ if environ is None else environ)
+    roots = [os.path.normcase(os.path.abspath(p)) for p in _own_folders()]
+    def ours(entry: str) -> bool:
+        try:entry = os.path.normcase(os.path.abspath(os.path.expandvars(entry.strip().strip('"'))))
+        except (TypeError, ValueError):return False
+        return any(entry == root or entry.startswith(root + os.sep) for root in roots)
+    for key in list(environ):
+        if key.upper() == "PATH":
+            environ[key] = os.pathsep.join(e for e in environ[key].split(os.pathsep) if e and not ours(e))
+        elif key.upper() in ("QT_PLUGIN_PATH", "QML2_IMPORT_PATH") and all(ours(e) for e in environ[key].split(os.pathsep) if e):
+            del environ[key]
+    return environ
+
+
+_dll_directory_lock = threading.Lock()
+
+
+def start_host(args, **options) -> subprocess.Popen:
+    """Starts AfterFX.exe (the -r relay) with host_environment(). The DLL directory the PyInstaller bootloader sets
+    (our bundle) is inherited by child processes too, so it is cleared just for the CreateProcess and put back."""
+    options.setdefault("env", host_environment())
+    if not getattr(sys, "frozen", False):return subprocess.Popen(args, **options)
+    kernel = ctypes.windll.kernel32
+    with _dll_directory_lock:
+        buffer = ctypes.create_unicode_buffer(32768)
+        saved = buffer.value if kernel.GetDllDirectoryW(len(buffer), buffer) else None
+        kernel.SetDllDirectoryW(None)
+        try:return subprocess.Popen(args, **options)
+        finally:kernel.SetDllDirectoryW(saved or None)
 
 
 def relay_script(folder: Path) -> Path:
@@ -165,7 +212,7 @@ def run_catalog_probe(exe: Path, mutate: bool = False, timeout: int = 180, folde
     template = (asset_root()/"scripts"/"catalog_probe.jsx").read_text(encoding="utf-8")
     script.write_text(template.replace("@@OUTPUT@@",json.dumps(output.as_posix(),ensure_ascii=True)).replace("@@MUTATE@@", "true" if mutate else "false"),encoding="utf-8")
     with (folder/"launcher.log").open("w",encoding="utf-8") as log:
-        subprocess.Popen([str(exe),"-r",str(script)],stdout=log,stderr=log,creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0))
+        start_host([str(exe),"-r",str(script)],stdout=log,stderr=log,creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0))
     deadline = time.monotonic()+timeout
     while time.monotonic() < deadline:
         if output.exists():

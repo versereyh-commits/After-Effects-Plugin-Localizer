@@ -21,6 +21,12 @@ static int profile_ok;
 typedef struct {const char *flt,*tdb;uintptr_t root,vector;int named_vector,legacy;uintptr_t map;int tree;} Adapter;
 /* Exported only when the named group's container is a std::map: its iterator type is part of the name. */
 #define TREE_LOOKUP "?LookupStream@TDB_NamedStreamGroup@@AEBA?AV?$_Tree_const_iterator@V?$_Tree_val@U?$_Tree_simple_types@U?$pair@$$CBVTDB_MatchName@@PEAVTDB_StreamBase@@@std@@@std@@@std@@@std@@AEBVTDB_MatchName@@W4IfMissing@TDB_StreamGroup@@@Z"
+/* Host functions taking the host's wide string. AE 2018 spells its allocator differently (dvacore's
+   SmallBlockAllocator); the string itself is the same: buffer or pointer, length +0x10, capacity +0x18, 7 inline. */
+#define WSTR(alloc) "?$basic_string@_WU?$char_traits@_W@std@@" alloc "@std@@"
+#define ALLOC_NEW "U?$STLAllocator@_W@allocator@dvacore@@"
+#define ALLOC_2018 "V?$STLAllocator@_W@SmallBlockAllocator@utility@dvacore@@"
+static FARPROC host_proc(HMODULE module,const char *name,const char *name_2018){FARPROC f=GetProcAddress(module,name);return f?f:GetProcAddress(module,name_2018);}
 static const Adapter adapters[]={
  {"68b229950e95dedf630f5d09653715268e8beba4830590433abe7cb58e78a357","8e1ea3d5e08d91dd25e899d43e0ad69a525b161716bb4c29250e3711b2591c80",0xc8e80,0x220,0,0,0x228},
  {"a4896d34e20f1fb08ba9afd0fc6e428081bd51dba6abb39e87aa6342c973a183","6d8f80729ef02538415bb6578399cee667101b6c218ea73d85d74357558b660e",0xce2f0,0x220,0,1,0x228},
@@ -184,7 +190,7 @@ static int primary_root(HMODULE f,uintptr_t root) {
 }
 static int codec_probe(HMODULE u) {
     typedef WideString *(*Convert)(WideString*,const char*);
-    Convert convert=(Convert)GetProcAddress(u,"?U_MBToUTF16String@@YA?AV?$basic_string@_WU?$char_traits@_W@std@@U?$STLAllocator@_W@allocator@dvacore@@@std@@PEBD@Z");
+    Convert convert=(Convert)host_proc(u,"?U_MBToUTF16String@@YA?AV" WSTR(ALLOC_NEW) "PEBD@Z","?U_MBToUTF16String@@YA?AV" WSTR(ALLOC_2018) "PEBD@Z");
     if(!convert)return 0;
     /* A short, valid UTF-8 sequence which also forms valid pairs in ACP 936.
        Both interpretations stay in the verified MSVC small-string layout. */
@@ -313,7 +319,7 @@ API long setLabel(TaggedData *a,long count,TaggedData *out) {
     if(!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,(LPCWSTR)vt,&owner))return 45;
     if(owner!=GetModuleHandleW(L"TDB.dll")&&owner!=GetModuleHandleW(L"FLT.dll"))return 45;
     typedef const WideString *(*GetName)(const void *);
-    GetName get=(GetName)GetProcAddress(GetModuleHandleW(L"TDB.dll"),"?GetDisplayName@TDB_StreamBase@@QEBAAEBV?$basic_string@_WU?$char_traits@_W@std@@U?$STLAllocator@_W@allocator@dvacore@@@std@@XZ");
+    GetName get=(GetName)host_proc(GetModuleHandleW(L"TDB.dll"),"?GetDisplayName@TDB_StreamBase@@QEBAAEBV" WSTR(ALLOC_NEW) "XZ","?GetDisplayName@TDB_StreamBase@@QEBAAEBV" WSTR(ALLOC_2018) "XZ");
     if(!get)return 32;
     const WideString *current=get((void*)address);
     if(current->capacity>4096||current->length>current->capacity)return 45;
@@ -342,7 +348,7 @@ API long setLabel(TaggedData *a,long count,TaggedData *out) {
     if(length<=7){memcpy(value.data.small,next,(length+1)*2);value.capacity=7;}
     else{value.data.pointer=next;value.capacity=length;}
     typedef void (*SetName)(void *,const WideString *);
-    SetName set=(SetName)GetProcAddress(GetModuleHandleW(L"TDB.dll"),"?SetDisplayName@TDB_StreamBase@@QEAAXAEBV?$basic_string@_WU?$char_traits@_W@std@@U?$STLAllocator@_W@allocator@dvacore@@@std@@@Z");
+    SetName set=(SetName)host_proc(GetModuleHandleW(L"TDB.dll"),"?SetDisplayName@TDB_StreamBase@@QEAAXAEBV" WSTR(ALLOC_NEW) "@Z","?SetDisplayName@TDB_StreamBase@@QEAAXAEBV" WSTR(ALLOC_2018) "@Z");
     if(!set)return 32;
     memset(pf_name,0,32);memcpy(pf_name,next_pf,strlen(next_pf));
     set((void*)address,&value);

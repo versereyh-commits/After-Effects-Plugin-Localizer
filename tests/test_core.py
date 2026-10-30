@@ -72,6 +72,13 @@ class ResourceTests(unittest.TestCase):
         except (UnicodeDecodeError,LookupError):expected=raw.decode("cp1252",errors="replace")
         self.assertEqual(pascal_string(bytes([len(raw)])+raw),expected)
 
+    def test_adobe_localizable_names_show_their_default_text(self):
+        from core import zstring_default
+        self.assertEqual(zstring_default("$$$/AE/Effect/Name/Blend=Blend"),"Blend")
+        self.assertEqual(zstring_default("$$$/AE/Effect/Category/NoiseAndGrain=Noise & Grain"),"Noise & Grain")
+        self.assertEqual(zstring_default("$$$/AE/Effect/Name/X=a=b"),"a=b")
+        for text in ("Glow","$$$/AE/Effect/Name/NoDefault","Levels = Gamma"):self.assertEqual(zstring_default(text),text)
+
     def test_runtime_writer_remains_gated_for_unverified_catalog_change(self):
         self.assertFalse(rename_gate(None)[0])
         self.assertFalse(rename_gate({"hostChangeObserved":True})[0])
