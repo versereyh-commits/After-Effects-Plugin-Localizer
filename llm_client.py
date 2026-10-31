@@ -58,6 +58,12 @@ PARAMETER_PROMPT=('你是 After Effects 视觉特效术语译者。将“效果�
                   '参数标签显示空间很小：每个中文名称最多31个UTF-8字节（约10个汉字），宁可简短也不要超长。'
                   '不要改 id，不要生成代码。只输出 JSON：{"translations":[{"id":"原id","name":"中文名称"}]}。')
 
+# Category names head groups in the Effects & Presets panel; the same 48-byte field as effect names (encode_name checks it).
+CATEGORY_PROMPT=('你是 After Effects 视觉特效术语译者。将“效果和预设”面板中的效果分类名称翻译为简洁自然的简体中文；category 列出该分类下的部分效果，用作上下文。'
+                 '优先采用 Adobe 中文版 After Effects 的分类译法（如 Blur & Sharpen→模糊和锐化、Color Correction→颜色校正、Distort→扭曲、Generate→生成、Stylize→风格化）。'
+                 '保留插件厂商前缀和专有名词（如 BCC、Sapphire、RG、Boris FX）。不同分类不要译成同一个名字。每个中文名称最多47个UTF-8字节。'
+                 '不要改 id，不要生成代码。只输出 JSON：{"translations":[{"id":"原id","name":"中文名称"}]}。')
+
 class TranslationError(RuntimeError):
     def __init__(self,message,partial,total):
         self.partial=dict(partial)
@@ -137,7 +143,7 @@ class _BatchFailed(Exception):
 BATCH_SIZE=10
 PARALLEL_BATCHES=3
 
-def translate_names(items:list[dict],key:str,base_url='https://api.deepseek.com',model='deepseek-flash',progress=None,cancelled=None,*,service:str=DEFAULT_PROVIDER,wait=time.sleep,usage=None,workers=PARALLEL_BATCHES,system_prompt=None)->dict[str,str]:
+def translate_names(items:list[dict],key:str,base_url='https://api.deepseek.com',model='deepseek-flash',progress=None,cancelled=None,*,service:str=DEFAULT_PROVIDER,wait=time.sleep,usage=None,workers=PARALLEL_BATCHES,system_prompt=None,_text_validator=None)->dict[str,str]:
     """Translates in batches of 10, up to `workers` batches at a time; once the service answers 429 the rest go one at a time.
 
     Progress is reported after each validated batch; cancellation is checked before each batch is sent. On a failure no
@@ -193,7 +199,11 @@ def translate_names(items:list[dict],key:str,base_url='https://api.deepseek.com'
                 label=str(raw).strip() if isinstance(raw,(str,int)) and not isinstance(raw,bool) else None
                 identity=numbers.get(label) or (label if label in expected else None)
                 if identity is None or identity in translated:raise ValueError(f'返回了重复或未知标识（{str(raw)[:40]}）')
-                encoded=encode_name(text);translated[identity]=encoded.split(b'\0',1)[0].decode('utf8')
+                if _text_validator is not None:
+                    source=next(item['sourceName'] for item in batch if item['id']==identity)
+                    translated[identity]=_text_validator(source,text)
+                else:
+                    encoded=encode_name(text);translated[identity]=encoded.split(b'\0',1)[0].decode('utf8')
             if set(translated)!=expected:raise ValueError('返回的译文不完整')
         except (KeyError,IndexError,TypeError,ValueError,AttributeError) as error:
             # Our own validation messages carry no secrets and tell the user what to fix.
@@ -221,6 +231,13 @@ def translate_names(items:list[dict],key:str,base_url='https://api.deepseek.com'
 
 # Words in model ids that mark services other than chat (embeddings, speech, images, moderation).
 NOT_CHAT=('embed','tts','whisper','dall-e','moderation','transcribe','audio','realtime','image','davinci','babbage','rerank','search')
+
+def translate_ui_strings(items,key,base_url='https://api.deepseek.com',model='deepseek-flash',**options):
+    from panel_localizer import validate_text
+    prompt=('将 After Effects 扩展或 ScriptUI 的界面文案翻译为自然简体中文。category 仅作界面上下文。'
+            '保留占位符、格式符、换行和转义的含义；不生成代码，不改变 id。允许完整翻译长提示，不采用效果名称字节限制。'
+            '只输出 JSON：{"translations":[{"id":"原id","name":"中文文案"}]}。')
+    return translate_names(items,key,base_url,model,system_prompt=prompt,_text_validator=validate_text,**options)
 
 def list_models(service:str,base_url:str,key:str,*,opener=urlopen)->list[str]:
     """Model ids the service offers right now (GET .../models). Only the key is sent; obvious non-chat

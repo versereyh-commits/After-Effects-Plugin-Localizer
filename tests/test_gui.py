@@ -9,6 +9,7 @@ from PySide6.QtWidgets import QApplication
 import app_live
 import live_names
 import effect_instances
+import effect_categories,effect_menu_names
 import settings_store
 from core import Plugin
 from app_live import CHECK,CANDIDATE,CURRENT,KEY
@@ -24,7 +25,7 @@ class GuiCase(unittest.TestCase):
         # the real host when another Qt test processes the event queue.
         timer=patch.object(app_live.QTimer,'singleShot');timer.start();self.addCleanup(timer.stop)
         self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup);root=Path(self.temp.name)
-        for module in (app_live,settings_store,live_names,effect_instances):
+        for module in (app_live,settings_store,live_names,effect_instances,effect_categories,effect_menu_names):
             handle=patch.object(module,'data_root',lambda:root);handle.start();self.addCleanup(handle.stop)
         # No real AE installation leaks in: one fallback version holds every plugin.
         for name,value in (('installations',lambda:self.installs()),('shared_roots',lambda:[]),('file_version',lambda exe:self.versions[Path(exe).parent.parent.name])):
@@ -269,7 +270,7 @@ class VersionTests(GuiCase):
         w.show_scan(([plugin('S_Glow','S_Glow','Sapphire',str(base/'Adobe After Effects 2026'/'Support Files'/'Plug-ins'/'S_Glow.aex')),
                       plugin('Old','Old Effect','Legacy',str(base/'Adobe After Effects 2021'/'Support Files'/'Plug-ins'/'Old.aex')),
                       plugin('Shine','tc Shine','RG',str(Path(self.temp.name)/'MediaCore'/'Shine.aex'))],[]))
-    def keys(self):return {self.table.item(r,KEY).text() for r in range(self.table.rowCount())}
+    def keys(self):return {self.table.item(r,KEY).text() for r in self.window.effect_rows()}
     def items(self):return [self.window.version_box.itemText(i) for i in range(self.window.version_box.count())]
     def test_versions_are_detected_and_the_supported_build_is_live(self):
         self.assertEqual((self.v26.live,self.v21.live),(True,False));self.assertIs(self.window.space,self.v26)
@@ -289,9 +290,9 @@ class VersionTests(GuiCase):
         self.window.choose_version(1)
         self.assertEqual(self.window.pending,{'tc Shine':'旧闪耀'});self.assertEqual(self.window.enabled,{'tc Shine'})
     def test_unsupported_version_cannot_rename_live(self):
-        self.window.show_live({'pid':1,'effects':[{'matchName':'tc Shine','displayName':'Shine','category':'c'}]});self.window.update_buttons();self.select(0)
+        self.window.show_live({'pid':1,'effects':[{'matchName':'tc Shine','displayName':'Shine','category':'c'}]});self.window.update_buttons();self.select(self.window.effect_rows()[0])
         self.assertTrue(self.window.apply_btn.isEnabled())
-        self.window.choose_version(1);self.select(0)
+        self.window.choose_version(1);self.select(self.window.effect_rows()[0])
         for widget in (self.window.apply_btn,self.window.restore_btn,self.window.restore_all_action,self.window.refresh_btn,self.window.parameters_btn,self.window.parameter_page.apply_btn):
             self.assertFalse(widget.isEnabled())
         self.assertEqual(self.table.item(self.rows_for('tc Shine')[0],CURRENT).text(),'仅翻译 · 不支持实时改名')
@@ -362,7 +363,7 @@ class SupportedBuildGuiTests(GuiCase):
     def test_each_verified_build_enables_native_actions_and_binds_its_path(self):
         for index,space in enumerate(self.window.spaces):
             self.window.choose_version(index)
-            self.window.show_live({'pid':1,'image':str(space.exe),'effects':[]});self.window.update_buttons();self.select(0)
+            self.window.show_live({'pid':1,'image':str(space.exe),'effects':[]});self.window.update_buttons();self.select(self.window.effect_rows()[0])
             self.assertTrue(space.live)
             for button in (self.window.apply_btn,self.window.restore_btn,self.window.parameters_btn,self.window.refresh_btn):self.assertTrue(button.isEnabled())
             self.assertEqual(self.window.session.expected_image,space.exe);self.assertEqual(self.window.parameter_session.expected_image,space.exe)
@@ -437,7 +438,7 @@ class NavigationTests(GuiCase):
         translate=self.submenu(w.more_tool,'翻译').actions();self.assertIn(w.translate_checked_action,translate);self.assertIn(w.retranslate_checked_action,translate)
         self.assertIn(w.refresh_action,w.more_tool.menu().actions())
         restore=w.restore_tool.menu().actions();self.assertIn(w.restore_checked_action,restore);self.assertIn(w.restore_all_action,restore);self.assertNotIn(w.restore_selected_action,restore)
-        self.assertEqual([a.text() for a in w.check_tool.menu().actions() if a.text()],['勾选当前筛选结果','取消勾选当前筛选结果','取消全部勾选','只看勾选项','收藏勾选项到“默认收藏夹”','把勾选项加入收藏夹','从“默认收藏夹”移出勾选项'])
+        self.assertEqual([a.text() for a in w.check_tool.menu().actions() if a.text()],['勾选当前筛选结果','取消勾选当前筛选结果','取消全部勾选','只看勾选项','只勾选分类名','收藏勾选项到“默认收藏夹”','把勾选项加入收藏夹','从“默认收藏夹”移出勾选项'])
         self.assertIn(w.manage_action,w.scheme_menu().actions())
         w.manage_action.trigger();self.assertEqual(w.pages.currentIndex(),app_live.SCHEMES)
     def test_effect_menus_no_longer_carry_parameter_options(self):
@@ -506,7 +507,7 @@ class ApiDialogTests(GuiCase):
         self.assertEqual(calls,[('http://localhost:11434/v1','qwen2.5:7b','ollama')]);self.assertIn('高斯模糊',dialog.error.text())
         self.assertEqual(self.window.settings.service,'deepseek')
     def test_translation_asks_for_settings_until_service_is_ready(self):
-        self.select(0)
+        self.select(self.window.effect_rows()[0])
         with patch.object(self.window,'configure_api',return_value=False) as asked,patch.object(self.window,'work',side_effect=AssertionError('must not translate')):
             self.window.translate_selected()
         asked.assert_called_once()

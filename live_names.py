@@ -298,7 +298,14 @@ class NameSession:
             journal=self.journal()
             wanted=list(journal['entries']) if keys is None else [k for k in keys if k in journal['entries']]
             if not wanted:return {'restored':{}}
-            if not any(row.get('pid')==journal.get('pid') for row in native_probe().get('processes',[])):
+            probe=native_probe()
+            if not isinstance(probe,dict) or probe.get('error') or not isinstance(probe.get('processes'),list):
+                raise RuntimeError('无法核对 AE 宿主；效果名称恢复记录已保留')
+            if not any(row.get('pid')==journal.get('pid') for row in probe['processes']):
+                # An empty diagnostic list is not proof of exit (enumeration can fail).
+                from host_identity import running_pids
+                if journal.get('pid') in running_pids():
+                    raise RuntimeError('原 AE 宿主仍在运行但诊断未能识别；效果名称恢复记录已保留')
                 _save(self.journal_path,{'schemaVersion':1,'entries':{}})
                 return {'restored':{},'oldProcessEnded':True}
             with self.process() as p:

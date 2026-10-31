@@ -15,7 +15,7 @@ from ui_kit import SHADOW,Banner,SearchField,Surface,button,confirm,icon,label,t
 
 PORTABLE=QKeySequence.SequenceFormat.PortableText
 NATIVE=QKeySequence.SequenceFormat.NativeText
-PAGES=('效果名称','参数名称','翻译方案','AE 版本','设置与日志','快速搜索')   # by page number (app_live.QUICK came last)
+PAGES=('效果名称','参数名称','翻译方案','AE 版本','设置与日志','快速搜索','面板与脚本')   # append only: preserve saved page shortcut IDs
 
 class Command(NamedTuple):
     id:str

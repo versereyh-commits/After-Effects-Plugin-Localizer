@@ -9,7 +9,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt,QEvent,QObject,QEasingCurve,QPoint,QPointF,QPropertyAnimation,QRect,QRectF,QSize,QTimer,QVariantAnimation,Signal
 from PySide6.QtGui import QColor,QCursor,QFont,QFontMetrics,QIcon,QPainter,QPainterPath,QPen,QPixmap,QPolygonF
 from PySide6.QtWidgets import (QAbstractItemView,QApplication,QCheckBox,QComboBox,QDialog,QScrollArea,QMainWindow,QListWidget,QFrame,QGraphicsOpacityEffect,QHBoxLayout,QHeaderView,QLabel,QLineEdit,QMenu,QPushButton,QSizePolicy,QStackedWidget,
-                               QStyle,QStyledItemDelegate,QStyleOptionViewItem,QToolButton,QVBoxLayout,QWidget)
+                               QStyle,QStyledItemDelegate,QStyleOptionViewItem,QTableWidget,QTableWidgetItem,QToolButton,QVBoxLayout,QWidget)
 
 # Tokens: one ink, one paper, greys between. Colour appears only for errors.
 # Dark mode swaps the two: chalk on slate, the ink blocks turn light with dark text on them.
@@ -104,6 +104,7 @@ def _draw(name,painter,color):
     elif name=='chevron_up':_poly(painter,(7,14.5),(12,9.5),(17,14.5))
     elif name=='chevron_right':_poly(painter,(9.5,7),(14.5,12),(9.5,17))
     elif name=='tick':_stroke(painter,color,3.0);_poly(painter,(5.5,12.5),(10,17),(18.5,7.5))
+    elif name=='dash':_stroke(painter,color,3.0);painter.drawLine(QPointF(6.5,12),QPointF(17.5,12))
     elif name=='check':_stroke(painter,color,2.3);_poly(painter,(5,12.5),(10,17),(19,7.5))
     elif name=='refresh':painter.drawArc(QRectF(4.5,4.5,15,15),40*16,290*16);_poly(painter,(19.5,4.5),(19.6,9.6),(14.5,9.4))
     elif name=='restore':painter.drawArc(QRectF(4.5,4.5,15,15),110*16,-290*16);_poly(painter,(4.5,4.5),(4.4,9.6),(9.5,9.4))
@@ -132,6 +133,8 @@ def _draw(name,painter,color):
     elif name=='trash':
         painter.drawLine(QPointF(4,6.5),QPointF(20,6.5));_poly(painter,(9.5,6.5),(9.5,4),(14.5,4),(14.5,6.5));_poly(painter,(6,6.5),(7,20),(17,20),(18,6.5))
         painter.drawLine(QPointF(10,10.5),QPointF(10,16.5));painter.drawLine(QPointF(14,10.5),QPointF(14,16.5))
+    elif name=='panel':
+        painter.drawRoundedRect(QRectF(3,4.5,18,15),2.5,2.5);painter.drawLine(QPointF(3,9),QPointF(21,9));painter.drawLine(QPointF(9.5,9),QPointF(9.5,19.5))
     elif name=='plug':
         _poly(painter,(8,3),(8,8));_poly(painter,(16,3),(16,8));_poly(painter,(5,8),(19,8),(19,12),(15.5,16),(8.5,16),(5,12),closed=True);painter.drawLine(QPointF(12,16),QPointF(12,21))
 
@@ -301,7 +304,7 @@ def stylesheet()->str:
         path=folder/f"{name}-{color.strip('#')}.png"
         if not path.exists():pixmap(name,color,12).save(str(path))
         return path.as_posix()
-    down=asset('chevron',MUTED);down_light=asset('chevron',ON_INK);up=asset('chevron_up',MUTED);right=asset('chevron_right',MUTED);tick=asset('tick',ON_INK)
+    down=asset('chevron',MUTED);down_light=asset('chevron',ON_INK);up=asset('chevron_up',MUTED);right=asset('chevron_right',MUTED);tick=asset('tick',ON_INK);dash=asset('dash',ON_INK)
     return f"""
 QWidget {{ font-size:13px; color:{INK}; }}
 QMainWindow,QDialog,QMessageBox,QFileDialog {{ background:{CANVAS}; }}
@@ -391,6 +394,7 @@ QCheckBox {{ spacing:9px; }}
 QCheckBox::indicator,QTableView::indicator,QListView::indicator {{ width:16px; height:16px; border-radius:5px; border:1px solid {BOX}; background:{PAPER}; }}
 QCheckBox::indicator:hover,QTableView::indicator:hover {{ border-color:{INK}; }}
 QCheckBox::indicator:checked,QTableView::indicator:checked,QListView::indicator:checked {{ background:{INK}; border-color:{INK}; image:url({tick}); }}
+QTableView::indicator:indeterminate {{ background:{INK}; border-color:{INK}; image:url({dash}); }}
 QCheckBox::indicator:disabled {{ background:{CANVAS}; border-color:{LINE}; }}
 QCheckBox::indicator:checked:disabled,QTableView::indicator:checked:disabled {{ background:{CHECK_DISABLED}; border-color:{CHECK_DISABLED}; }}
 QDialog#prompt {{ background:{PAPER}; }}
@@ -749,11 +753,11 @@ def _tag(painter,right,top,text,font,filled=True)->float:
 
 def _scheme_text(painter,rect,data,font,selected_fill=None):
     """Shared drawing for a scheme in the list and in the switcher menu:
-    bold title with 当前 / 未保存 tags, then quiet lines (counts, time)."""
+    bold title with 当前 / 未保存 tags (or the given tags), then quiet lines (counts, time)."""
     title=QFont(font);title.setPixelSize(14);title.setWeight(QFont.Weight.DemiBold);small=QFont(font);small.setPixelSize(11);small.setWeight(QFont.Weight.DemiBold)
-    right=rect.right()-10
-    if data.get('dirty'):right=_tag(painter,right,rect.y()+10,'未保存',small,False)-6
-    if data.get('current'):right=_tag(painter,right,rect.y()+10,'当前',small)-6
+    right=rect.right()-10;tags=data.get('tags')
+    if tags is None:tags=([('未保存',False)] if data.get('dirty') else [])+([('当前',True)] if data.get('current') else [])
+    for text,filled in tags:right=_tag(painter,right,rect.y()+10,text,small,filled)-6
     x=rect.x()+14;painter.setFont(title);painter.setPen(QColor(INK));width=int(right-x-4)
     painter.drawText(QRectF(x,rect.y()+9,width,20),Qt.AlignmentFlag.AlignVCenter|Qt.AlignmentFlag.AlignLeft,QFontMetrics(title).elidedText(data.get('title',''),Qt.TextElideMode.ElideRight,width))
     meta=QFont(font);meta.setPixelSize(12);painter.setFont(meta);painter.setPen(QColor(MUTED))
@@ -1082,6 +1086,7 @@ class StarDelegate(QStyledItemDelegate):
     def paint(self,painter,option,index):
         opt=QStyleOptionViewItem(option);self.initStyleOption(opt,index);opt.text=''
         style=opt.widget.style() if opt.widget else QApplication.style();style.drawControl(QStyle.ControlElement.CE_ItemViewItem,opt,painter,opt.widget)
+        if index.data(HEAD_ROLE) is not None:return     # a group's header row: nothing to favourite
         on=bool(index.data());hover=bool(option.state&QStyle.StateFlag.State_MouseOver)
         centre=QRectF(option.rect).center();painter.save();painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.drawPixmap(QRectF(centre.x()-8,centre.y()-8,16,16).toRect(),pixmap('star_fill' if on else 'star',INK if on else MUTED if hover else FAINT,16));painter.restore()
@@ -1354,6 +1359,66 @@ class CheckDragger(QObject):
         if self.state is None:self.scroller.stop();return
         bar=self.table.verticalScrollBar();bar.setValue(bar.value()+self.direction*bar.singleStep())
         point=self.table.viewport().mapFromGlobal(QCursor.pos());self.sweep(self.table.rowAt(max(1,min(point.y(),self.table.viewport().height()-2))))
+
+# Grouped rows: a header row above each group's rows, kept together by sorting and folded by the user.
+HEAD_ROLE=Qt.ItemDataRole.UserRole+20   # on every cell of a header row: the group's key
+
+class GroupItem(QTableWidgetItem):
+    """A cell of a GroupTable. `group` and `head` keep a group's rows together, header first, in either sort
+    order; `hit` (on the row's first cell) says whether the row passes the current filter, folded or not."""
+    group='';head=False;hit=True
+    def __lt__(self,other):
+        table=self.tableWidget();down=table is not None and getattr(table,'order',None)==Qt.SortOrder.DescendingOrder
+        def rank(item):
+            group=getattr(item,'group','')
+            # Qt sorts descending by asking other<self, so the header ranks after its rows then and still comes first.
+            return (group.casefold() or '￿',group,getattr(item,'head',False)==down,item.text().casefold())
+        return rank(self)<rank(other)
+
+def group_cell(text,group,head=False)->GroupItem:
+    item=GroupItem(text);item.group=group;item.head=head
+    if head:item.setData(HEAD_ROLE,group)
+    return item
+
+class GroupTable(QTableWidget):
+    """A table of GroupItem rows in groups. A header click or sortItems orders the groups by name and the rows inside
+    each group by the column. Qt's own sorting stays off (it re-sorts after every edit, moving a row away while it is
+    being changed): setSortingEnabled only keeps the flag, so callers that pause it around updates still work."""
+    def __init__(self,rows,columns,parent=None):
+        super().__init__(rows,columns,parent);self.order=Qt.SortOrder.AscendingOrder;self.sorting=False
+    def setSortingEnabled(self,on):self.sorting=bool(on)
+    def isSortingEnabled(self)->bool:return self.sorting
+    def sortItems(self,column,order=Qt.SortOrder.AscendingOrder):self.order=order;super().sortItems(column,order)
+    def setHorizontalHeader(self,header):
+        super().setHorizontalHeader(header);header.setSortIndicatorShown(True);header.setSectionsClickable(True)
+        header.sortIndicatorChanged.connect(self.sortItems)
+    def resort(self):
+        header=self.horizontalHeader();self.sortItems(max(header.sortIndicatorSection(),0),header.sortIndicatorOrder())
+
+class TreeDelegate(QStyledItemDelegate):
+    """The name column of a GroupTable: a chevron before each header (right = folded, down = open) and every row of
+    a group indented under its header's name. is_open(group) answers for a header; drawn in the current palette."""
+    INDENT=30
+    def __init__(self,parent,is_open):
+        super().__init__(parent);self.is_open=is_open;blank=QPixmap(1,1);blank.fill(Qt.GlobalColor.transparent);self.blank=QIcon(blank)
+    def initStyleOption(self,option,index):
+        super().initStyleOption(option,index);group=index.data(HEAD_ROLE)
+        option.features|=QStyleOptionViewItem.ViewItemFeature.HasDecoration
+        if group is None:option.icon=self.blank;option.decorationSize=QSize(self.INDENT,16)
+        else:option.icon=icon('chevron' if self.is_open(group) else 'chevron_right',INK_2,16);option.decorationSize=QSize(16,16)
+
+class IndentCheckDelegate(QStyledItemDelegate):
+    """The box column of a GroupTable: the boxes of a group's rows sit further in than the group's own box."""
+    INDENT=14
+    def paint(self,painter,option,index):
+        opt=QStyleOptionViewItem(option);self.initStyleOption(opt,index);style=opt.widget.style() if opt.widget else QApplication.style()
+        if index.data(HEAD_ROLE) is not None or not opt.features&QStyleOptionViewItem.ViewItemFeature.HasCheckIndicator:
+            style.drawControl(QStyle.ControlElement.CE_ItemViewItem,opt,painter,opt.widget);return
+        box=style.subElementRect(QStyle.SubElement.SE_ItemViewItemCheckIndicator,opt,opt.widget).translated(self.INDENT,0);state=opt.checkState
+        opt.features&=~QStyleOptionViewItem.ViewItemFeature.HasCheckIndicator;style.drawControl(QStyle.ControlElement.CE_ItemViewItem,opt,painter,opt.widget)
+        mark=QStyleOptionViewItem(opt);mark.rect=box
+        mark.state=(opt.state&~(QStyle.StateFlag.State_On|QStyle.StateFlag.State_Off|QStyle.StateFlag.State_NoChange))|{Qt.CheckState.Checked:QStyle.StateFlag.State_On,Qt.CheckState.PartiallyChecked:QStyle.StateFlag.State_NoChange}.get(state,QStyle.StateFlag.State_Off)
+        style.drawPrimitive(QStyle.PrimitiveElement.PE_IndicatorItemViewItemCheck,mark,painter,opt.widget)
 
 def check_state(flags)->Qt.CheckState:
     """Header state for a list of booleans: none, some or all."""

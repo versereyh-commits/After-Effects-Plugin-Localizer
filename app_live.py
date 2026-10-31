@@ -7,16 +7,19 @@ import json,os,re,shutil,subprocess,sys,threading
 from PySide6.QtCore import Qt,QEvent,QEventLoop,QObject,QTimer,QItemSelection,QItemSelectionModel,QPoint,QRect,QRectF,QSize,QEasingCurve,QUrl,Signal
 from PySide6.QtGui import QAction,QColor,QDesktopServices,QFont,QKeySequence,QPainter,QShortcut
 from PySide6.QtWidgets import (QApplication,QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,QLabel,QPushButton,QLineEdit,QTableWidget,QTableWidgetItem,QHeaderView,QPlainTextEdit,QFileDialog,QCheckBox,QDialog,QFormLayout,QMessageBox,
-                               QComboBox,QInputDialog,QMenu,QFrame,QToolButton,QButtonGroup,QListWidget,QListWidgetItem,QSizePolicy,QGridLayout,QGraphicsOpacityEffect,QAbstractItemView,QWidgetAction,QScrollArea,QSystemTrayIcon)
+                               QComboBox,QMenu,QFrame,QToolButton,QButtonGroup,QListWidget,QListWidgetItem,QSizePolicy,QGridLayout,QGraphicsOpacityEffect,QAbstractItemView,QWidgetAction,QScrollArea,QSystemTrayIcon)
 from app import Job,apply_theme
 from core import scan,installations,shared_roots,readable_category
 from live_names import NameSession,read_live,UNSUPPORTED
 from ae_ui import refresh_effects
 from runtime import data_root,file_version,write_json_atomic
 from settings_store import Settings
-from llm_client import translate_names,TranslationError,PROVIDERS,PARAMETER_PROMPT,list_models
+from llm_client import translate_names,TranslationError,PROVIDERS,PARAMETER_PROMPT,CATEGORY_PROMPT,list_models
 from parameter_names import ParameterSession,identity,split_identity,validate_label
 from effect_instances import EffectInstanceSession
+from effect_categories import CategorySession,supported_build as category_build
+from effect_menu_names import MenuNameSession
+import time
 from ae_profiles import is_supported,supported_text
 from ae_paths import installed_flt_sha
 import autostart,cep_bridge,release_notes,ui_kit,token_usage,updater
@@ -25,18 +28,20 @@ from shortcuts import Keymap,ShortcutDialog,PAGES,local_shortcut
 from quick_search import AeHotkey,HOTKEY_ID,QuickSearch,build_entries,record_timing
 from favorites import Favorites
 import favorites as favorites_store
-from ui_kit import confirm,choose,inform,ask_text,Prompt,SchemeDelegate,SchemeRow,SchemeSwitcher,CheckHeader,CheckDragger,TrashDelegate,check_state
+from ui_kit import confirm,choose,inform,ask_text,Prompt,SchemeDelegate,SchemeRow,SchemeSwitcher,CheckHeader,CheckDragger,TrashDelegate,check_state,GroupTable,group_cell
 from ui_kit import (SHADOW,STATUS_MARK,Banner,DiamondDelegate,Breather,EmptyState,FadeStack,Legend,LoaderButton,MetricTile,UsageTile,NavRail,Pill,SearchField,Spinner,StatusTag,Surface,
                     button,divider,elastic,fade_in,icon,label,logo,menu_button,page_head,repolish,soft_path,table_style)
 
-APP_VERSION='1.3.1'
+APP_VERSION='1.4.0'
 APP_NAME='AE汉化工具'
 # Installed copies: the current folder name, and the folder older versions used (an upgrade keeps it).
 INSTALL_FOLDERS=('AE汉化工具','AE插件名称汉化')
 # Shown on the settings page; wording chosen by the user.
-THANKS='AE 效果名称实时汉化的可行性最早由「帧绘剪工作室」验证跑通。本软件在此基础上独立实现，谨此致谢。'
+THANKS=('AE 效果名称实时汉化的可行性最早由「帧绘剪工作室」验证跑通。本软件在此基础上独立实现，谨此致谢。\n'
+        '感谢群友「白嫖」对“面板与脚本”功能的支持。')
 # Shown under the acknowledgement: what users should not expect.
-LIMITS=('· 中文只写在正在运行的 AE 里，不改插件文件：AE 重启后恢复原名，需打开本软件连接 AE 重新应用（效果名称可自动）。\n'
+LIMITS=('· 效果与参数汉化只写在正在运行的 AE 里，不改插件文件：AE 重启后恢复原名，需打开本软件连接 AE 重新应用（效果名称可自动）。\n'
+        '· 面板与脚本汉化会备份并修改本地文件，重新打开面板后生效；恢复时遇到外部修改会停止覆盖。JSXBIN 不支持。\n'
         '· 参数名称每次都要在参数页读取后应用，不会自动重新应用。\n'
         '· 只有已验证的 AE 构建能实时汉化；其他版本需先在“AE 版本”页自动识别与适配。\n'
         '· 下拉菜单选项和插件自绘的界面无法汉化；参数名称最多约 10 个汉字，效果名称约 15 个汉字。\n'
@@ -359,7 +364,7 @@ class ApiDialog(QDialog):
         super().reject()
 
 # Page numbers (and the page0... shortcut ids); the quick search page came last, though the rail lists it under 汉化.
-EFFECTS,PARAMETERS,SCHEMES,VERSIONS,SETTINGS,QUICK=range(6)
+EFFECTS,PARAMETERS,SCHEMES,VERSIONS,SETTINGS,QUICK,PANELS=range(7)
 MISSING='当前 AE 未加载'
 ROW_FILTERS=(('all','全部'),('applied','已应用'),('missing','未加载'),('favorite','已收藏'))
 TILE_MARKS={'applied':'solid','missing':'dash','favorite':'star'}
@@ -531,6 +536,7 @@ class Window(QMainWindow):
         load_warning=self.bind_space(space)
         self.parameter_session=ParameterSession()
         self.instance_session=EffectInstanceSession()
+        self.category_session=CategorySession();self.menu_name_session=MenuNameSession(self.session,self.category_session)
         self.bind_targets()
         load_warning='\n'.join(x for x in (load_warning,self.bind_parameter_stores(space)) if x)
         self.make_actions()
@@ -539,7 +545,7 @@ class Window(QMainWindow):
         main=QVBoxLayout();main.setContentsMargins(24-SHADOW,22,24-SHADOW,10);main.setSpacing(14)
         self.banner=Banner('warn','自动识别与适配…',lambda:self.analyze_adapter(self.space));self.note=self.banner.text;main.addWidget(inset(self.banner))
         self.pages=FadeStack()
-        for build in (self.build_effects_page,self.build_parameters_page,self.build_schemes_page,self.build_versions_page,self.build_settings_page,self.build_quick_page):self.pages.addWidget(build())
+        for build in (self.build_effects_page,self.build_parameters_page,self.build_schemes_page,self.build_versions_page,self.build_settings_page,self.build_quick_page,self.build_panels_page):self.pages.addWidget(build())
         main.addWidget(self.pages,1)
         foot=QHBoxLayout();foot.setContentsMargins(SHADOW,0,SHADOW,0);foot.setSpacing(8)
         self.progress=Spinner('arc');self.progress.hide();foot.addWidget(self.progress)
@@ -549,7 +555,7 @@ class Window(QMainWindow):
         self.buttons=(self.version_box,self.connect_btn,self.scheme_switcher,self.check_tool,self.more_tool,self.restore_tool,self.refresh_btn,
                       self.apply_btn,self.restore_btn,self.translate_btn,self.parameters_btn,self.reveal_btn,*self.all_actions,
                       self.page_save_as_btn,self.page_import_btn,self.load_scheme_btn,self.scheme_apply_btn,self.scheme_restore_btn,self.add_effects_btn,self.delete_checked_btn,self.discard_btn,self.scheme_more,self.empty_save_btn,
-                      self.paths_btn,self.scan_btn,self.use_version_btn,self.dir_btn,self.analyze_btn,self.api_btn,*self.parameter_page.controls)
+                      self.paths_btn,self.scan_btn,self.use_version_btn,self.dir_btn,self.analyze_btn,self.api_btn,*self.parameter_page.controls,*self.panel_page.controls)
         for warning in self.settings.warnings:self.log.appendPlainText(warning)
         if self.favorites.warning:self.log.appendPlainText(self.favorites.warning)
         if load_warning:self.log.appendPlainText(load_warning)
@@ -633,7 +639,7 @@ class Window(QMainWindow):
         self._bilingual=bool(on);self.save_ui_preference('bilingualNames',self._bilingual)
         # What counts as "applied" follows the chosen form, so every row is re-judged.
         self._fill=True;self.table.setSortingEnabled(False)
-        for row in range(self.table.rowCount()):self.color_current(row)
+        for row in self.effect_rows():self.color_current(row)
         self.table.setSortingEnabled(True);self._fill=False;self.filter_rows();self.show_detail(self.selected_rows())
         self.status.setText('双语写入已开启：之后应用的效果名称为“英文原名 (中文)”' if self._bilingual else '双语写入已关闭：之后应用的效果名称只写中文')
     def target_name(self,english:str,chinese:str)->str:
@@ -749,15 +755,19 @@ class Window(QMainWindow):
         self.apply_selected_action=A('应用此效果的名称',self.apply_selected)
         self.restore_selected_action=A('恢复此效果原名',self.restore_selected)
         self.restore_checked_action=A('恢复勾选项原名',self.restore_checked)
-        self.restore_all_action=A('一键恢复全部默认（含参数）',self.restore_all,'restore_all',tip='把本软件改过的所有效果和参数名称恢复为 AE 原名；方案和勾选保留')
+        self.restore_all_action=A('一键恢复全部默认（含参数和分类）',self.restore_all,'restore_all',tip='把本软件改过的效果、参数和分类名称恢复为 AE 原名；方案和勾选保留')
+        self.restore_categories_action=A('恢复效果分类名',lambda:self.restore_categories(),tip='只把本软件改过的效果分类名恢复为 AE 原名，效果名称和参数名称不动')
         self.refresh_action=A('刷新 AE“效果和预设”列表',self.refresh_native,'refresh')
         self.calibrate_refresh_action=A('校准刷新菜单按钮…',self.calibrate_refresh_menu,tip='5 秒内把鼠标停在 AE 效果和预设的菜单按钮上；只核对菜单，不刷新。本次 AE 会话有效，布局或缩放变化需重校准。')
-        self.check_filtered_action=A('勾选当前筛选结果',lambda:self.check_visible(True),'check_filtered')
+        self.check_filtered_action=A('勾选当前筛选结果',lambda:self.check_visible(True),'check_filtered',tip='同时勾选匹配效果所属的分类名；应用分类名影响 AE 中该分类的全部效果，包括筛选隐藏项')
         self.uncheck_filtered_action=A('取消勾选当前筛选结果',lambda:self.check_visible(False))
-        self.uncheck_all_action=A('取消全部勾选',lambda:self.check_keys(set(self.enabled),False),'uncheck_all',tip='包括被筛选隐藏的效果')
+        self.uncheck_all_action=A('取消全部勾选',lambda:(self.ticked.clear(),self.check_keys(set(self.enabled),False)),'uncheck_all',tip='包括被筛选隐藏的效果和分类')
         # Took over from the 已勾选 tile: the table lists only the checked effects (with the tiles and the search).
         self.only_checked_action=A('只看勾选项',lambda:self.set_only_checked(self.only_checked_action.isChecked()),tip='表格只列出勾选的效果；统计卡和搜索照常筛选')
         self.only_checked_action.setCheckable(True)
+        # Categories on their own: a category's box then selects just its name; the effects are checked separately.
+        self.categories_only_action=A('只勾选分类名',lambda:self.set_categories_only(self.categories_only_action.isChecked()),tip='开启后，勾选分类的方框只选中分类名本身，不再连带勾选其下的效果；效果仍可单独勾选')
+        self.categories_only_action.setCheckable(True);self.categories_only_action.setChecked(self.categories_only)
         # The two texts name the current folder (favorites_changed keeps them up to date).
         folder=self.favorites.current
         self.favorite_checked_action=A(f'收藏勾选项到“{folder}”',lambda:self.favorite_keys(self.checked_keys(),True),tip='把勾选的效果加入当前收藏夹（排在已有收藏之后）；快速搜索时置顶')
@@ -784,7 +794,7 @@ class Window(QMainWindow):
         names=QVBoxLayout();names.setSpacing(0);names.addWidget(label('AE插件汉化','brand'));names.addWidget(label(f'After Effects · {APP_VERSION}','brandSub'));brand.addLayout(names);brand.addStretch();col.addLayout(brand)
         # nav_buttons follows the page numbers; the rail shows them in its own order.
         self.nav_group=QButtonGroup(self);self.nav_buttons=[None]*len(PAGES)
-        for section,items in (('汉化',(('效果名称','effects',EFFECTS),('参数名称','params',PARAMETERS),('翻译方案','schemes',SCHEMES),('快速搜索','quick',QUICK))),('环境',(('AE 版本','versions',VERSIONS),('设置与日志','settings',SETTINGS)))):
+        for section,items in (('汉化',(('效果名称','effects',EFFECTS),('参数名称','params',PARAMETERS),('翻译方案','schemes',SCHEMES),('快速搜索','quick',QUICK),('面板与脚本','panel',PANELS))),('环境',(('AE 版本','versions',VERSIONS),('设置与日志','settings',SETTINGS)))):
             rail.add_section(section)
             for text,glyph,index in items:
                 item=rail.add_item(text,glyph);self.nav_group.addButton(item,index);self.nav_buttons[index]=item
@@ -801,6 +811,9 @@ class Window(QMainWindow):
         self.nav_foot=label('','navFoot',True);self.nav_foot.setContentsMargins(8,0,8,0);col.addWidget(self.nav_foot)
         self.nav_group.idClicked.connect(self.go)
         return rail
+    def build_panels_page(self):
+        from panel_page import PanelPage
+        self.panel_page=PanelPage(self,data_root());return self.panel_page
     def build_effects_page(self):
         page=QWidget();layout=QVBoxLayout(page);layout.setContentsMargins(0,0,0,0);layout.setSpacing(12)
         head,row,self.summary=page_head('效果名称','正在发现插件目录……')
@@ -808,7 +821,7 @@ class Window(QMainWindow):
         # Kept across rebuilds of the switcher menu; filled each time it opens.
         self.add_checked_menu=QMenu('把勾选项加入方案',self.scheme_switcher.menu());self.add_checked_menu.aboutToShow.connect(lambda:self.fill_add_menu(self.add_checked_menu,sorted(self.enabled,key=str.casefold)))
         row.addWidget(self.scheme_switcher);row.addSpacing(8)
-        self.restore_tool=menu_button('恢复',[self.restore_checked_action,None,self.restore_all_action],icon_name='restore');row.addWidget(self.restore_tool)
+        self.restore_tool=menu_button('恢复',[self.restore_checked_action,self.restore_categories_action,None,self.restore_all_action],icon_name='restore');row.addWidget(self.restore_tool)
         self.more_tool=menu_button('更多',[('翻译',[self.translate_checked_action,self.retranslate_checked_action,None,self.api_action]),None,self.refresh_action,self.calibrate_refresh_action]);row.addWidget(self.more_tool)
         self.refresh_btn=button('','icon');ui_kit.themed_icon(self.refresh_btn,'refresh','INK_2',16);self.refresh_btn.clicked.connect(self.refresh_native);row.addWidget(self.refresh_btn)
         layout.addWidget(inset(head))
@@ -826,26 +839,30 @@ class Window(QMainWindow):
         search=SearchField('搜索名称、内部标识或分类');self.filter=search.edit;self.filter.textChanged.connect(self.filter_rows);bar.addWidget(search,1)
         # Every folder, plus a new one named by the user, as places for the checked effects.
         self.folder_checked_menu=QMenu('把勾选项加入收藏夹',self);self.folder_checked_menu.aboutToShow.connect(lambda:self.fill_folder_menu(self.folder_checked_menu,self.checked_keys()))
-        self.check_tool=menu_button('勾选',[self.check_filtered_action,self.uncheck_filtered_action,None,self.uncheck_all_action,None,self.only_checked_action,None,
+        self.check_tool=menu_button('勾选',[self.check_filtered_action,self.uncheck_filtered_action,None,self.uncheck_all_action,None,self.only_checked_action,self.categories_only_action,None,
                                             self.favorite_checked_action,self.folder_checked_menu,self.unfavorite_checked_action])
         self.check_tool.setObjectName('quiet');bar.addWidget(self.check_tool)
         table_card.box.addLayout(bar)
-        self.table=QTableWidget(0,8);self.check_header=CheckHeader(self.table,self.toggle_visible);self.table.setHorizontalHeader(self.check_header)
+        # Effects in groups by category: a header row per category, folded until opened (self.opened); while a search or
+        # filter is on, groups with matches open, and folding one again lasts until the filter changes (self.folded_now).
+        self.opened=set();self.folded_now=set();self.filter_state=None;self.filtering=False;self.fold_click=(None,0.0)
+        self.table=GroupTable(0,8);self.check_header=CheckHeader(self.table,self.toggle_visible);self.table.setHorizontalHeader(self.check_header)
         self.table.setHorizontalHeaderLabels(['','原始名称','中文候选（可编辑）','AE 当前名称','内部标识','分类','状态','']);table_style(self.table);self.check_anchor=None
-        self.table.horizontalHeaderItem(CHECK).setToolTip('勾选的效果组成当前方案；批量翻译、应用、恢复只作用于勾选项。\n点这里勾选或取消当前筛选结果；按住行内复选框上下拖动可快速勾选，Shift+点击可连续勾选')
+        self.table.horizontalHeaderItem(CHECK).setToolTip('勾选的效果组成当前方案；批量翻译、应用、恢复只作用于勾选项。\n点这里勾选或取消当前筛选结果；分类行的复选框勾选整个分类，勾满的分类在翻译和应用时一并处理分类名。\n按住行内复选框上下拖动可快速勾选，Shift+点击可连续勾选')
         self.table.horizontalHeaderItem(FAVORITE).setToolTip('收藏：星星表示在当前收藏夹里，点击加入或移出。当前收藏夹的效果在快速搜索里置顶；收藏夹在“快速搜索”页切换和管理')
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows);self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked|QAbstractItemView.EditTrigger.EditKeyPressed|QAbstractItemView.EditTrigger.SelectedClicked)
         header=self.table.horizontalHeader();header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive);header.setStretchLastSection(True);header.moveSection(STATUS,1)
         # The star sits right after the box; the category column stays last and takes the spare width.
         header.moveSection(header.visualIndex(FAVORITE),2);header.setSectionResizeMode(FAVORITE,QHeaderView.ResizeMode.Fixed)
-        for column,width in ((CHECK,52),(FAVORITE,34),(STATUS,100),(ORIGINAL,150),(CANDIDATE,150),(CURRENT,140),(KEY,170),(CATEGORY,120)):self.table.setColumnWidth(column,width)
+        for column,width in ((CHECK,52),(FAVORITE,34),(STATUS,100),(ORIGINAL,190),(CANDIDATE,150),(CURRENT,140),(KEY,170),(CATEGORY,120)):self.table.setColumnWidth(column,width)
+        self.table.setItemDelegateForColumn(ORIGINAL,ui_kit.TreeDelegate(self.table,self.group_open));self.table.setItemDelegateForColumn(CHECK,ui_kit.IndentCheckDelegate(self.table));self.check_header.setSortIndicator(ORIGINAL,Qt.SortOrder.AscendingOrder)
         self.table.setItemDelegateForColumn(FAVORITE,ui_kit.StarDelegate(self.table));self.table.cellClicked.connect(self.table_clicked)
         self.status_delegate=DiamondDelegate(self.table,lambda index:bool(self.writing) and self.table.item(index.row(),KEY) is not None and self.table.item(index.row(),KEY).text() in self.writing)
         self.table.setItemDelegateForColumn(STATUS,self.status_delegate);self.breather=Breather(self.table,self.status_delegate)
         self.table.itemSelectionChanged.connect(self.selection_changed);self.table.itemChanged.connect(self.item_changed)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu);self.table.customContextMenuRequested.connect(self.table_menu)
-        self.dragger=CheckDragger(self.table,CHECK,lambda row:self.table.item(row,KEY).text() in self.enabled,self.paint_checks,self.finish_checks)
+        self.dragger=CheckDragger(self.table,CHECK,self.row_checked,self.paint_checks,self.finish_checks)
         self.table_stack=QStackedWidget();self.table_empty=EmptyState('effects');self.table_stack.addWidget(self.table_empty);self.table_stack.addWidget(self.table)
         self.empty_paths_btn=self.table_empty.add_button(button('检测 / 定位 AE…'));self.empty_paths_btn.clicked.connect(self.open_ae_paths)
         self.empty_clear_btn=self.table_empty.add_button(button('清除筛选'));self.empty_clear_btn.clicked.connect(self.clear_filters);self.empty_clear_btn.hide()
@@ -1080,10 +1097,14 @@ class Window(QMainWindow):
         self.shortcut_reset_btn=button('恢复默认','quiet');self.shortcut_reset_btn.clicked.connect(self.reset_shortcuts);keys.addWidget(self.shortcut_reset_btn);keys.addStretch();col.addLayout(keys)
         grid.addWidget(frame,1,2)
         # Bottom row: the log over two columns, the acknowledgement beside it, so it costs no extra height.
-        frame,col=self.settings_card('致谢')
+        frame,card=self.settings_card('致谢')
+        # The acknowledgement and the limits scroll inside the card (like the release notes) rather than make it taller.
+        self.thanks_scroll=QScrollArea();self.thanks_scroll.setObjectName('promptScroll');self.thanks_scroll.setWidgetResizable(True);self.thanks_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.thanks_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff);body=QWidget();body.setObjectName('scrollPage');col=QVBoxLayout(body);col.setContentsMargins(0,0,6,0);col.setSpacing(6)
         self.thanks=label(THANKS,'muted',True);self.thanks.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse);col.addWidget(self.thanks);col.addSpacing(6)
         self.limits_title=label('局限','cardTitle');col.addWidget(self.limits_title)
         self.limits=label(LIMITS,'muted',True);self.limits.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse);col.addWidget(self.limits);col.addStretch()
+        self.thanks_scroll.setWidget(body);card.addWidget(self.thanks_scroll,1)
         grid.addWidget(frame,2,2)
         layout.addLayout(grid,1)
         frame=Surface(padding=(20,16,20,16));col=frame.box;row=QHBoxLayout();row.addWidget(label('运行日志','cardTitle'));row.addStretch()
@@ -1319,7 +1340,7 @@ class Window(QMainWindow):
         except Exception as error:self.error('移除后台连接失败：'+str(error));return
         self.log.appendPlainText('已移除后台连接扩展');self.update_bridge_info()
     def update_nav(self):
-        counts=(len(self.plugins),len(self.parameter_page.rows) or '',len(self.schemes),len(self.spaces),self.unread or '',len(self.favorites.favorites) or '')
+        counts=(len(self.plugins),len(self.parameter_page.rows) or '',len(self.schemes),len(self.spaces),self.unread or '',len(self.favorites.favorites) or '',self.panel_page.visible_count() or '')
         for button_,count in zip(self.nav_buttons,counts):button_.set_count(count,button_ is self.nav_buttons[SETTINGS] and bool(self.unread))
     def update_pill(self):
         if not self.space.live:state,text='warn','仅翻译'
@@ -1341,11 +1362,15 @@ class Window(QMainWindow):
     # AE versions: each installed version is a separate space; only verified builds can be renamed live.
     def bind_space(self,space:VersionSpace)->str:
         self.space=space;space.folder.mkdir(parents=True,exist_ok=True)
+        if hasattr(self,'panel_page'):self.panel_page.version_changed()
         self.map_path=space.map_path;self.store=CandidateStore(self.map_path);self.pending=self.store.values
         self.enabled_store=CandidateStore(space.enabled_path,keys=True);self.enabled=self.enabled_store.values
         if space.live:self.pending.setdefault('S_Glow','辉光')
         self.scheme_folder=space.scheme_folder;self.active_path=space.active_path;self.needs_refresh=False
-        warnings=[self.store.secure(),self.enabled_store.secure()]
+        self.category_store=CandidateStore(space.folder/'category-translations.json');self.category_pending=self.category_store.values
+        # Categories the user ticked through their own box; checking every effect of one by hand does not tick it.
+        self.ticked_store=CandidateStore(space.folder/'category-enabled.json',keys=True);self.ticked=self.ticked_store.values
+        warnings=[self.store.secure(),self.enabled_store.secure(),self.category_store.secure(),self.ticked_store.secure()]
         if hasattr(self,'parameter_session'):warnings.append(self.bind_parameter_stores(space))
         return '\n'.join(x for x in warnings if x)
     def bind_parameter_stores(self,space):
@@ -1413,6 +1438,7 @@ class Window(QMainWindow):
     def bind_targets(self):
         if self.space.live:
             self.session.expected_image=self.space.exe
+            if hasattr(self,'category_session'):self.category_session.expected_image=self.space.exe
             if hasattr(self,'parameter_session'):self.parameter_session.expected_image=self.space.exe
             if hasattr(self,'instance_session'):self.instance_session.expected_image=self.space.exe
         if self.live and self.space.live and self.space.exe and self.live.get('image'):
@@ -1476,39 +1502,54 @@ class Window(QMainWindow):
         if job is not None and job is not self.job:return
         if self.loading_button:self.loading_button.stop();self.loading_button=None
         if self.writing:self.writing=set();self.breather.stop()
-        self.parameter_page.stop_writing();self.progress.hide();self.update_buttons();self.update_usage()
+        self.parameter_page.stop_writing();self.panel_page.finished();self.progress.hide();self.update_buttons();self.update_usage()
         if self.close_after or self._stopping.is_set():QTimer.singleShot(0,self.close)
     def update_buttons(self):
         if self.busy():return
         for widget in self.buttons:widget.setEnabled(True)
         live=self.live is not None and self.space.live
-        for widget in (self.apply_selected_action,self.restore_selected_action,self.restore_all_action,self.refresh_btn,self.refresh_action,self.calibrate_refresh_action):widget.setEnabled(live)
+        for widget in (self.apply_selected_action,self.restore_selected_action,self.restore_all_action,self.restore_categories_action,self.refresh_btn,self.refresh_action,self.calibrate_refresh_action):widget.setEnabled(live)
         for widget in self.parameter_page.controls:widget.setEnabled(self.space.live)
         self.parameter_page.update_check_all();self.parameter_page.update_empty()
-        self.update_detail_actions();self.update_scheme_bar();self.update_pill();self.update_refresh_hint()
+        self.update_detail_actions();self.update_scheme_bar();self.update_pill();self.update_refresh_hint();self.panel_page.update_controls()
     # The detail panel's buttons act on the checked effects when there are any, otherwise on the selected row.
-    def target_mode(self)->str:return 'checked' if self.enabled else 'selected'
+    def target_mode(self)->str:return 'checked' if self.enabled or self.checked_groups() else 'selected'
+    @property
+    def categories_only(self)->bool:
+        if not hasattr(self,'_categories_only'):self._categories_only=self.ui_preferences().get('categoriesOnly') is True
+        return self._categories_only
+    def set_categories_only(self,on):
+        self._categories_only=bool(on);self.save_ui_preference('categoriesOnly',self._categories_only);self.categories_only_action.setChecked(self._categories_only)
+        self.status.setText('只勾选分类名：勾选分类时不再连带勾选其效果' if on else '勾选分类时会一并勾选其下的效果')
+    def drop_ticks(self,keys):
+        """Unless categories are checked on their own, a category stays selected only while its effects are."""
+        if self.categories_only or not keys:return
+        self.ticked.difference_update({self.group_of(row) for row in self.effect_rows() if self.table.item(row,KEY).text() in keys})
     def update_detail_actions(self):
         if not hasattr(self,'target_note'):return
-        rows=self.selected_rows();live=self.live is not None and self.space.live;checked=self.target_mode()=='checked';count=len(self.enabled)
+        rows=self.selected_rows();live=self.live is not None and self.space.live;checked=self.target_mode()=='checked';count=len(self.enabled)+len(self.checked_groups())
+        group=None if rows else self.selected_group();writable=self.categories_writable()
         word='勾选项' if checked else '所选项'
         for widget,verb in ((self.translate_btn,'翻译'),(self.apply_btn,'应用'),(self.restore_btn,'恢复')):widget.set_label(verb+word)
-        if checked:note=f'作用于 {count} 个勾选项'+('，所选行不参与' if rows and self.table.item(rows[0],KEY).text() not in self.enabled else '')
+        if checked:note=f'作用于 {count} 个勾选项'+('，所选行不参与' if (rows and self.table.item(rows[0],KEY).text() not in self.enabled) or (group is not None and group not in self.checked_groups()) else '')
+        elif group is not None:note='作用于所选分类；勾选效果后改为作用于勾选项'
         else:note='作用于所选效果；勾选效果后改为作用于勾选项' if rows else '选择一行，或勾选多个效果'
         self.target_note.setText(note)
         why='' if live else ('先连接 AE' if self.space.live else f'{self.space.label} 不支持实时改名')
-        target=f'{count} 个勾选项' if checked else '所选效果'
+        if live and group and not checked and not writable:why='分类名写入 AE 目前只支持已实测的 AE 2026（26.5.0.89）'
+        target=f'{count} 个勾选项' if checked else '所选分类' if group is not None else '所选效果'
         k=self.keymap
         self.translate_btn.setToolTip(k.tip('translate',f'AI 翻译{target}的名称'+('；已有中文的会先询问是否重新翻译' if checked else '，覆盖现有中文候选')))
         self.apply_btn.setToolTip(k.tip('apply',f'把{target}的中文名称写入 AE'+('（没有中文的跳过）' if checked else ''))+(f'\n{why}' if why else ''))
         self.restore_btn.setToolTip(k.tip('restore',f'把{target}在 AE 中恢复为原名（只恢复本软件改过的）')+(f'\n{why}' if why else ''))
         if not self.busy():
-            named=any(self.pending.get(key,'').strip() for key in self.enabled)
-            self.translate_btn.setEnabled(bool(count if checked else rows))
-            self.apply_btn.setEnabled(live and (named if checked else bool(rows)))
-            self.restore_btn.setEnabled(live and bool(count if checked else rows))
+            named=any(self.pending.get(key,'').strip() for key in self.enabled) or (self.categories_writable() and any(self.category_pending.get(g,'').strip() for g in self.checked_groups()))
+            category=bool(group) and not checked
+            self.translate_btn.setEnabled(bool(count if checked else rows or category))
+            self.apply_btn.setEnabled(live and (named if checked else bool(rows) or (category and writable and bool(self.category_pending.get(group,'').strip()))))
+            self.restore_btn.setEnabled(live and bool(count if checked else rows or (category and writable)))
             self.translate_action.setEnabled(bool(rows))
-        self.parameters_btn.setEnabled(self.space.live and len(rows)==1 and not self.busy());self.name_edit.setEnabled(len(rows)==1);self.reveal_btn.setVisible(len(rows)==1)
+        self.parameters_btn.setEnabled(self.space.live and len(rows)==1 and not self.busy());self.name_edit.setEnabled(len(rows)==1 or bool(group));self.reveal_btn.setVisible(len(rows)==1)
     def update_refresh_hint(self):
         """After a write the refresh button stands out until clicked; it never refreshes by itself."""
         on=bool(self.needs_refresh and self.live)
@@ -1516,29 +1557,30 @@ class Window(QMainWindow):
         self.refresh_btn.setToolTip(self.keymap.tip('refresh','刷新 AE“效果和预设”列表')+('\n名称已写入，点此刷新后在 AE 中可见' if on else '\n应用与恢复不会自动刷新'))
     def commit_name(self):
         """Keeps what was typed in the detail field as the selected row's candidate."""
-        rows=self.selected_rows()
-        if len(rows)!=1 or not self.name_edit.isEnabled():return
-        item=self.table.item(rows[0],CANDIDATE)
+        rows=self.selected_rows();group=None if rows else self.selected_group()
+        if not self.name_edit.isEnabled() or not (len(rows)==1 or group):return
+        item=self.table.item(rows[0] if rows else self.group_row(group),CANDIDATE)
         if item.text()!=self.name_edit.text():item.setText(self.name_edit.text())
     def checked_rows(self)->list[int]:
         """One table row per checked effect, hidden rows included, in table order."""
         rows=[];seen=set()
-        for row in range(self.table.rowCount()):
+        for row in self.effect_rows():
             key=self.table.item(row,KEY).text()
             if key in self.enabled and key not in seen:rows.append(row);seen.add(key)
         return rows
     def translate_target(self):
         if self.target_mode()=='selected':self.translate_selected();return
-        self.commit_name();rows=self.checked_rows()
-        if not rows:self.toast.notify('无需翻译','勾选的效果都不在当前版本的表格里');return
-        missing=[row for row in rows if not self.table.item(row,CANDIDATE).text().strip()];named=len(rows)-len(missing)
+        self.commit_name();rows=self.checked_rows();groups=self.checked_groups()
+        if not rows and not groups:self.toast.notify('无需翻译','勾选的效果都不在当前版本的表格里');return
+        missing=[row for row in rows if not self.table.item(row,CANDIDATE).text().strip()];lacking=[g for g in groups if not self.category_pending.get(g,'').strip()]
+        total=len(rows)+len(groups);gaps=len(missing)+len(lacking);named=total-gaps
         if named:
-            choices=[f'全部重新翻译（{len(rows)} 项）']+([f'只翻译缺少的 {len(missing)} 项'] if missing else [])
-            text=f'勾选的 {len(rows)} 项中有 {named} 项已有中文候选。'+('重新翻译会覆盖这些中文；只翻译缺少的不会改动它们。' if missing else '重新翻译会覆盖现有的中文候选。')
+            choices=[f'全部重新翻译（{total} 项）']+([f'只翻译缺少的 {gaps} 项'] if gaps else [])
+            text=f'勾选的 {total} 项中有 {named} 项已有中文候选。'+('重新翻译会覆盖这些中文；只翻译缺少的不会改动它们。' if gaps else '重新翻译会覆盖现有的中文候选。')
             picked=choose(self,f'{named} 个勾选项已有中文',text,choices)
             if picked is None:return
-            if missing and picked==1:rows=missing
-        self.translate_rows(rows)
+            if gaps and picked==1:rows,groups=missing,lacking
+        self.translate_rows(rows,groups) if groups else self.translate_rows(rows)
     def apply_target(self):
         if self.target_mode()=='selected':self.apply_selected()
         else:self.commit_name();self.apply_scheme()
@@ -1559,22 +1601,118 @@ class Window(QMainWindow):
         elif self.space.live:QTimer.singleShot(150,self.connect_live)
     def show_space(self):
         self.plugins=self.space_plugins(self.space);self.table.clearSelection();self.show_detail([])
-        self._fill=True;self.table.setSortingEnabled(False);self.table.setRowCount(len(self.plugins))
+        # A header row per category (as the plug-in resources name it), its effects below it.
+        groups={}
+        for p in self.plugins:groups.setdefault(readable_category(p.category or '').strip(),[]).append(p)
+        self._fill=True;self.table.setSortingEnabled(False);self.table.setRowCount(len(self.plugins)+len(groups))
         mono=QFont('Cascadia Mono');mono.setStyleHint(QFont.StyleHint.Monospace);mono.setPixelSize(12)
-        for row,p in enumerate(self.plugins):
-            check=QTableWidgetItem();check.setFlags(Qt.ItemFlag.ItemIsUserCheckable|Qt.ItemFlag.ItemIsEnabled|Qt.ItemFlag.ItemIsSelectable)
-            check.setCheckState(Qt.CheckState.Checked if p.match_name in self.enabled else Qt.CheckState.Unchecked);self.table.setItem(row,CHECK,check)
-            for col,value in ((ORIGINAL,p.display_name),(CANDIDATE,self.pending.get(p.match_name,'')),(CURRENT,'尚未连接'),(KEY,p.match_name),(CATEGORY,readable_category(p.category)),(STATUS,''),
-                              (FAVORITE,'★' if p.match_name in self.favorites else '')):
-                item=QTableWidgetItem(value);item.setToolTip(p.path if col==ORIGINAL else '点击收藏或取消收藏' if col==FAVORITE else value)
-                if col!=CANDIDATE:item.setFlags(item.flags()&~Qt.ItemFlag.ItemIsEditable)
-                if col==KEY:item.setFont(mono)
-                if col in (KEY,CATEGORY):item.setForeground(QColor(ui_kit.MUTED))
-                self.table.setItem(row,col,item)
-        self.table.setSortingEnabled(True);self._fill=False
+        bold=QFont(self.table.font());bold.setWeight(QFont.Weight.DemiBold);row=0
+        for group,members in groups.items():
+            self.fill_group_row(row,group,bold);row+=1
+            for p in members:
+                check=group_cell('',group);check.setFlags(Qt.ItemFlag.ItemIsUserCheckable|Qt.ItemFlag.ItemIsEnabled|Qt.ItemFlag.ItemIsSelectable)
+                check.setCheckState(Qt.CheckState.Checked if p.match_name in self.enabled else Qt.CheckState.Unchecked);self.table.setItem(row,CHECK,check)
+                for col,value in ((ORIGINAL,p.display_name),(CANDIDATE,self.pending.get(p.match_name,'')),(CURRENT,'尚未连接'),(KEY,p.match_name),(CATEGORY,readable_category(p.category)),(STATUS,''),
+                                  (FAVORITE,'★' if p.match_name in self.favorites else '')):
+                    item=group_cell(value,group);item.setToolTip(p.path if col==ORIGINAL else '点击收藏或取消收藏' if col==FAVORITE else value)
+                    if col!=CANDIDATE:item.setFlags(item.flags()&~Qt.ItemFlag.ItemIsEditable)
+                    if col==KEY:item.setFont(mono)
+                    if col in (KEY,CATEGORY):item.setForeground(QColor(ui_kit.MUTED))
+                    self.table.setItem(row,col,item)
+                row+=1
+        self.table.resort();self.table.setSortingEnabled(True);self._fill=False
         common=sum(1 for p in self.plugins if not self.space.owns(p.path)) if self.space.plugins else 0
         self.summary.setText(f'{self.space.label}：{len(self.plugins)} 条名称资源'+(f'（含公共目录 {common} 条）' if common else '')+f' · 共 {len(self.spaces)} 个 AE 版本 · {len(self.scan_errors)} 个文件未解析')
         self.update_names();self.filter_rows();self.update_nav()
+    def fill_group_row(self,row,group,bold):
+        """A category's header row; paint_groups keeps its box, count, AE name and status current."""
+        title=group or '未分类'
+        for col in range(self.table.columnCount()):
+            item=group_cell(title if col==ORIGINAL else self.category_pending.get(group,'') if col==CANDIDATE else '',group,True);flags=Qt.ItemFlag.ItemIsEnabled|Qt.ItemFlag.ItemIsSelectable
+            if col==CHECK:flags|=Qt.ItemFlag.ItemIsUserCheckable;item.setCheckState(Qt.CheckState.Unchecked);item.setToolTip('勾选或取消此分类下列出的全部效果')
+            elif col==ORIGINAL:item.setToolTip(f'分类“{title}”：点击名称展开或收起其中的效果；选中此行可在右侧翻译、应用或恢复分类名')
+            elif col==CANDIDATE:
+                item.setToolTip('双击填写中文分类名；勾满整个分类后，翻译和应用勾选项会一并处理它' if group else '这些效果没有分类，不能汉化分类名')
+                if group:flags|=Qt.ItemFlag.ItemIsEditable
+            if col in (ORIGINAL,CANDIDATE):item.setFont(bold)
+            if col==KEY:item.setForeground(QColor(ui_kit.MUTED))
+            item.setFlags(flags);self.table.setItem(row,col,item)
+    # The table's rows: per category a header row (GroupItem.head) and then its effects.
+    def is_group(self,row)->bool:return getattr(self.table.item(row,CHECK),'head',False)
+    def group_of(self,row)->str:return getattr(self.table.item(row,CHECK),'group','')
+    def effect_rows(self)->list[int]:return [row for row in range(self.table.rowCount()) if not self.is_group(row)]
+    def group_rows(self)->list[int]:return [row for row in range(self.table.rowCount()) if self.is_group(row)]
+    def group_open(self,group)->bool:return group not in self.folded_now if self.filtering else group in self.opened
+    def toggle_group(self,group):
+        (self.folded_now if self.filtering else self.opened).symmetric_difference_update({group})
+        for row in range(self.table.rowCount()):
+            cell=self.table.item(row,CHECK)
+            if cell.group==group and not cell.head:self.table.setRowHidden(row,not (cell.hit and self.group_open(group)))
+        self.table.viewport().update()
+    def fold_all(self,fold):
+        groups={self.group_of(row) for row in self.group_rows()}
+        if self.filtering:self.folded_now=set(groups) if fold else set()
+        else:self.opened=set() if fold else groups
+        self.filter_rows()
+    def row_keys(self,rows)->set[str]:
+        """The effects behind some rows: a header row stands for the effects its group lists under the current filter
+        (for none while categories are checked on their own)."""
+        groups=set() if self.categories_only else {self.group_of(row) for row in rows if self.is_group(row)}
+        keys={self.table.item(row,KEY).text() for row in rows if not self.is_group(row)}
+        if groups:keys|={self.table.item(row,KEY).text() for row in self.visible_rows() if self.group_of(row) in groups}
+        return keys
+    def row_checked(self,row)->bool:
+        if self.is_group(row):return self.table.item(row,CHECK).checkState()==Qt.CheckState.Checked
+        return self.table.item(row,KEY).text() in self.enabled
+    def tick_groups(self,groups,on):(self.ticked.update if on else self.ticked.difference_update)({group for group in groups if group})
+    def checked_groups(self)->list[str]:
+        """Categories ticked through their own box: translating, applying and restoring the checked items include them."""
+        return [self.group_of(row) for row in self.group_rows() if self.group_of(row) in self.ticked] if hasattr(self,'table') else []
+    def categories_writable(self)->bool:
+        """Category names reach AE only on the build they were tested on (effect_categories.SUPPORTED, same FLT module)."""
+        live=self.live or {}
+        return bool(self.space.live and live and category_build(live.get('version'),live.get('profileSha256')))
+    def category_plan(self,groups,named=True)->list[tuple[str,str,str]]:
+        """(category, Chinese, one of its effects AE has loaded) for each category a write can reach."""
+        loaded={r['matchName'] for r in (self.live or {}).get('effects',[])};plan=[]
+        for group in groups:
+            value=self.category_pending.get(group,'').strip()
+            if not group or (named and not value):continue
+            key=next((self.table.item(row,KEY).text() for row in self.effect_rows() if self.group_of(row)==group and self.table.item(row,KEY).text() in loaded),None)
+            if key:plan.append((group,value,key))
+        return plan
+    def paint_groups(self):
+        """Header rows follow their groups: the box (all, some or none of the listed effects checked), how many effects
+        are listed, the category's name in AE now and its own status."""
+        if not hasattr(self,'table'):return
+        live={r['matchName']:r.get('category','') for r in self.live['effects']} if self.live else None
+        listed={};ticked={};total={};names={}
+        for row in self.effect_rows():
+            cell=self.table.item(row,CHECK);group=cell.group;key=self.table.item(row,KEY).text();total[group]=total.get(group,0)+1
+            if cell.hit:
+                listed[group]=listed.get(group,0)+1
+                if key in self.enabled:ticked[group]=ticked.get(group,0)+1
+            if live is not None and key in live:names.setdefault(group,set()).add(live[key])
+        self._fill=True
+        for row in self.group_rows():
+            group=self.group_of(row);shown=listed.get(group,0);on=ticked.get(group,0);count=total.get(group,0)
+            self.table.item(row,CHECK).setCheckState(Qt.CheckState.Checked if group and group in self.ticked else Qt.CheckState.PartiallyChecked if on else Qt.CheckState.Unchecked)
+            label=f'{count} 个效果' if shown in (0,count) else f'{shown}/{count} 个效果';self.table.item(row,KEY).setText(label);self.table.item(row,KEY).setToolTip(label)
+            candidate=self.category_pending.get(group,'').strip();found=sorted(names.get(group,()))
+            if not self.space.live:current='仅翻译 · 不支持实时改名'
+            elif not self.live:current='尚未连接'
+            elif not found:current=MISSING
+            else:current=found[0] if len(found)==1 else '、'.join(found[:2])+(' 等' if len(found)>2 else '')
+            applied=bool(candidate and len(found)==1 and found[0]==candidate)
+            status='待翻译' if not candidate else '仅翻译' if not self.space.live else '未连接' if not self.live else '仅翻译' if not self.categories_writable() else '已应用' if applied else '待应用'
+            cell=self.table.item(row,CURRENT);cell.setText(current);cell.setToolTip(current)
+            cell.setForeground(QColor(ui_kit.INK if applied else ui_kit.FAINT if current in (MISSING,'尚未连接','仅翻译 · 不支持实时改名') else ui_kit.INK_2))
+            self.table.item(row,STATUS).setText(status)
+            if self.table.item(row,CANDIDATE).text()!=self.category_pending.get(group,''):self.table.item(row,CANDIDATE).setText(self.category_pending.get(group,''))
+        self._fill=False
+    def save_categories(self):
+        message=self.category_store.save()
+        if message:self.log.appendPlainText(message)
     def connect_live(self):
         if not self.space.live:self.analyze_adapter(self.space);return
         self.status.setText('正在核对 AE 路径、构建版本和实际效果目录……');self.work(lambda progress:read_live(expected_image=self.space.exe),self.show_live)
@@ -1621,9 +1759,9 @@ class Window(QMainWindow):
         names={r['matchName']:r['displayName'] for r in self.live['effects']};self.paint_current(lambda key:names.get(key,MISSING))
     def paint_current(self,text):
         self._fill=True;self.table.setSortingEnabled(False)
-        for row in range(self.table.rowCount()):
+        for row in self.effect_rows():
             item=self.table.item(row,CURRENT);item.setText(text(self.table.item(row,KEY).text()));self.color_current(row)
-        self.table.setSortingEnabled(True);self._fill=False;self.update_counts()
+        self.table.setSortingEnabled(True);self._fill=False;self.paint_groups();self.update_counts()
     def row_status(self,row)->str:
         current=self.table.item(row,CURRENT).text();candidate=self.table.item(row,CANDIDATE).text().strip()
         if current==MISSING:return '未加载'
@@ -1648,7 +1786,7 @@ class Window(QMainWindow):
     def paint_membership(self,keys=None):
         """Greys rows outside the scheme in use (only seen when all effects are shown); they stay editable."""
         members=self.scheme_members();self._fill=True;sorting=self.table.isSortingEnabled();self.table.setSortingEnabled(False)
-        for row in range(self.table.rowCount()):
+        for row in self.effect_rows():
             key=self.table.item(row,KEY).text()
             if keys is not None and key not in keys:continue
             outside=members is not None and key not in members
@@ -1668,11 +1806,24 @@ class Window(QMainWindow):
         return {'checked':key in self.enabled,'todo':not candidate,'applied':applied,'missing':current==MISSING,'favorite':key in self.favorites}[mode]
     def filter_rows(self,*_):
         text=self.filter.text().casefold();mode=ROW_FILTERS[max(self.chip_group.checkedId(),0)][0];members=self.scheme_members()
-        for row in range(self.table.rowCount()):
-            hit=self.in_scope(row,members) and text in ' '.join(self.table.item(row,c).text() for c in range(ORIGINAL,CATEGORY+1)).casefold() and self.row_matches(row,mode)
+        state=(text,mode,self.only_checked)
+        if state!=self.filter_state:self.filter_state=state;self.folded_now=set()
+        self.filtering=bool(text) or mode!='all' or self.only_checked
+        # A search for a category (its name or Chinese name) lists all of its effects.
+        titles={self.group_of(row):(self.group_of(row)+' '+self.table.item(row,CANDIDATE).text()).casefold() for row in self.group_rows()}
+        shown=set();rows=range(self.table.rowCount())
+        for row in rows:
+            cell=self.table.item(row,CHECK)
+            if cell.head:continue
+            words=' '.join(self.table.item(row,c).text() for c in range(ORIGINAL,CATEGORY+1)).casefold()
+            hit=self.in_scope(row,members) and (text in words or bool(text) and text in titles.get(cell.group,'')) and self.row_matches(row,mode)
             if hit and self.only_checked:hit=self.table.item(row,KEY).text() in self.enabled
-            self.table.setRowHidden(row,not hit)
-        self.paint_membership();self.update_counts();self.show_table_state();self.update_check_header()
+            cell.hit=hit
+            if hit:shown.add(cell.group)
+        for row in rows:
+            cell=self.table.item(row,CHECK)
+            self.table.setRowHidden(row,cell.group not in shown if cell.head else not (cell.hit and self.group_open(cell.group)))
+        self.paint_membership();self.update_counts();self.show_table_state();self.update_check_header();self.paint_groups()
     def visible_keys(self)->set[str]:return {self.table.item(row,KEY).text() for row in self.visible_rows()}
     def update_check_header(self):self.check_header.set_state(check_state(key in self.enabled for key in self.visible_keys()))
     def toggle_visible(self):
@@ -1682,7 +1833,7 @@ class Window(QMainWindow):
         if not self.plugins:
             self.table_empty.set_icon('effects');self.table_empty.show_message('这个版本没有找到插件名称','插件目录中没有可识别的效果资源。可以重新检测 AE 安装，或在“AE 版本”页为此版本添加插件目录。')
             self.empty_paths_btn.show();self.empty_clear_btn.hide();self.empty_all_btn.hide();self.table_stack.setCurrentIndex(0)
-        elif not self.visible_rows() and self.scoped() and not any(self.in_scope(r,self.scheme_members()) for r in range(self.table.rowCount())):
+        elif not self.visible_rows() and self.scoped() and not any(self.in_scope(r,self.scheme_members()) for r in self.effect_rows()):
             self.table_empty.set_icon('schemes');self.table_empty.show_message(f'方案“{self.active.title}”中还没有效果','显示全部效果后勾选或填写中文，它们就会加入这个方案；保存方案即可记住。')
             self.empty_paths_btn.hide();self.empty_clear_btn.hide();self.empty_all_btn.show();self.table_stack.setCurrentIndex(0)
         elif not self.visible_rows():
@@ -1704,6 +1855,13 @@ class Window(QMainWindow):
         self.status.setText((f'已把 {changed} 个效果加入收藏夹“{folder}”' if on else f'已从收藏夹“{folder}”移出 {changed} 个效果') if changed else
                             (f'这些效果都已在收藏夹“{folder}”里' if on else f'这些效果都不在收藏夹“{folder}”里'))
     def table_clicked(self,row,column):
+        if self.is_group(row):
+            # Only the name (with its arrow) folds; the other cells just select the category for the detail panel.
+            if column!=ORIGINAL:return
+            group=self.group_of(row);now=time.monotonic()
+            # A double click arrives as two clicks: the second must not fold the group straight back.
+            if self.fold_click[0]==group and now-self.fold_click[1]<QApplication.doubleClickInterval()/1000:return
+            self.fold_click=(group,now);self.toggle_group(group);return
         if column==FAVORITE and self.table.item(row,KEY) is not None:self.toggle_favorite(self.table.item(row,KEY).text())
     def toggle_favorite(self,key):
         on=self.favorites.toggle(key);folder=self.favorites.current
@@ -1781,7 +1939,7 @@ class Window(QMainWindow):
         self.favorite_checked_action.setText(f'收藏勾选项到“{folder}”');self.unfavorite_checked_action.setText(f'从“{folder}”移出勾选项')
         self.chips['favorite'].setToolTip(f'只看当前收藏夹“{folder}”里的效果')
         self._fill=True;sorting=self.table.isSortingEnabled();self.table.setSortingEnabled(False)
-        for row in range(self.table.rowCount()):
+        for row in self.effect_rows():
             item=self.table.item(row,FAVORITE)
             if item is not None:item.setText('★' if self.table.item(row,KEY).text() in self.favorites else '')
         self.table.setSortingEnabled(sorting);self._fill=False
@@ -1789,43 +1947,69 @@ class Window(QMainWindow):
         else:self.update_counts()
         self.show_detail(self.selected_rows());self.fill_quick_lists();self.update_scheme_bar()
     def update_counts(self):
-        members=self.scheme_members();rows=[row for row in range(self.table.rowCount()) if self.in_scope(row,members)]
+        members=self.scheme_members();rows=[row for row in self.effect_rows() if self.in_scope(row,members)]
         for key,text in ROW_FILTERS:
             count=len(rows) if key=='all' else sum(1 for row in rows if self.row_matches(row,key))
             self.chips[key].set_value(count)
         tile=self.chips['all'];caption='方案中' if self.scoped() else '全部'
         if tile.caption!=caption:tile.caption=caption;tile.setToolTip('只看当前方案中的效果；方案菜单里可选择“显示全部效果”' if self.scoped() else '只看“全部”的效果');tile.update()
         self.update_check_header();self.update_detail_actions()
-    def visible_rows(self):return [row for row in range(self.table.rowCount()) if not self.table.isRowHidden(row)]
+    def visible_rows(self):
+        """The effect rows the filter lists, inside a folded category too."""
+        return [row for row in self.effect_rows() if self.table.item(row,CHECK).hit]
     def check_keys(self,keys,checked):
         if checked:self.enabled.update(keys)
-        else:self.enabled.difference_update(keys)
+        else:self.enabled.difference_update(keys);self.drop_ticks(keys)
         self.sync_rows(keys);self.save_enabled();self.status.setText(f"已{'勾选' if checked else '取消勾选'} {len(keys)} 个效果")
     def paint_checks(self,rows,state):
-        """Live feedback while sweeping over boxes; saving waits for the release."""
-        keys={self.table.item(row,KEY).text() for row in rows};(self.enabled.update if state else self.enabled.difference_update)(keys)
-        self._fill=True;self.table.setSortingEnabled(False)
-        for row in rows:self.table.item(row,CHECK).setCheckState(Qt.CheckState.Checked if state else Qt.CheckState.Unchecked)
-        self.table.setSortingEnabled(True);self._fill=False
+        """Live feedback while sweeping over boxes (a category's box stands for its listed effects); saving waits for the release."""
+        keys=self.row_keys(rows);(self.enabled.update if state else self.enabled.difference_update)(keys)
+        if not state:self.drop_ticks(keys)
+        self.tick_groups({self.group_of(row) for row in rows if self.is_group(row)},state);self._fill=True
+        for row in self.effect_rows():
+            if self.table.item(row,KEY).text() in keys:self.table.item(row,CHECK).setCheckState(Qt.CheckState.Checked if state else Qt.CheckState.Unchecked)
+        self._fill=False;self.paint_groups()
     def finish_checks(self,rows,state):
-        keys={self.table.item(row,KEY).text() for row in rows if self.table.item(row,KEY)}
-        self.check_anchor=self.table.item(rows[-1],KEY).text() if rows else self.check_anchor
-        self.sync_rows(keys);self.save_enabled();self.status.setText(f"已{'勾选' if state else '取消勾选'} {len(keys)} 个效果")
-    def check_visible(self,checked):self.check_keys({self.table.item(row,KEY).text() for row in self.visible_rows()},checked)
+        keys=self.row_keys(rows);effects=[row for row in rows if not self.is_group(row)]
+        self.check_anchor=self.table.item(effects[-1],KEY).text() if effects else self.check_anchor
+        groups=[row for row in rows if self.is_group(row)]
+        self.sync_rows(keys);self.save_enabled()
+        self.status.setText(f"已{'勾选' if state else '取消勾选'} {len(keys)} 个效果" if keys or not groups else f"已{'勾选' if state else '取消勾选'} {len(groups)} 个分类名")
+    def check_visible(self,checked):
+        rows=self.visible_rows();self.tick_groups({self.group_of(row) for row in rows},checked)
+        self.check_keys({self.table.item(row,KEY).text() for row in rows},checked)
     def sync_rows(self,keys):
         # Duplicate resource rows (same effect in several AE versions) always show one shared state.
         self._fill=True;self.table.setSortingEnabled(False)
-        for row in range(self.table.rowCount()):
+        for row in self.effect_rows():
             key=self.table.item(row,KEY).text()
             if key not in keys:continue
             self.table.item(row,CHECK).setCheckState(Qt.CheckState.Checked if key in self.enabled else Qt.CheckState.Unchecked)
             self.table.item(row,CANDIDATE).setText(self.pending.get(key,''));self.color_current(row)
-        self.table.setSortingEnabled(True);self._fill=False;self.paint_membership(set(keys));self.update_counts()
-    def selected_rows(self):return sorted({x.row() for x in self.table.selectionModel().selectedRows()})
+        self.table.setSortingEnabled(True);self._fill=False;self.paint_membership(set(keys));self.paint_groups();self.update_counts()
+    def selected_rows(self):
+        """The selected effect row (a selected category's header row is selected_group)."""
+        return sorted({x.row() for x in self.table.selectionModel().selectedRows() if not self.is_group(x.row())})
+    def selected_group(self)->str|None:
+        rows=[x.row() for x in self.table.selectionModel().selectedRows() if self.is_group(x.row())]
+        return self.group_of(rows[0]) if rows else None
+    def group_row(self,group)->int|None:return next((row for row in self.group_rows() if self.group_of(row)==group),None)
+    def show_group_detail(self,group):
+        """A selected category in the detail panel: its Chinese name in the field, the buttons act on it."""
+        row=self.group_row(group);item=lambda col:self.table.item(row,col).text();title=group or '未分类'
+        self.detail_star.hide();self.detail_eyebrow.setText('效果分类');self.selected_label.setText(title)
+        state=item(STATUS);self.detail_state.set(STATUS_MARK.get(state),{'已应用':'已在 AE 生效','待应用':'有中文，待应用','待翻译':'还没有中文名称','仅翻译':'只保存中文名，不写入此 AE'}.get(state,state))
+        self.detail_info.setText(f'AE 当前分类名：{item(CURRENT)}\n包含：{item(KEY)}' if group else '这些效果没有分类，不能汉化分类名')
+        notes=['双语写入只作用于效果名称，分类名始终只写中文。']
+        if group and not self.categories_writable():notes.append('分类名写入 AE 目前只支持已实测的 AE 2026（26.5.0.89）；其他版本只保存中文名。')
+        self.path_label.setText('\n'.join(notes))
+        self.name_edit.setPlaceholderText('输入中文分类名，回车应用此分类');self.name_edit.setText(item(CANDIDATE))
     def selection_changed(self):
         self.show_detail(self.selected_rows())
         self.update_detail_actions();self.fit_detail()
     def show_detail(self,rows):
+        if not rows and (group:=self.selected_group()) is not None:self.show_group_detail(group);return
+        self.name_edit.setPlaceholderText('输入中文名称，回车应用此效果')
         if not rows:
             self.detail_eyebrow.setText('效果详情');self.selected_label.setText('在左侧表格中选择效果');self.detail_state.set(None,'');self.detail_star.hide()
             self.detail_info.setText('点击一行查看详情并输入中文名称；批量操作请勾选左侧复选框。');self.path_label.clear();self.name_edit.clear();return
@@ -1839,7 +2023,24 @@ class Window(QMainWindow):
     def table_menu(self,pos):
         index=self.table.indexAt(pos)
         if not index.isValid():return
-        menu=self.row_menu(index.row());menu.exec(self.table.viewport().mapToGlobal(pos))
+        menu=self.group_menu(index.row()) if self.is_group(index.row()) else self.row_menu(index.row());menu.exec(self.table.viewport().mapToGlobal(pos))
+    def group_menu(self,row)->QMenu:
+        """The context menu of a category's header row."""
+        self.table.selectRow(row);group=self.group_of(row);title=group or '未分类';keys=self.row_keys([row]);ticked=self.table.item(row,CHECK).checkState()==Qt.CheckState.Checked
+        idle=not self.busy();writable=self.categories_writable();menu=QMenu(self)
+        menu.addAction('收起此分类' if self.group_open(group) else '展开此分类',lambda:self.toggle_group(group))
+        menu.addAction('展开全部分类',lambda:self.fold_all(False));menu.addAction('收起全部分类',lambda:self.fold_all(True));menu.addSeparator()
+        if self.categories_only:menu.addAction('取消勾选此分类名' if ticked else '勾选此分类名',lambda:(self.tick_groups({group},not ticked),self.save_enabled(),self.paint_groups(),self.update_detail_actions())).setEnabled(bool(group))
+        else:menu.addAction(f'取消勾选此分类及其 {len(keys)} 个效果' if ticked else f'勾选此分类及其 {len(keys)} 个效果',lambda:(self.tick_groups({group},not ticked),self.check_keys(keys,not ticked))).setEnabled(bool(keys))
+        menu.addSeparator()
+        menu.addAction('AI 翻译此分类名',lambda:self.translate_rows([],[group])).setEnabled(bool(group) and idle)
+        menu.addAction('应用此分类名到 AE',lambda:self.apply_categories([group])).setEnabled(writable and idle and bool(group and self.category_pending.get(group,'').strip()))
+        menu.addAction('恢复此分类原名',lambda:self.restore_categories([group])).setEnabled(writable and idle and bool(group))
+        menu.addAction('恢复全部分类原名',lambda:self.restore_categories()).setEnabled(writable and idle)
+        if self.space.live and not writable:
+            menu.addAction('分类名写入 AE 目前只支持已实测的 AE 2026（26.5.0.89）' if self.live else '连接 AE 后可把分类名写入 AE').setEnabled(False)
+        menu.addSeparator();menu.addAction('复制分类名',lambda:(QApplication.clipboard().setText(title),self.status.setText('已复制分类名')))
+        return menu
     def row_menu(self,row)->QMenu:
         """The context menu for one row; that row becomes the current one."""
         self.table.selectRow(row);key=self.table.item(row,KEY).text();checked=key in self.enabled
@@ -1854,6 +2055,44 @@ class Window(QMainWindow):
         for title,column in (('内部标识',KEY),('原始名称',ORIGINAL),('中文候选',CANDIDATE)):copy.addAction(title,lambda c=column:self.copy_column(c))
         menu.addAction('打开插件所在文件夹',lambda:self.reveal(self.table.item(row,ORIGINAL).toolTip()))
         return menu
+    # Category names: the header row's Chinese goes to AE as one write of AE's own group around a loaded effect, on the
+    # tested build only; AE moves the group in its list, so the user refreshes and searches again.
+    def apply_categories(self,groups):
+        if self.busy():return
+        if not self.categories_writable():self.error('分类名写入 AE 目前只支持已实测的 AE 2026（26.5.0.89）；中文分类名已保存为候选');return
+        plan=self.category_plan(groups)
+        if not plan:self.error('此分类还没有中文名称，或它的效果当前 AE 都未加载');return
+        self.status.setText(f'正在应用 {len(plan)} 个分类名称……')
+        self.work(lambda progress:self.apply_with_categories({},plan),self.applied)
+    def write_categories(self,plan)->dict:
+        """Runs in the job. A failed category is rolled back on its own and reported; the others still go."""
+        done={};errors=[]
+        for group,value,key in plan:
+            try:
+                found=self.category_session.group(key)
+                if found['category']==value:done[group]=0;continue
+                done[group]=len(self.category_session.apply_group(key,value,found['category'],found['keys']).get('applied',{}))
+            except Exception as error:errors.append(f'{group}：{error}')
+        return {'categories':done,'categoryErrors':errors}
+    def apply_with_categories(self,names,plan):
+        operation,live,error=self.apply_names(names) if names else ({'applied':{}},None,'')
+        if plan:operation.update(self.write_categories(plan));_,live,error=with_live(None,self.space.exe)
+        return operation,live,error
+    def restore_categories(self,groups=None):
+        if not self.live or self.busy():return
+        plan=None if groups is None else self.category_plan(groups,named=False)
+        if plan==[]:self.status.setText('此分类的效果当前 AE 都未加载，无需恢复');return
+        def done(result):
+            operation,live,error=result;count=len(operation.get('restored',{}))
+            if count:self.needs_refresh=True
+            self.update_refresh_hint();self.show_reread(live,error);self.status.setText(f'已恢复 {count} 个效果分类；请刷新 AE 列表并重新搜索' if count else '没有需要恢复的分类名称')
+        self.work(lambda progress:with_live(self.restore_category_groups(plan),self.space.exe),done)
+    def restore_category_groups(self,plan):
+        """Runs in the job: whole AE groups (plan None: every recorded category)."""
+        if plan is None:return self.category_session.restore()
+        keys=set()
+        for group,value,key in plan:keys.update(self.category_session.group(key)['keys'])
+        return self.category_session.restore(keys)
     def fill_add_menu(self,menu:QMenu,keys:list[str],part='effects')->QMenu:
         """Lists every scheme of this version, plus a new one, as places to put keys."""
         menu.clear();word=PART_WORD[part]
@@ -1896,6 +2135,18 @@ class Window(QMainWindow):
         else:self.error('插件文件不存在：'+path)
     def item_changed(self,item):
         if self._fill or item.column() not in (CHECK,CANDIDATE):return
+        if getattr(item,'head',False):
+            if item.column()==CHECK:
+                on=item.checkState()!=Qt.CheckState.Unchecked;self.tick_groups({item.group},on)
+                if self.categories_only:self.save_enabled();self.paint_groups();self.update_detail_actions()
+                else:self.check_keys(self.row_keys([item.row()]),on)
+                return
+            value=item.text().strip()
+            if value:self.category_pending[item.group]=value
+            else:self.category_pending.pop(item.group,None)
+            self.save_categories();self.paint_groups();self.selection_changed()
+            if self.filter.text():self.filter_rows()
+            return
         key=self.table.item(item.row(),KEY).text()
         if item.column()==CHECK:
             checked=item.checkState()==Qt.CheckState.Checked;anchor=self.check_anchor;self.check_anchor=key
@@ -1905,12 +2156,13 @@ class Window(QMainWindow):
                     first,last=sorted((keys.index(anchor),visible.index(item.row()) if item.row() in visible else keys.index(key)))
                     self.check_keys(set(keys[first:last+1]),checked);return
             if checked:self.enabled.add(key)
-            else:self.enabled.discard(key)
+            else:self.enabled.discard(key);self.drop_ticks({key})
             self.sync_rows({key});self.save_enabled();return
         self.pending[key]=item.text();self.save_translations();self.sync_rows({key});self.selection_changed()
     def save_enabled(self):
-        message=self.enabled_store.save()
-        if message:self.log.appendPlainText(message)
+        for store in (self.enabled_store,self.ticked_store):
+            message=store.save()
+            if message:self.log.appendPlainText(message)
         self.update_scheme_bar()
     def save_translations(self):
         message=self.store.save()
@@ -1950,6 +2202,7 @@ class Window(QMainWindow):
         return {key:value}
     def apply_selected(self):
         if not self.space.live:self.error(f'{self.space.label} 不支持实时改名');return
+        if not self.selected_rows() and (group:=self.selected_group()):self.commit_name();self.apply_categories([group]);return
         try:values=self.translations_selected()
         except Exception as e:self.error(str(e));return
         self.status.setText(f'正在应用 {len(values)} 个名称……');self.writing=set(values)
@@ -1957,10 +2210,12 @@ class Window(QMainWindow):
     def apply_scheme(self):
         if not self.space.live:self.error(f'{self.space.label} 不支持实时改名');return
         names={k:self.pending[k] for k in self.enabled if self.pending.get(k,'').strip()};blank=len(self.enabled)-len(names)
-        if not names:self.error('勾选的效果都还没有中文候选，请先翻译');return
+        groups=self.checked_groups();writable=self.categories_writable();plan=self.category_plan(groups) if groups and writable else []
+        if not names and not plan:self.error('勾选的效果都还没有中文候选，请先翻译');return
         if blank:self.log.appendPlainText(f'{blank} 个勾选的效果还没有中文候选，本次跳过')
-        self.status.setText(f'正在应用翻译方案中的 {len(names)} 个名称……');self.writing=set(names)
-        self.work(lambda progress:self.apply_names(names),self.applied)
+        if groups and not writable and any(self.category_pending.get(g,'').strip() for g in groups):self.log.appendPlainText('勾选的分类名只保存为候选：此 AE 构建尚未实测分类写入')
+        self.status.setText(f'正在应用翻译方案中的 {len(names)} 个名称'+(f'和 {len(plan)} 个分类' if plan else '')+'……');self.writing=set(names)
+        self.work(lambda progress:self.apply_with_categories(names,plan),self.applied)
     def applied(self,result):
         operation,live,read_error=result;applied=operation.get('applied',{});unchanged=set(operation.get('unchanged',[]))
         written={k:v for k,v in applied.items() if k not in unchanged}
@@ -1977,19 +2232,34 @@ class Window(QMainWindow):
             # Names this AE's legacy encoding cannot hold were left out; the rest are written.
             self.log.appendPlainText(f"{len(problem['keys'])} 项未写入：{problem['message']}")
             self.toast.notify(f"{len(problem['keys'])} 项译名含无法保存的字符，已跳过",problem['message'],error=True)
-        if written:self.needs_refresh=True
+        categories={g:n for g,n in operation.get('categories',{}).items() if n}
+        if categories:self.toast.notify('分类名称已生效',f'已应用 {len(categories)} 个分类');self.log.appendPlainText(f'已应用 {len(categories)} 个分类名称：'+'、'.join(f'{g}→{self.category_pending.get(g,"")}' for g in categories))
+        if failed:=operation.get('categoryErrors'):
+            for problem in failed:self.log.appendPlainText('分类名称未应用：'+problem)
+            self.toast.notify(f'{len(failed)} 个分类名称未应用','；'.join(failed)[:300],error=True)
+        if written or categories:self.needs_refresh=True
         self.update_refresh_hint()
-        self.status.setText('名称已写入 AE，图层效果标题已同步；目录请点击“刷新 AE 列表”' if written or instance_count else '没有需要写入的名称')
+        self.status.setText('名称已写入 AE，图层效果标题已同步；目录请点击“刷新 AE 列表”' if written or instance_count else '分类名称已写入 AE；点击“刷新 AE 列表”后重新搜索' if categories else '没有需要写入的名称')
         self.show_reread(live,read_error)
     def restore_selected(self):
+        if not self.selected_rows() and (group:=self.selected_group()):self.restore_categories([group]);return
         keys=sorted({self.table.item(row,KEY).text() for row in self.selected_rows()})
         if not keys:self.error('请先在表格中点击要恢复的效果');return
         self.work(lambda progress:with_live(self.restore_effect_names(keys),self.space.exe),self.restored)
     def restore_checked(self):
-        keys=sorted(self.enabled)
-        if not keys:self.error('还没有勾选效果；恢复全部请用“一键恢复全部默认”');return
-        self.status.setText(f'正在恢复 {len(keys)} 个勾选项的原名……')
-        self.work(lambda progress:with_live(self.restore_effect_names(keys),self.space.exe),self.restored)
+        keys=sorted(self.enabled);groups=self.checked_groups()
+        if not keys and not groups:self.error('还没有勾选效果；恢复全部请用“一键恢复全部默认”');return
+        try:recorded=bool(groups) and self.categories_writable() and bool(self.category_session.journal()['entries'])
+        except Exception:recorded=False
+        plan=self.category_plan(groups,named=False) if recorded else []
+        def job(progress):
+            result=self.restore_effect_names(keys) if keys else {'restored':{}}
+            if plan:
+                try:result['categoryResult']=self.restore_category_groups(plan)
+                except Exception as error:result.setdefault('restoreErrors',[]).append('效果分类恢复失败：'+str(error))
+            return with_live(result,self.space.exe)
+        self.status.setText(f'正在恢复 {len(keys)} 个勾选项的原名'+(f'和 {len(plan)} 个分类' if plan else '')+'……')
+        self.work(job,self.restored)
     def restore_effect_names(self,keys=None):
         # The palette catalog must not be held hostage by project-instance
         # validation, user-renamed instances, or a blocked scripting relay.
@@ -2008,6 +2278,8 @@ class Window(QMainWindow):
         result=self.restore_effect_names()
         try:result['parameterResult']=self.parameter_session.restore(progress=progress)
         except Exception as error:result.setdefault('restoreErrors',[]).append('参数标签恢复失败：'+str(error))
+        try:result['categoryResult']=self.category_session.restore()
+        except Exception as error:result.setdefault('restoreErrors',[]).append('效果分类恢复失败：'+str(error))
         if self.close_after:
             if result.get('restoreErrors'):raise RuntimeError('部分原名未恢复，记录已保留：'+'；'.join(result['restoreErrors']))
             if result.get('instanceResult',{}).get('pending'):raise RuntimeError('其他工程或已移动效果仍有实例标题恢复记录；请返回原工程恢复后退出，或取消退出前恢复')
@@ -2058,6 +2330,8 @@ class Window(QMainWindow):
         if 'parameterResult' in operation:
             result=operation['parameterResult'];self.log.appendPlainText(f"已恢复 {result.get('restored',0)} 个参数标签，{result.get('pending',0)} 个未加载参数保留记录")
             if self.parameter_page.rows:self.parameter_page.status.setText('参数名称已在“效果名称”页恢复，请重新读取以查看 AE 当前名称。')
+        if operation.get('categoryResult',{}).get('restored'):
+            self.needs_refresh=True;self.update_refresh_hint();self.log.appendPlainText(f"已恢复 {len(operation['categoryResult']['restored'])} 个效果分类");self.status.setText('分类已恢复；请刷新 AE 列表并重新搜索')
         if operation.get('restoreErrors'):
             self.error('部分原名未恢复，记录已保留：'+'；'.join(operation['restoreErrors'])+'。效果目录已恢复的部分请手动刷新 AE 列表；失败部分需重试恢复。')
     def show_reread(self,live,read_error):
@@ -2071,10 +2345,30 @@ class Window(QMainWindow):
         if not self.live:return
         live=dict(self.live);image=str(self.space.exe)
         def done(result):
-            self.needs_refresh=False;self.update_refresh_hint()
+            self.needs_refresh=bool(result.get('effectMenuError'));self.update_refresh_hint()
             self.status.setText('已执行 AE 原生列表刷新菜单，请在 AE 中核对名称');self.toast.notify('刷新菜单已执行','请在 AE“效果和预设”列表核对最新名称')
+            if result.get('effectMenuError'):
+                self.status.setText('列表已刷新，但效果菜单同步未完成：'+result['effectMenuError']);self.log.appendPlainText('效果菜单同步：'+result['effectMenuError'])
+            elif result.get('effectMenu',{}).get('supported'):
+                menu=result['effectMenu'];skipped=menu.get('skipped',[])
+                self.status.setText(f"已刷新列表，菜单识别 {menu.get('visibleMatched',menu.get('updated',0))} 项，本次同步 {menu.get('updated',0)} 项"+(f"，跳过 {len(skipped)} 个效果（详见设置与日志）" if skipped else '；分类搜索结果需重新搜索'))
+                if skipped:
+                    reasons={'not_in_menu':'没有对应的可见菜单项','ambiguous_menu':'菜单同名项不唯一','effect_not_loaded':'效果未加载','category_changed':'分类成员不一致','alias_translation_conflict':'同名效果的译名不一致','menu_target_conflict':'同一菜单项的目标译名冲突'}
+                    counts={}
+                    for item in skipped:counts[item['reason']]=counts.get(item['reason'],0)+1
+                    self.log.appendPlainText('效果菜单跳过：'+'；'.join(f"{reasons.get(k,k)} {v} 项" for k,v in counts.items()))
+                    for item in skipped[:30]:self.log.appendPlainText(f"  {item['source']} [{item['key']}]：{reasons.get(item['reason'],item['reason'])}")
+                    if len(skipped)>30:self.log.appendPlainText(f"  以上显示前30项，共跳过{len(skipped)}项；其他可确认菜单已正常同步")
+            elif result.get('effectMenu',{}).get('supported') is False:self.log.appendPlainText('此构建尚未验证效果菜单同步，保留原有列表刷新')
             if result.get('diagnosticPath'):self.log.appendPlainText('刷新诊断：'+result['diagnosticPath'])
-        self.work(lambda progress:refresh_effects(live['pid'],expected_image=image,creation_time=live['creationTime']),done)
+        def work(progress):
+            deadline=time.monotonic()+10
+            result=refresh_effects(live['pid'],expected_image=image,creation_time=live['creationTime'])
+            try:
+                if self.session.journal()['entries'] or self.category_session.journal()['entries'] or self.menu_name_session.path.exists():result['effectMenu']=self.menu_name_session.sync(live['pid'],live['creationTime'],image,deadline=deadline)
+            except Exception as error:result['effectMenuError']=str(error)
+            return result
+        self.work(work,done)
     def calibrate_refresh_menu(self):
         if not self.live or self.busy():return
         from ae_ui import calibrate_effects
@@ -2089,30 +2383,46 @@ class Window(QMainWindow):
         self.update_api_info();self.update_usage();return accepted
     def translate_selected(self):
         rows=self.selected_rows()
+        if not rows and (group:=self.selected_group()):self.translate_rows([],[group]);return
         if not rows:self.error('请先在表格中点击要翻译的效果');return
         self.translate_rows(rows)
     def translate_checked(self,overwrite=False):
         rows=[];seen=set()
-        for row in range(self.table.rowCount()):
+        for row in self.effect_rows():
             key=self.table.item(row,KEY).text()
             if key in self.enabled and key not in seen and (overwrite or not self.table.item(row,CANDIDATE).text().strip()):rows.append(row);seen.add(key)
-        if not rows:self.toast.notify('无需翻译','勾选的效果都已有中文候选' if self.enabled else '还没有勾选效果');return
-        self.translate_rows(rows)
-    def translate_rows(self,rows):
+        groups=[g for g in self.checked_groups() if overwrite or not self.category_pending.get(g,'').strip()]
+        if not rows and not groups:self.toast.notify('无需翻译','勾选的效果都已有中文候选' if self.enabled else '还没有勾选效果');return
+        self.translate_rows(rows,groups) if groups else self.translate_rows(rows)
+    def translate_rows(self,rows,groups=()):
         if not self.settings.ready() and not self.configure_api():return
         unique={self.table.item(row,KEY).text():{'id':self.table.item(row,KEY).text(),'sourceName':self.table.item(row,ORIGINAL).text(),'category':self.table.item(row,CATEGORY).text()} for row in rows}
-        self.status.setText(f'正在调用 {self.settings.provider.name} 翻译 {len(unique)} 个名称……')
+        # A category goes with a few of its effects as context; its own prompt keeps Adobe's usual category wording.
+        categories={}
+        for group in groups:
+            if group:categories[group]={'id':group,'sourceName':group,'category':'该分类下的效果：'+'、'.join([self.table.item(row,ORIGINAL).text() for row in self.effect_rows() if self.group_of(row)==group][:8])}
+        if not unique and not categories:return
+        what='、'.join(x for x in (f'{len(unique)} 个名称' if unique else '',f'{len(categories)} 个分类名' if categories else '') if x)
+        self.status.setText(f'正在调用 {self.settings.provider.name} 翻译 {what}……')
         s=self.settings
         def translate(progress):
             # Keep finished batches even when a later batch fails, so the user does not pay for them twice.
-            try:return translate_names(list(unique.values()),s.key,s.base_url,s.model,progress=lambda done,total:progress(f'正在调用 {s.provider.name} 翻译……已完成 {done}/{total} 项'),service=s.service,usage=record_usage),''
-            except TranslationError as failure:return failure.partial,str(failure)
+            names={}
+            if unique:
+                try:names=translate_names(list(unique.values()),s.key,s.base_url,s.model,progress=lambda done,total:progress(f'正在调用 {s.provider.name} 翻译……已完成 {done}/{total} 项'),service=s.service,usage=record_usage)
+                except TranslationError as failure:return failure.partial,str(failure),{}
+            if not categories:return names,'',{}
+            try:return names,'',translate_names(list(categories.values()),s.key,s.base_url,s.model,progress=lambda done,total:progress(f'正在调用 {s.provider.name} 翻译分类名……已完成 {done}/{total} 项'),service=s.service,usage=record_usage,system_prompt=CATEGORY_PROMPT)
+            except TranslationError as failure:return names,str(failure),failure.partial
         self.work(translate,self.translated)
     def translated(self,result):
-        result,failure=result;self.pending.update(result);self.sync_rows(set(result))
+        result,failure,*more=result;categories=more[0] if more else {}
+        self.pending.update(result);self.sync_rows(set(result))
+        if categories:self.category_pending.update(categories);self.save_categories();self.paint_groups()
         self.save_translations();self.selection_changed();self.status.setText('翻译完成，请查看中文候选后点击应用')
-        if result and not failure:self.toast.notify('翻译完成',f'生成 {len(result)} 个中文候选，确认后应用到 AE')
-        if failure:self.error(failure+('；已完成部分的候选已保存' if result else ''))
+        made=len(result)+len(categories)
+        if made and not failure:self.toast.notify('翻译完成',f'生成 {len(result)} 个中文候选'+(f'和 {len(categories)} 个分类名' if categories else '')+'，确认后应用到 AE')
+        if failure:self.error(failure+('；已完成部分的候选已保存' if made else ''))
     # Saved schemes: a library in each version's schemes/ folder. A scheme holds a whole set: effect names
     # and parameter labels, each with its checks. Switching only replaces the tables; AE is never touched.
     def current_names(self)->dict[str,str]:return {k:v for k,v in self.pending.items() if v}
@@ -2896,7 +3206,7 @@ class Window(QMainWindow):
         if dialog and dialog.validation and dialog.validation.held:
             event.ignore();dialog.restore_validation();self.status.setText('正在恢复验证改名，恢复完成后可关闭');return
         # A damaged journal cannot be restored from; closing must still work (AE keeps names until it restarts).
-        try:entries=self.session.journal().get('entries') or self.parameter_session.journal().get('entries') or self.instance_session.journal().get('entries')
+        try:entries=self.session.journal().get('entries') or self.parameter_session.journal().get('entries') or self.instance_session.journal().get('entries') or self.category_session.journal().get('entries')
         except Exception:entries=None
         if self.exit_restore.isChecked() and entries and not self.close_after:
             event.ignore();self.close_after=True;self.work(lambda progress:self.restore_names(progress),self.exit_restored);return

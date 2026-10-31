@@ -63,7 +63,7 @@ class HostBridge:
                 # Only our retained Popen handle for this exact -r invocation is stopped.
                 relay.terminate();relay.wait(timeout=5)
     def call(self,action,**kwargs):
-        if action not in {'status','catalog','prepare','snapshot','render','edit','switch','show','close'}:raise ValueError('QA action rejected')
+        if action not in {'status','catalog','prepare','snapshot','popupProbe','render','edit','switch','show','close'}:raise ValueError('QA action rejected')
         extras={'status':{'diagnoseCatalog'},'render':{'frame','disabled'},'edit':{'parameterEffect','parameterMatch'},'switch':{'target'}}
         if set(kwargs)-extras.get(action,set()):raise ValueError('QA 请求不能覆盖身份、许可或输出路径')
         with self.process() as p:pid=p.pid

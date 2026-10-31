@@ -23,7 +23,8 @@ try{
   phase('读取一次效果目录，选择测试效果');
   var ids={},available=app.effects;for(var ai=0;ai<available.length;ai++){if(ai%64===0)requirePermit();ids[available[ai].matchName]=true;}
   // AE's own Gaussian Blur first: every AE has it and it does not depend on a third-party plugin's GPU renderer.
-  var test=ids['ADBE Gaussian Blur 2']?'ADBE Gaussian Blur 2':ids.S_Glow?'S_Glow':null;
+  // No chained ?: here: ExtendScript reads a?b:c?d:e as (a?b:c)?d:e, which picked S_Glow whenever either effect existed.
+  var test=null;if(ids['ADBE Gaussian Blur 2'])test='ADBE Gaussian Blur 2';else if(ids.S_Glow)test='S_Glow';
   if(!test)throw new Error('No supported QA fixture effect is installed');
   requirePermit();phase('创建自有测试合成');building=true;
   // The QA project renders on the CPU: graphics drivers that crash AE (seen with AE 25.0 on an AMD card) must not end a self-check.
@@ -40,7 +41,18 @@ try{
  }else{
   requirePermit();if(!owned())throw new Error('验证只能操作软件自有 QA 工程');phase('已核对自有 QA 工程');
   var c=comp(),effects=c.layer(1).property('ADBE Effect Parade');
-  if(q.action==='snapshot'){
+  if(q.action==='popupProbe'){
+   r.popupRows=[];
+   for(var pe=1;pe<=effects.numProperties;pe++){
+    var popupEffect=effects.property(pe);
+    for(var pp=1;pp<=popupEffect.numProperties;pp++){
+     var popup=popupEffect.property(pp),popupRow={effect:popupEffect.matchName,matchName:popup.matchName,name:popup.name};
+     try{popupRow.isDropdownEffect=popup.isDropdownEffect===true;}catch(noDropdown){popupRow.isDropdownEffect=false;}
+     try{var popupType=Number(popup.propertyValueType);if(isFinite(popupType))popupRow.valueType=popupType;if(isFinite(popup.minValue))popupRow.minimum=popup.minValue;if(isFinite(popup.maxValue))popupRow.maximum=popup.maxValue;}catch(noRange){}
+     popupRow.hasSetPropertyParameters=typeof popup.setPropertyParameters==='function';r.popupRows.push(popupRow);
+    }
+   }
+  }else if(q.action==='snapshot'){
    r.rows=[];for(var e=1;e<=effects.numProperties;e++){var fx=effects.property(e);for(var i=1;i<=fx.numProperties;i++){
     var p=fx.property(i),row={effect:fx.matchName,matchName:p.matchName,name:p.name,index:i};
     try{row.keys=p.numKeys;row.expression=p.expression;}catch(ignore){}

@@ -254,16 +254,22 @@ class DragCheckTests(GuiCase):
         from PySide6.QtTest import QTest
         QTest.mouseRelease(table.viewport(),Qt.MouseButton.LeftButton,Qt.KeyboardModifier.NoModifier,table.visualItemRect(table.item(row,column)).center())
     def test_sweeping_down_the_boxes_checks_every_row_passed_and_saves_once(self):
-        w=self.window;w.resize(1300,820);w.show();self.addCleanup(w.hide);self.app.processEvents();t=w.table
+        w=self.window;w.resize(1300,820);w.show();self.addCleanup(w.hide);w.fold_all(False);self.app.processEvents();t=w.table
+        # Open groups: 0 Keying, 1 Atom Key, 2 RG Blurs and Glows, 3 tc Shine, 4 Sapphire Lighting, 5-6 S_Glow.
         with patch.object(w,'save_enabled',wraps=w.save_enabled) as save:
             self.press(t,0);self.move(t,3);self.release(t,3)
-        save.assert_called_once();self.assertEqual(w.enabled,{t.item(r,KEY).text() for r in range(4)})
+        save.assert_called_once();self.assertEqual(w.enabled,{'Atom Key','tc Shine'});self.assertEqual(w.ticked,{'Keying','RG Blurs and Glows'})
         self.assertTrue(all(t.item(r,0).checkState()==Qt.CheckState.Checked for r in range(4)))
         self.press(t,3);self.move(t,1);self.release(t,1)
-        self.assertEqual(w.enabled,{t.item(0,KEY).text()}-{t.item(r,KEY).text() for r in range(1,4)})
-    def test_click_without_moving_toggles_one_box_and_skips_hidden_rows_when_sweeping(self):
+        self.assertEqual(w.enabled,set());self.assertEqual(t.item(0,0).checkState(),Qt.CheckState.Unchecked)
+    def test_pressing_a_folded_category_box_checks_its_whole_group(self):
         w=self.window;w.resize(1300,820);w.show();self.addCleanup(w.hide);self.app.processEvents();t=w.table
-        self.press(t,1);self.release(t,1);self.assertEqual(w.enabled,{t.item(1,KEY).text()})
+        header=next(r for r in w.group_rows() if w.group_of(r)=='Sapphire Lighting');self.assertTrue(all(t.isRowHidden(r) for r in w.effect_rows()))
+        self.press(t,header);self.release(t,header)
+        self.assertEqual(w.enabled,{'S_Glow'});self.assertEqual(w.checked_groups(),['Sapphire Lighting'])
+    def test_click_without_moving_toggles_one_box_and_skips_hidden_rows_when_sweeping(self):
+        w=self.window;w.resize(1300,820);w.show();self.addCleanup(w.hide);w.fold_all(False);self.app.processEvents();t=w.table
+        self.press(t,3);self.release(t,3);self.assertEqual(w.enabled,{'tc Shine'});self.assertEqual(w.checked_groups(),[])
         w.filter.setText('S');visible=w.visible_rows();self.press(t,visible[0]);self.move(t,visible[-1]);self.release(t,visible[-1])
         self.assertNotIn('Atom Key',w.enabled)
     def test_parameter_boxes_sweep_too(self):

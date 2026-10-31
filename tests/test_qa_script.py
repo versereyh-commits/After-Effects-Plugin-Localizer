@@ -4,7 +4,37 @@ This checks getter call counts and cancellation before mutations, not AE ABI.
 Node is a development-only dependency; no AE or user files are accessed.
 """
 from pathlib import Path
-import json,shutil,subprocess,unittest
+import json,re,shutil,subprocess,unittest
+
+SCRIPTS=Path(__file__).resolve().parents[1]/'scripts'
+
+def chained_ternaries(source):
+    """Lines where a ?: starts in the else branch of another ?: at the same nesting level.
+
+    ExtendScript evaluates a?b:c?d:e as (a?b:c)?d:e (AE QA results 2018-2026 all show it), so such chains
+    must be parenthesized or written as if/else.
+    """
+    text=re.sub(r'"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|//[^\n]*|/\*[\s\S]*?\*/',lambda m:'""'+'\n'*m.group().count('\n'),source)
+    found,stack,line=[],[[0,False]],1
+    for char in text:
+        state=stack[-1]
+        if char in '([{':stack.append([0,False])
+        elif char in ')]}':
+            if len(stack)>1:stack.pop()
+        elif char=='?':
+            if state[1]:found.append(line)
+            state[0]+=1
+        elif char==':' and state[0]:state[0]-=1;state[1]=True
+        elif char in ';,\n':state[:]=[0,False]
+        if char=='\n':line+=1
+    return found
+
+class TernaryTests(unittest.TestCase):
+    def test_detector(self):
+        self.assertEqual(chained_ternaries("var a=x?1:y?2:3;\nvar b=x?1:(y?2:3);\nvar c={k:x?1:2,m:y?3:4};\nvar d='a?b:c?d';"),[1])
+    def test_scripts_have_no_chained_ternary(self):
+        for path in sorted(SCRIPTS.glob('*.jsx')):
+            with self.subTest(path.name):self.assertEqual(chained_ternaries(path.read_text(encoding='utf8')),[])
 
 RUNNER=r'''
 const fs=require('fs'),vm=require('vm');const q=JSON.parse(fs.readFileSync(0,'utf8'));
@@ -27,11 +57,12 @@ process.stdout.write(JSON.stringify({result:JSON.parse(files.result),progress:JS
 @unittest.skipUnless(shutil.which('node'),'Node is needed for the isolated JSX regression tests')
 class QAScriptTests(unittest.TestCase):
     def run_script(self,**options):
-        source=(Path(__file__).resolve().parents[1]/'scripts'/'adapter_qa.jsx').read_text(encoding='utf8')
+        source=(SCRIPTS/'adapter_qa.jsx').read_text(encoding='utf8')
         result=subprocess.run([shutil.which('node'),'-e',RUNNER],input=json.dumps(dict(source=source,**options)),text=True,encoding='utf8',capture_output=True,check=True)
         return json.loads(result.stdout)
     def test_prepare_reads_whole_catalog_once(self):
         result=self.run_script();self.assertEqual(result['reads'],1);self.assertTrue(result['result']['prepared']);self.assertIn('save',result['events'])
+        self.assertIn('effect:ADBE Gaussian Blur 2',result['events']);self.assertEqual(result['result']['fixture']['testEffect'],'ADBE Gaussian Blur 2')
     def test_expiry_after_catalog_prevents_project_mutations(self):
         result=self.run_script(expireOnRead=True);self.assertIn('取消',result['result']['error']);self.assertEqual(result['events'],[])
     def test_user_project_is_never_closed_or_changed(self):

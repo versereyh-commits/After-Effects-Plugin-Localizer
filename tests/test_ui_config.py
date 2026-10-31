@@ -1,4 +1,4 @@
-import json
+import json,sys
 from pathlib import Path
 import tempfile
 import threading
@@ -139,9 +139,15 @@ class RefreshTests(unittest.TestCase):
         user=FakeUser32();self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
         entered=threading.Event();done=threading.Event()
         def slow(hwnd,pid,u,deadline):entered.set();time.sleep(.4);done.set();return [(100,20)]
+        # Import before faking comtypes: its package import can otherwise reset the
+        # fake module while the worker is starting under full-suite load.
+        import palette_messages
         for target,value in [('main_window',lambda pid:1),('_user32',lambda:user),('_native_api',lambda u:None),('_owner',lambda u,h:1),('_identity',lambda *a:('test/AfterFX.exe',10)),('_diagnostic_path',lambda:Path(self.temp.name)/'d.json'),('_locate_tab',slow),('_popups',lambda u,pid:[]),('_native_windows',lambda *a:([],[]))]:
             handle=patch.object(ae_ui,target,value);handle.start();self.addCleanup(handle.stop)
-        with self.assertRaisesRegex(RuntimeError,'超时'):ae_ui.refresh_effects(1,timeout=.1)
+        # Exercise our timeout, not real COM initialization on a test worker.
+        # Native COM startup can fail before slow() and accidentally test GetMenu fallback instead.
+        fake_com=SimpleNamespace(CoInitializeEx=lambda flags:None,CoUninitialize=lambda:None)
+        with patch.dict(sys.modules,{'comtypes':fake_com}),self.assertRaisesRegex(RuntimeError,'超时'):ae_ui.refresh_effects(1,timeout=.1)
         self.assertTrue(done.wait(2));self.assertEqual(user.posts,[])
     def test_closed_panel_is_opened_with_the_window_command_once(self):
         user=FakeUser32(closed={9});self.patch(user,[[],[(100,20)]],[(9,77,3,94)])

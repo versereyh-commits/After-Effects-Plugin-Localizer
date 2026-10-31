@@ -127,6 +127,24 @@ class LiveSafetyTests(unittest.TestCase):
     def test_missing_journal_is_empty(self):
         self.assertEqual(self.session.journal(),{'schemaVersion':1,'entries':{}})
         self.assertFalse(self.session.journal_path.exists())
+    def test_restore_probe_failure_preserves_record_and_memory(self):
+        live._save(self.session.journal_path,self._journal())
+        before=self.session.journal_path.read_bytes()
+        for report in ({'error':'probe unavailable'},{}, {'processes':None}):
+            with patch.object(live,'native_probe',return_value=report),self.assertRaisesRegex(RuntimeError,'恢复记录已保留'):
+                self.session.restore()
+            self.assertEqual(self.session.journal_path.read_bytes(),before)
+            self.assertEqual(self.process.writes,[])
+    def test_restore_empty_probe_does_not_expire_a_running_host(self):
+        live._save(self.session.journal_path,self._journal());before=self.session.journal_path.read_bytes()
+        with patch.object(live,'native_probe',return_value={'processes':[]}),patch('host_identity.running_pids',return_value={123}),self.assertRaisesRegex(RuntimeError,'仍在运行'):
+            self.session.restore()
+        self.assertEqual(self.session.journal_path.read_bytes(),before);self.assertEqual(self.process.writes,[])
+    def test_restore_confirmed_exit_expires_record(self):
+        live._save(self.session.journal_path,self._journal())
+        with patch.object(live,'native_probe',return_value={'processes':[]}),patch('host_identity.running_pids',return_value=set()):
+            self.assertTrue(self.session.restore()['oldProcessEnded'])
+        self.assertEqual(self.session.journal()['entries'],{});self.assertEqual(self.process.writes,[])
     def test_bad_json_is_preserved_without_writes(self):
         self._assert_bad_journal(b'{broken json')
     def test_list_journal_is_preserved_without_writes(self):

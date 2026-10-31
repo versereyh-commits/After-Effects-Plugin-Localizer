@@ -45,6 +45,15 @@ class DeepSeekTests(unittest.TestCase):
         self.assertEqual(self.call(),{'S_Glow':'辉光'})
         self.assertEqual(Handler.received['response_format'],{'type':'json_object'})
         self.assertEqual(Handler.received['thinking'],{'type':'disabled'})
+    def test_ui_text_allows_long_tip(self):
+        text='这是较长的面板提示。'*30+' {name}'
+        Handler.reply={'translations':[{'id':'1','name':text}]}
+        result=llm_client.translate_ui_strings([{'id':'tip','sourceName':'Hello {name}','category':'Test panel'}],'test-only',self.base,workers=1)
+        self.assertEqual(result,{'tip':text})
+    def test_ui_text_rejects_changed_placeholder(self):
+        Handler.reply={'translations':[{'id':'1','name':'你好 {other}'}]}
+        with self.assertRaisesRegex(TranslationError,'占位符'):
+            llm_client.translate_ui_strings([{'id':'tip','sourceName':'Hello {name}','category':'Test panel'}],'test-only',self.base,workers=1)
     def test_unknown_identity_is_rejected(self):
         Handler.reply={'translations':[{'id':'another','name':'辉光'}]}
         with self.assertRaises(RuntimeError):self.call()
