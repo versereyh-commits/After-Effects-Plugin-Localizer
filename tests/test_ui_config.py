@@ -149,6 +149,11 @@ class RefreshTests(unittest.TestCase):
         fake_com=SimpleNamespace(CoInitializeEx=lambda flags:None,CoUninitialize=lambda:None)
         with patch.dict(sys.modules,{'comtypes':fake_com}),self.assertRaisesRegex(RuntimeError,'超时'):ae_ui.refresh_effects(1,timeout=.1)
         self.assertTrue(done.wait(2));self.assertEqual(user.posts,[])
+    def test_lookup_timeout_is_terminal_even_before_total_deadline(self):
+        user=FakeUser32();self.patch(user,[[]],[])
+        with patch.object(ae_ui,'_inspect',side_effect=TimeoutError('定位超时')),patch.object(ae_ui,'_panel_command',side_effect=AssertionError('must not continue')):
+            with self.assertRaisesRegex(RuntimeError,'超时'):ae_ui.refresh_effects(1,timeout=5)
+        self.assertEqual(user.posts,[])
     def test_closed_panel_is_opened_with_the_window_command_once(self):
         user=FakeUser32(closed={9});self.patch(user,[[],[(100,20)]],[(9,77,3,94)])
         with patch.object(ae_ui,'_panel_command',return_value={'checked':False,'command':1234}):result=ae_ui.refresh_effects(1,timeout=1)

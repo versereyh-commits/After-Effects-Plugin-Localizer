@@ -100,7 +100,7 @@ class MenuNameSession:
             if Path(j['image'])!=Path(p.image):raise ValueError()
             return j
         except (KeyError,TypeError,ValueError) as e:raise RuntimeError('菜单恢复记录格式不符，已保留') from e
-    def sync(self,pid,creation_time,image,*,deadline=None):
+    def sync(self,pid,creation_time,image,*,deadline=None,originals=None):
         deadline=time.monotonic()+5 if deadline is None else deadline
         def check():
             if time.monotonic()>=deadline:raise TimeoutError('效果菜单同步超时，未继续修改')
@@ -124,9 +124,19 @@ class MenuNameSession:
             # Some AE/Premiere aliases share one visible item. Only a consensus display
             # name across all loaded aliases is safe; never guess which internal ID owns it.
             historical={e['key']:e['source'] for e in j['entries'].values() if e['kind']=='effect'}
+            # A catalog may already be translated by a previous tool session,
+            # without an active name journal. Use scanned plugin resources only
+            # as original labels, never as a desired translation or command ID.
+            sources=dict(historical)
+            for key,source in (originals or {}).items():
+                if key in catalog and isinstance(source,str) and source and key not in sources:
+                    sources[key]=source
+            for key,source in sources.items():
+                if key in catalog and catalog[key]['displayName']!=source:
+                    wanted.setdefault('effect:'+key,dict(kind='effect',key=key,source=source,members=[]))
             aliases={}
             for key,row in catalog.items():
-                source=active_names.get(key,{}).get('originalName',historical.get(key,row['displayName']))
+                source=active_names.get(key,{}).get('originalName',sources.get(key,row['displayName']))
                 aliases.setdefault(source,set()).add(row['displayName'])
             staged=[];skipped=[];planned={};matched_targets=set()
             def skip(token,w,reason):skipped.append(dict(kind=w['kind'],key=w['key'],source=w['source'],reason=reason))

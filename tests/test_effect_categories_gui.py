@@ -68,7 +68,7 @@ class CategoryWrites(CategoryGui):
         self.table.item(self.header('Sapphire Lighting'),CANDIDATE).setText('蓝宝石灯光')
         self.assertFalse(self.menu('Sapphire Lighting')[title].isEnabled())
         self.live(writable=False);actions=self.menu('Sapphire Lighting')
-        self.assertFalse(actions[title].isEnabled());self.assertIn('分类名写入 AE 目前只支持已实测的 AE 2026（26.5.0.89）',actions)
+        self.assertFalse(actions[title].isEnabled());self.assertIn('分类名写入需要当前 AE 构建与模块通过适配核验',actions)
         self.live();self.assertTrue(self.menu('Sapphire Lighting')[title].isEnabled())
         with patch.object(w,'busy',return_value=True):self.assertFalse(self.menu('Sapphire Lighting')[title].isEnabled())
         self.assertEqual(self.table.item(self.header('Sapphire Lighting'),STATUS).text(),'待应用')
@@ -172,7 +172,7 @@ class CategoryDetail(CategoryGui):
         self.assertEqual(w.category_pending,{'Sapphire Lighting':'蓝宝石灯光'})
     def test_an_unverified_build_keeps_the_typed_name_and_says_why(self):
         self.live(writable=False);w=self.window;self.select_header('Keying');w.name_edit.setText('抠像');w.commit_name()
-        self.assertFalse(w.apply_btn.isEnabled());self.assertIn('26.5.0.89',w.path_label.text())
+        self.assertFalse(w.apply_btn.isEnabled());self.assertIn('适配核验',w.path_label.text())
         with patch.object(w,'error') as error,patch.object(w,'work') as work:w.apply_selected()
         error.assert_called_once();work.assert_not_called();self.assertEqual(w.category_pending,{'Keying':'抠像'})
     def test_restore_menu_has_a_categories_only_entry(self):

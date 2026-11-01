@@ -32,7 +32,7 @@ from ui_kit import confirm,choose,inform,ask_text,Prompt,SchemeDelegate,SchemeRo
 from ui_kit import (SHADOW,STATUS_MARK,Banner,DiamondDelegate,Breather,EmptyState,FadeStack,Legend,LoaderButton,MetricTile,UsageTile,NavRail,Pill,SearchField,Spinner,StatusTag,Surface,
                     button,divider,elastic,fade_in,icon,label,logo,menu_button,page_head,repolish,soft_path,table_style)
 
-APP_VERSION='1.4.0'
+APP_VERSION='1.4.1'
 APP_NAME='AE汉化工具'
 # Installed copies: the current folder name, and the folder older versions used (an upgrade keeps it).
 INSTALL_FOLDERS=('AE汉化工具','AE插件名称汉化')
@@ -1536,7 +1536,7 @@ class Window(QMainWindow):
         else:note='作用于所选效果；勾选效果后改为作用于勾选项' if rows else '选择一行，或勾选多个效果'
         self.target_note.setText(note)
         why='' if live else ('先连接 AE' if self.space.live else f'{self.space.label} 不支持实时改名')
-        if live and group and not checked and not writable:why='分类名写入 AE 目前只支持已实测的 AE 2026（26.5.0.89）'
+        if live and group and not checked and not writable:why='分类名写入需要当前 AE 构建与模块通过适配核验'
         target=f'{count} 个勾选项' if checked else '所选分类' if group is not None else '所选效果'
         k=self.keymap
         self.translate_btn.setToolTip(k.tip('translate',f'AI 翻译{target}的名称'+('；已有中文的会先询问是否重新翻译' if checked else '，覆盖现有中文候选')))
@@ -1669,7 +1669,7 @@ class Window(QMainWindow):
         """Categories ticked through their own box: translating, applying and restoring the checked items include them."""
         return [self.group_of(row) for row in self.group_rows() if self.group_of(row) in self.ticked] if hasattr(self,'table') else []
     def categories_writable(self)->bool:
-        """Category names reach AE only on the build they were tested on (effect_categories.SUPPORTED, same FLT module)."""
+        """Category names require an enabled adapter and matching FLT module."""
         live=self.live or {}
         return bool(self.space.live and live and category_build(live.get('version'),live.get('profileSha256')))
     def category_plan(self,groups,named=True)->list[tuple[str,str,str]]:
@@ -2001,7 +2001,7 @@ class Window(QMainWindow):
         state=item(STATUS);self.detail_state.set(STATUS_MARK.get(state),{'已应用':'已在 AE 生效','待应用':'有中文，待应用','待翻译':'还没有中文名称','仅翻译':'只保存中文名，不写入此 AE'}.get(state,state))
         self.detail_info.setText(f'AE 当前分类名：{item(CURRENT)}\n包含：{item(KEY)}' if group else '这些效果没有分类，不能汉化分类名')
         notes=['双语写入只作用于效果名称，分类名始终只写中文。']
-        if group and not self.categories_writable():notes.append('分类名写入 AE 目前只支持已实测的 AE 2026（26.5.0.89）；其他版本只保存中文名。')
+        if group and not self.categories_writable():notes.append('分类名写入需要当前 AE 构建与模块通过适配核验；其他版本只保存中文名。')
         self.path_label.setText('\n'.join(notes))
         self.name_edit.setPlaceholderText('输入中文分类名，回车应用此分类');self.name_edit.setText(item(CANDIDATE))
     def selection_changed(self):
@@ -2038,7 +2038,7 @@ class Window(QMainWindow):
         menu.addAction('恢复此分类原名',lambda:self.restore_categories([group])).setEnabled(writable and idle and bool(group))
         menu.addAction('恢复全部分类原名',lambda:self.restore_categories()).setEnabled(writable and idle)
         if self.space.live and not writable:
-            menu.addAction('分类名写入 AE 目前只支持已实测的 AE 2026（26.5.0.89）' if self.live else '连接 AE 后可把分类名写入 AE').setEnabled(False)
+            menu.addAction('分类名写入需要当前 AE 构建与模块通过适配核验' if self.live else '连接 AE 后可把分类名写入 AE').setEnabled(False)
         menu.addSeparator();menu.addAction('复制分类名',lambda:(QApplication.clipboard().setText(title),self.status.setText('已复制分类名')))
         return menu
     def row_menu(self,row)->QMenu:
@@ -2059,7 +2059,7 @@ class Window(QMainWindow):
     # tested build only; AE moves the group in its list, so the user refreshes and searches again.
     def apply_categories(self,groups):
         if self.busy():return
-        if not self.categories_writable():self.error('分类名写入 AE 目前只支持已实测的 AE 2026（26.5.0.89）；中文分类名已保存为候选');return
+        if not self.categories_writable():self.error('分类名写入需要当前 AE 构建与模块通过适配核验；中文分类名已保存为候选');return
         plan=self.category_plan(groups)
         if not plan:self.error('此分类还没有中文名称，或它的效果当前 AE 都未加载');return
         self.status.setText(f'正在应用 {len(plan)} 个分类名称……')
@@ -2344,6 +2344,9 @@ class Window(QMainWindow):
     def refresh_native(self):
         if not self.live:return
         live=dict(self.live);image=str(self.space.exe)
+        labels={}
+        for plugin in self.plugins:labels.setdefault(plugin.match_name,set()).add(plugin.display_name)
+        originals={key:next(iter(values)) for key,values in labels.items() if len(values)==1}
         def done(result):
             self.needs_refresh=bool(result.get('effectMenuError'));self.update_refresh_hint()
             self.status.setText('已执行 AE 原生列表刷新菜单，请在 AE 中核对名称');self.toast.notify('刷新菜单已执行','请在 AE“效果和预设”列表核对最新名称')
@@ -2365,7 +2368,7 @@ class Window(QMainWindow):
             deadline=time.monotonic()+10
             result=refresh_effects(live['pid'],expected_image=image,creation_time=live['creationTime'])
             try:
-                if self.session.journal()['entries'] or self.category_session.journal()['entries'] or self.menu_name_session.path.exists():result['effectMenu']=self.menu_name_session.sync(live['pid'],live['creationTime'],image,deadline=deadline)
+                result['effectMenu']=self.menu_name_session.sync(live['pid'],live['creationTime'],image,deadline=deadline,originals=originals)
             except Exception as error:result['effectMenuError']=str(error)
             return result
         self.work(work,done)

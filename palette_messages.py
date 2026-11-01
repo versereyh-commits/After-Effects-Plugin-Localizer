@@ -138,6 +138,10 @@ def _run(u,pid,timeout,image,created,calibrate,progress):
         owned.clear();return True
     def locate():
         try:points=ui._inspect(main,pid,u,min(deadline,time.monotonic()+2))
+        except TimeoutError:
+            # Windows event waits can return just before the monotonic deadline.
+            # A timed-out lookup is terminal, even if check() sees a few ticks left.
+            raise
         except Exception as error:
             check();trace.append({'uiaError':str(error)});points=[]
         check()

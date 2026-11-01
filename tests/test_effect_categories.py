@@ -4,6 +4,8 @@ from types import SimpleNamespace
 from contextlib import nullcontext
 from unittest.mock import patch
 import effect_categories as E
+from dataclasses import replace
+from ae_profiles import LOCAL_PROFILES
 
 class Memory:
     pid=123;creation_time=456;image='AfterFX.exe'
@@ -30,6 +32,18 @@ class Registry:
     def target(self,key):return next(r for r in self.records() if r['matchName']==key)
 
 class Categories(unittest.TestCase):
+    def test_all_enabled_builtin_builds_and_matching_hashes_are_available(self):
+        for version,profile in E.PROFILES.items():
+            self.assertEqual(E.supported_build(version,profile.flt_sha),profile.enabled)
+            self.assertFalse(E.supported_build(version,'0'*64))
+        self.assertFalse(E.supported_build('unknown','0'*64))
+    def test_validated_local_legacy_layout_is_available_but_disabled_is_not(self):
+        legacy=replace(E.PROFILES['26.5.0.89'],version='15.1.2.69',name_base=20,fc_vtable=0,fc_tag=1,fc_tail=164,registry_list=True)
+        with patch.dict(LOCAL_PROFILES,{legacy.version:legacy}):
+            self.assertTrue(E.supported_build(legacy.version,legacy.flt_sha))
+            self.assertEqual(E.CategorySession._span(type('R',(),{'profile':legacy})()),100)
+        with patch.dict(LOCAL_PROFILES,{legacy.version:replace(legacy,enabled=False)}):
+            self.assertFalse(E.supported_build(legacy.version,legacy.flt_sha))
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup);self.p=Memory();self.session=E.CategorySession();self.session.path=Path(self.tmp.name)/'category.json';self.p.session=self.session
         for name,value in (('_process_lock',lambda:nullcontext()),('main_window',lambda pid:1),('Registry',Registry),('current_process',lambda **kw:self.p),('running_pids',lambda:{self.p.pid})):

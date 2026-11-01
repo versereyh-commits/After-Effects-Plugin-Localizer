@@ -71,7 +71,8 @@ class DetailTargetTests(GuiCase):
         with patch.object(app_live,'refresh_effects',side_effect=AssertionError('must not refresh')):
             w.applied(({'applied':{'tc Shine':'闪耀'}},LIVE,''));w.update_buttons()
         self.assertTrue(w.needs_refresh);self.assertTrue(w.refresh_btn.property('attention'));self.assertIn('点此刷新',w.refresh_btn.toolTip())
-        with patch.object(app_live,'refresh_effects',return_value={}),patch.object(w,'work',lambda work,done:done(work(lambda text:None))):w.refresh_native()
+        with patch.object(app_live,'refresh_effects',return_value={}),patch.object(w.menu_name_session,'sync',return_value={'supported':True,'updated':0}) as sync,patch.object(w,'work',lambda work,done:done(work(lambda text:None))):w.refresh_native()
+        self.assertIn('S_Glow',sync.call_args.kwargs['originals'])
         self.assertFalse(w.needs_refresh);self.assertFalse(w.refresh_btn.property('attention'))
     def test_the_header_has_no_next_step_button_or_apply_menu(self):
         w=self.window;self.assertFalse(hasattr(w,'next_btn'));self.assertFalse(hasattr(w,'apply_scheme_action'))

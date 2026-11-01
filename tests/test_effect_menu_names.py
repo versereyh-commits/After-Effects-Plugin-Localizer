@@ -28,6 +28,16 @@ class MenuNames(unittest.TestCase):
         for key,value in (('_process_lock',lambda:nullcontext()),('current_process',lambda **kw:self.p),('Registry',fixtures.Registry),('Menus',FakeMenus),('main_window',lambda pid:1)):
             p=patch.object(M,key,value);p.start();self.addCleanup(p.stop)
     def sync(self):return self.session.sync(123,456,'AfterFX.exe')
+    def test_resource_originals_sync_already_translated_catalog_without_name_journal(self):
+        self.nj={'pid':999,'creationTime':1,'entries':{'Key0':{'originalName':'Wrong host'}}}
+        result=self.session.sync(123,456,'AfterFX.exe',originals={'Key0':'Old0'})
+        self.assertEqual(result['updated'],1);self.assertEqual(FakeMenus.rows[0]['text'],'Effect0\tCtrl+X')
+        self.p.blocks[4096][16:64]=fixtures.E.encode_name('Old0')
+        self.sync();self.assertEqual(FakeMenus.rows[0]['text'],'Old0\tCtrl+X')
+    def test_resource_original_alias_conflict_still_refuses_write(self):
+        self.nj={'entries':{}}
+        result=self.session.sync(123,456,'AfterFX.exe',originals={'Key0':'Old0','Key1':'Old0'})
+        self.assertEqual(result['updated'],0);self.assertEqual(len(result['skipped']),2)
     def test_effect_sync_preserves_command_shortcut_and_restores(self):
         r=self.sync();self.assertEqual(r['updated'],1);self.assertEqual(FakeMenus.rows[0]['text'],'Effect0\tCtrl+X');self.assertEqual(FakeMenus.rows[0]['id'],101)
         self.nj['entries']={};self.p.blocks[4096][16:64]=fixtures.E.encode_name('Old0')

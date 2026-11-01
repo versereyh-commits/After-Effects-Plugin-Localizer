@@ -1,21 +1,21 @@
 """Verified category labels. Uses only the first 48 bytes of a verified 64-byte field.
 
 Independent journal, exact original bytes, no value/identifier/plugin-file changes.
-New writes are enabled only for the build with owned-QA evidence.
+Writes require an enabled exact-build adapter and matching module hash.
 """
 from pathlib import Path
 import json
-from ae_profiles import fc_fields,fc_size,PROFILES
+from ae_profiles import fc_fields,fc_size,PROFILES,get_profile,is_supported
 from live_names import Registry,current_process,_lock,_process_lock,_save,encode_name
 from runtime import data_root
 from ae_ui import main_window
 from host_identity import running_pids
 
-SUPPORTED={'26.5.0.89'}
-
 def supported_build(version,flt_sha)->bool:
-    verified=PROFILES.get(version)
-    return version in SUPPORTED and verified is not None and flt_sha==verified.flt_sha
+    if not flt_sha or not is_supported(version,flt_sha):return False
+    verified=get_profile(version,flt_sha)
+    start,end=fc_fields(verified)[2]
+    return verified.flt_sha==flt_sha and end-start==64
 
 def supported(profile):return supported_build(profile.version,profile.flt_sha)
 
