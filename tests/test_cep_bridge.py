@@ -40,6 +40,21 @@ class StatusTests(BridgeCase):
         cep_bridge.install();self.assertEqual(cep_bridge.status(),'installed')   # reinstalling replaces the old copy
         self.assertEqual([p.name for p in cep_bridge.installed().parent.iterdir()],[EXT])
         cep_bridge.remove();self.assertEqual(cep_bridge.status(),'missing');cep_bridge.remove()
+    def test_reinstall_moves_a_module_ae_still_holds_aside(self):
+        cep_bridge.install();held=cep_bridge.installed()/'ae_host_identity_v1.dll';held.write_bytes(b'loaded')
+        real_unlink=Path.unlink;real_rmtree=cep_bridge.shutil.rmtree
+        def unlink(path,*args,**kwargs):
+            if path.name==held.name and path.parent.name==EXT:raise PermissionError(5,'拒绝访问。')
+            return real_unlink(path,*args,**kwargs)
+        def rmtree(path,*args,**kwargs):
+            if Path(path)==cep_bridge.installed() and (Path(path)/held.name).exists():raise PermissionError(5,'拒绝访问。')
+            return real_rmtree(path,*args,**kwargs)
+        (cep_bridge.installed()/'main.js').write_text('changed',encoding='utf-8')
+        with patch.object(Path,'unlink',unlink),patch.object(cep_bridge.shutil,'rmtree',rmtree):cep_bridge.install()
+        self.assertEqual(cep_bridge.status(),'installed');self.assertFalse((cep_bridge.installed()/held.name).exists())
+        aside=list(cep_bridge._aside().rglob(held.name));self.assertEqual(len(aside),1);self.assertEqual(aside[0].read_bytes(),b'loaded')
+        self.assertEqual([p.name for p in cep_bridge.installed().parent.iterdir()],[EXT])   # nothing extra in Adobe's list
+        cep_bridge.install();self.assertEqual(list(cep_bridge._aside().iterdir()),[])        # emptied once released
     def test_debug_mode_is_switched_on_and_only_our_changes_are_put_back(self):
         # Before: CSXS.10 has it off, CSXS.11 already on (another plugin), CSXS.8, 9 and 12 never set, CSXS.13 off.
         self.registry.update({10:'0',11:'1',13:'0'})
@@ -90,7 +105,7 @@ class ExtensionSourceTests(unittest.TestCase):
         source=(Path(cep_bridge.__file__).parent/'cep'/'main.js').read_text(encoding='utf-8')
         accepted=set(re.findall(r"'(\w+)'",re.search(r'ACTIONS = \[(.*?)\]',source).group(1)))
         sent=set()
-        for module in ('parameter_names.py','effect_instances.py','live_names.py'):
+        for module in ('parameter_names.py','effect_instances.py','live_names.py','popup_names.py'):
             sent|=set(re.findall(r"action='(\w+)'",(Path(cep_bridge.__file__).parent/module).read_text(encoding='utf-8')))
         self.assertTrue(sent);self.assertLessEqual(sent,accepted)
         self.assertIn('@@BRIDGE_ID@@',source);self.assertNotIn('evalFile',source)    # only its own template, never a file it is handed

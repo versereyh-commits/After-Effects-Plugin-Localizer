@@ -8,7 +8,7 @@
 (function () {
     'use strict';
     var BRIDGE_ID = '@@BRIDGE_ID@@';
-    var ACTIONS = ['catalog', 'selection', 'labels', 'codec', 'instanceCatalog', 'instanceNames', 'addEffect'];
+    var ACTIONS = ['catalog', 'selection', 'labels', 'codec', 'instanceCatalog', 'instanceNames', 'addEffect', 'popups'];
     var host = window.__adobe_cep__, fs = window.cep && window.cep.fs;
     if (!host || !fs) return;
 

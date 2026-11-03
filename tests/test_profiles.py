@@ -88,9 +88,16 @@ class ProfileTests(unittest.TestCase):
     def test_native_layout_names_the_container_kind(self):
         profiles=ae_profiles.PROFILES
         self.assertEqual(parameter_names.native_layout(profiles['26.0.0.67']).split(',')[2:4],['228','0'])
-        self.assertEqual(parameter_names.native_layout(profiles['18.2.1.8']).split(',')[3],'1')
+        self.assertEqual(parameter_names.native_layout(profiles['18.2.1.8']).split(',')[1:4],['190','198','1'])
         tree=replace(profiles['26.0.0.67'],named_map=0x220,named_tree=True)
         self.assertEqual(parameter_names.native_layout(tree).split(',')[1:4],['220','220','2'])
+    def test_vector_layout_uses_the_verified_count_offset_without_mutating_profile(self):
+        p=ae_profiles.PROFILES['18.2.1.8']
+        self.assertEqual(p.named_map,0x228) # unused historical default, not a vector field
+        layout=[int(x,16) for x in parameter_names.native_layout(p).split(',')]
+        self.assertEqual(layout[2],struct.unpack_from('<I',p.count_bytes,3)[0])
+        self.assertEqual(layout[2],layout[1]+8)
+        self.assertEqual(p.named_map,0x228)
     def test_native_and_python_adapters_pin_identical_hash_pairs(self):
         source=(Path(__file__).parents[1]/'native'/'ae_parameters.c').read_text(encoding='utf8')
         for p in ae_profiles.PROFILES.values():

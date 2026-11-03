@@ -3,7 +3,7 @@
 Most services speak the OpenAI chat-completions protocol; Claude uses Anthropic's
 Messages API. Every reply is validated the same way before any name is kept."""
 from __future__ import annotations
-import errno,json,socket,time
+import errno,json,socket,threading,time
 from concurrent.futures import FIRST_COMPLETED,ThreadPoolExecutor,wait as wait_any
 from dataclasses import dataclass,field
 from http.client import IncompleteRead
@@ -137,24 +137,24 @@ def parse_json(text:str):
     return json.loads(text[start:end+1])
 
 class _BatchFailed(Exception):
-    """One batch could not be translated; `throttled` tells whether the service asked us to slow down (HTTP 429)."""
-    def __init__(self,message,throttled=False):super().__init__(message);self.throttled=throttled
+    """One batch could not be translated."""
 
 BATCH_SIZE=10
 PARALLEL_BATCHES=3
 
-def translate_names(items:list[dict],key:str,base_url='https://api.deepseek.com',model='deepseek-flash',progress=None,cancelled=None,*,service:str=DEFAULT_PROVIDER,wait=time.sleep,usage=None,workers=PARALLEL_BATCHES,system_prompt=None,_text_validator=None)->dict[str,str]:
+def translate_names(items:list[dict],key:str,base_url='https://api.deepseek.com',model='deepseek-flash',progress=None,cancelled=None,*,service:str=DEFAULT_PROVIDER,wait=time.sleep,usage=None,workers=PARALLEL_BATCHES,system_prompt=None,_text_validator=None,slowdown=None)->dict[str,str]:
     """Translates in batches of 10, up to `workers` batches at a time; once the service answers 429 the rest go one at a time.
 
     Progress is reported after each validated batch; cancellation is checked before each batch is sent. On a failure no
     new batch starts, batches already in flight finish and keep their results, and TranslationError carries everything
     finished so far. wait injects the retry delay; usage receives each reply's token count (rejected replies included).
-    system_prompt replaces the effect-name prompt (parameter labels use PARAMETER_PROMPT)."""
+    system_prompt replaces the effect-name prompt (parameter labels use PARAMETER_PROMPT). slowdown is an Event shared
+    with translations running alongside, so a 429 on any of them slows them all."""
     chosen=provider(service);name=chosen.name;key=key.strip()
     if chosen.needs_key and not key:raise ValueError(f'请先在翻译模型设置中填写 {name} 的 API Key')
     if not model.strip():raise ValueError('请先在翻译模型设置中填写模型名称')
     check_endpoint(base_url)
-    result={};total=len(items);model=model.strip()
+    result={};total=len(items);model=model.strip();slowdown=slowdown or threading.Event()
     if len({item['id'] for item in items})!=total:raise TranslationError('待翻译的效果标识重复',result,total)
 
     def run(batch):
@@ -162,34 +162,35 @@ def translate_names(items:list[dict],key:str,base_url='https://api.deepseek.com'
         # is "CS Composite"), and one changed id used to throw away the whole batch.
         numbers={str(n):item['id'] for n,item in enumerate(batch,1)};expected=set(numbers.values())
         sent=[{**item,'id':n} for n,item in zip(numbers,batch)]
-        request=build_request(chosen,base_url,key,model,sent,system_prompt=system_prompt);throttled=False
+        request=build_request(chosen,base_url,key,model,sent,system_prompt=system_prompt)
         for attempt in range(3):
             try:
                 response=urlopen(request,timeout=60)
                 break
             except HTTPError as error:
-                code=error.code;error.close();throttled=throttled or code==429
+                code=error.code;error.close()
+                if code==429:slowdown.set()
                 if attempt==2 or not (code==429 or 500<=code<600):
-                    raise _BatchFailed(f'{name} 请求失败（HTTP {code}），请检查密钥、余额和模型配置',throttled) from None
+                    raise _BatchFailed(f'{name} 请求失败（HTTP {code}），请检查密钥、余额和模型配置') from None
             except (URLError,TimeoutError,ConnectionError) as error:
                 reason=error.reason if isinstance(error,URLError) else error
                 retryable=isinstance(reason,(TimeoutError,ConnectionError,socket.gaierror)) or (isinstance(reason,OSError) and reason.errno in (errno.ETIMEDOUT,errno.ENETUNREACH,errno.EHOSTUNREACH))
                 if attempt==2 or not retryable:
-                    raise _BatchFailed(f'{name} 连接失败或超时，请检查网络与接口地址',throttled) from None
-            except IncompleteRead:raise _BatchFailed(f'{name} 响应被截断',throttled) from None
-            except ValueError:raise _BatchFailed(f'{name} 接口地址或请求格式错误',throttled) from None
+                    raise _BatchFailed(f'{name} 连接失败或超时，请检查网络与接口地址') from None
+            except IncompleteRead:raise _BatchFailed(f'{name} 响应被截断') from None
+            except ValueError:raise _BatchFailed(f'{name} 接口地址或请求格式错误') from None
             wait(2**attempt)
         try:
             with response:payload=json.loads(response.read().decode('utf8'))
-        except (IncompleteRead,OSError,URLError):raise _BatchFailed(f'{name} 响应读取失败或被截断',throttled) from None
-        except (ValueError,UnicodeDecodeError):raise _BatchFailed(f'{name} 返回了无法解析的响应',throttled) from None
+        except (IncompleteRead,OSError,URLError):raise _BatchFailed(f'{name} 响应读取失败或被截断') from None
+        except (ValueError,UnicodeDecodeError):raise _BatchFailed(f'{name} 返回了无法解析的响应') from None
         if usage is not None:
             # Counting must never cost the user a finished batch.
             try:usage(reply_tokens(payload))
             except Exception:pass
         try:
             content,cut=reply_text(chosen,payload)
-            if cut:raise _BatchFailed(f'{name} 译文被截断',throttled)
+            if cut:raise _BatchFailed(f'{name} 译文被截断')
             if not content:raise ValueError('返回空译文')
             rows=parse_json(content)['translations'];translated={}
             if not isinstance(rows,list):raise ValueError('译文格式错误')
@@ -208,23 +209,22 @@ def translate_names(items:list[dict],key:str,base_url='https://api.deepseek.com'
         except (KeyError,IndexError,TypeError,ValueError,AttributeError) as error:
             # Our own validation messages carry no secrets and tell the user what to fix.
             detail=str(error) if isinstance(error,ValueError) and not isinstance(error,json.JSONDecodeError) else '译文格式错误'
-            raise _BatchFailed(f'{name} 译文校验失败：'+detail,throttled) from None
-        return translated,throttled
+            raise _BatchFailed(f'{name} 译文校验失败：'+detail) from None
+        return translated
 
-    pending=[items[i:i+BATCH_SIZE] for i in range(0,total,BATCH_SIZE)];running=set();failure=None;throttled=False;limit=max(1,int(workers))
+    pending=[items[i:i+BATCH_SIZE] for i in range(0,total,BATCH_SIZE)];running=set();failure=None;limit=max(1,int(workers))
     with ThreadPoolExecutor(max_workers=limit) as pool:
         while pending or running:
-            while pending and failure is None and len(running)<(1 if throttled else limit):
+            while pending and failure is None and len(running)<(1 if slowdown.is_set() else limit):
                 if cancelled is not None and cancelled():failure=f'{name} 翻译已取消';break
                 running.add(pool.submit(run,pending.pop(0)))
             if failure is not None:pending.clear()
             if not running:break
             done,running=wait_any(running,return_when=FIRST_COMPLETED)
             for future in done:
-                try:translated,hit=future.result()
-                except _BatchFailed as error:
-                    throttled=throttled or error.throttled;failure=failure or str(error);continue
-                throttled=throttled or hit;result.update(translated)
+                try:translated=future.result()
+                except _BatchFailed as error:failure=failure or str(error);continue
+                result.update(translated)
                 if progress is not None:progress(len(result),total)
     if failure is not None:raise TranslationError(failure,result,total)
     return result

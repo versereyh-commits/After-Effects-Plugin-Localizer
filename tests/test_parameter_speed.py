@@ -99,8 +99,10 @@ class SpeedTests(unittest.TestCase):
             n.read_parameters();self.assertEqual(c.rows.call_count,2);self.assertEqual(c.rows.call_args.args[0],True)
     def test_timing_log_excludes_content_and_pointers(self):
         with tempfile.TemporaryDirectory() as tmp,patch.object(n,'data_root',return_value=Path(tmp)):
+            n.record_read_timing({'event':'apply','labels':3,'popups':1,'popupMs':1.5,'labelMs':2.5,'readMs':3.5,'nativeMs':4.5,'name':'secret'})
+            self.assertEqual(json.loads((Path(tmp)/'parameter-read-timing.jsonl').read_text(encoding='utf8').splitlines()[-1]),{'event':'apply','labels':3,'popups':1,'popupMs':1.5,'labelMs':2.5,'readMs':3.5,'nativeMs':4.5})
             n.record_read_timing({'event':'read','totalMs':1,'project':'secret','address':123,'name':'secret'})
-            row=json.loads((Path(tmp)/'parameter-read-timing.jsonl').read_text());self.assertEqual(row,{'event':'read','totalMs':1})
+            row=json.loads((Path(tmp)/'parameter-read-timing.jsonl').read_text().splitlines()[-1]);self.assertEqual(row,{'event':'read','totalMs':1})
 
 class AsciiTests(unittest.TestCase):
     def test_normal_string_uses_one_block(self):

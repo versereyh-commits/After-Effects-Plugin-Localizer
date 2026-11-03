@@ -108,17 +108,17 @@ class ApplicationIntegrationTests(unittest.TestCase):
         result=app_live.Window.restore_effect_names(window)
         self.assertEqual(result['restored'],{});self.assertEqual(result['instanceResult']['restored'],1);self.assertIn('效果目录恢复失败',result['restoreErrors'][0])
     def test_parameter_failure_does_not_prevent_catalog_or_instance_restore(self):
-        window=SimpleNamespace(restore_effect_names=Mock(return_value={'restored':{'CC Drizzle':'CC Drizzle'},'instanceResult':{'restored':1,'pending':0}}),parameter_session=Mock(),category_session=Mock(),close_after=False)
+        window=SimpleNamespace(restore_effect_names=Mock(return_value={'restored':{'CC Drizzle':'CC Drizzle'},'instanceResult':{'restored':1,'pending':0}}),parameter_session=Mock(),category_session=Mock(),popup_session=Mock(),close_after=False)
         window.parameter_session.restore.side_effect=RuntimeError('parameter guard')
         result=app_live.Window.restore_names(window,None)
         self.assertEqual(result['restored'],{'CC Drizzle':'CC Drizzle'});self.assertIn('参数标签恢复失败',result['restoreErrors'][0]);window.restore_effect_names.assert_called_once()
     def test_exit_stays_open_when_any_restore_stage_fails(self):
-        window=SimpleNamespace(restore_effect_names=Mock(return_value={'restored':{},'restoreErrors':['catalog guard']}),parameter_session=Mock(),category_session=Mock(),close_after=True)
+        window=SimpleNamespace(restore_effect_names=Mock(return_value={'restored':{},'restoreErrors':['catalog guard']}),parameter_session=Mock(),category_session=Mock(),popup_session=Mock(),close_after=True)
         window.parameter_session.restore.return_value={'restored':0,'pending':0}
         with self.assertRaisesRegex(RuntimeError,'部分原名未恢复'):app_live.Window.restore_names(window,None)
     def test_all_stage_errors_are_reported(self):
-        window=SimpleNamespace(session=Mock(),instance_session=Mock(),parameter_session=Mock(),category_session=Mock(),close_after=False)
+        window=SimpleNamespace(session=Mock(),instance_session=Mock(),parameter_session=Mock(),category_session=Mock(),popup_session=Mock(),close_after=False)
         window.session.restore.side_effect=RuntimeError('catalog');window.instance_session.restore.side_effect=RuntimeError('instance');window.parameter_session.restore.side_effect=RuntimeError('parameter')
-        window.category_session.restore.side_effect=RuntimeError('category')
+        window.category_session.restore.side_effect=RuntimeError('category');window.popup_session.restore.side_effect=RuntimeError('popup')
         window.restore_effect_names=lambda:app_live.Window.restore_effect_names(window)
-        self.assertEqual(len(app_live.Window.restore_names(window,None)['restoreErrors']),4)
+        self.assertEqual(len(app_live.Window.restore_names(window,None)['restoreErrors']),5)

@@ -258,14 +258,14 @@ class ParameterAutoTests(GuiCase):
         with patch.object(window.parameter_session,'apply',apply),patch('threading.Thread',lambda target,**kw:threads.append(target) or type('T',(),{'start':lambda self:None,'join':lambda self,**kw:None})()):
             window.quick_parameters(self.entry());threads.pop()()
         return window
-    def test_a_miss_retries_with_a_heap_scan_and_schedules_the_full_pass(self):
+    def test_a_miss_retries_with_a_heap_scan(self):
         calls=[]
         def apply(names,fast=False,rescan=False,progress=None,skip_missing=False):
             calls.append((fast,rescan))
             if fast and not rescan:raise parameter_names.FastMiss('miss')
             return {'changed':1,'parameters':1,'scanned':True,'scanTarget':'heap'}
         window=self.run_quick(apply)
-        self.assertEqual(calls,[(True,False),(True,True)]);self.assertIn('默认堆扫描',window.log.toPlainText());self.assertTrue(window.quick_full.isActive())
+        self.assertEqual(calls,[(True,False),(True,True)]);self.assertIn('默认堆扫描',window.log.toPlainText())
     def test_a_miss_that_already_scanned_goes_straight_to_the_full_scan(self):
         calls=[]
         def apply(names,fast=False,rescan=False,progress=None,skip_missing=False):
@@ -273,20 +273,15 @@ class ParameterAutoTests(GuiCase):
             if fast:raise parameter_names.FastMiss('miss',scanned=True)
             return {'changed':1,'parameters':1}
         window=self.run_quick(apply)
-        self.assertEqual(calls,[(True,False),(False,False)]);self.assertIn('完整扫描',window.log.toPlainText());self.assertFalse(window.quick_full.isActive())
+        self.assertEqual(calls,[(True,False),(False,False)]);self.assertIn('完整扫描',window.log.toPlainText())
     def test_first_write_scanning_the_heap_is_reported_as_such(self):
         window=self.run_quick(lambda names,**kw:{'changed':1,'parameters':1,'scanned':True,'scanTarget':'heap'})
-        self.assertIn('默认堆扫描',window.log.toPlainText());self.assertTrue(window.quick_full.isActive())
-    def test_cache_writes_schedule_one_full_pass_and_missing_translations_only_say_so(self):
+        self.assertIn('默认堆扫描',window.log.toPlainText())
+    def test_cache_writes_start_nothing_after_and_missing_translations_only_say_so(self):
         window=self.window;window.space.live=True
         window.quick_parameters(self.entry());self.assertIn('参数还没翻译',window.log.toPlainText())
-        key=parameter_names.identity('tc Shine','p1');window.parameter_pending[key]='强度';window.parameter_enabled.add(key)
-        window.quick_params_done(self.entry(),{'changed':1,'parameters':1},0.5,'cache')
-        self.assertTrue(window.quick_full.isActive());self.assertEqual(window.quick_full_keys,{key:'强度'})
-        calls=[];threads=[]
-        with patch.object(window.parameter_session,'apply',lambda names,**kw:calls.append(kw) or {'changed':1}),patch('threading.Thread',lambda target,**kw:threads.append(target) or type('T',(),{'start':lambda self:None,'join':lambda self,**kw:None})()):
-            window.quick_full_pass();threads.pop()()
-        self.assertEqual(calls,[{'rescan':True,'skip_missing':True}]);self.assertEqual(window.quick_full_keys,{})
+        with patch.object(window,'background') as background:window.quick_params_done(self.entry(),{'changed':1,'parameters':1},0.5,'cache')
+        background.assert_not_called()
 
 class LayerParameterTests(GuiCase):
     """Shift+Space over AE: every parameter of the selected layers' effects in Chinese."""
@@ -317,15 +312,15 @@ class LayerParameterTests(GuiCase):
         window=self.window;k1,k2,k3=parameter_names.identity('fxA','p1'),parameter_names.identity('fxB','p2'),parameter_names.identity('fxB','p3')
         window.parameter_pending[k1]='强度';window.parameter_enabled.add(k1)
         rows=[{'id':k,'name':n,'effectMatchName':parameter_names.split_identity(k)[0]} for k,n in ((k1,'Amount'),(k2,'Radius'),(k3,'Angle'))]
-        applied=self.run_layer({'parameters':rows},{'changed':3,'parameters':3,'heapOnly':True})
+        applied=self.run_layer({'parameters':rows},{'changed':3,'parameters':3})
         names,kw=applied[0];self.assertEqual(names,{k1:'强度',k2:'译Radius',k3:'译Angle'});self.assertEqual(kw,{'full':False,'skip_missing':True})
         self.assertEqual(window.parameter_pending[k2],'译Radius');self.assertIn(k3,window.parameter_enabled)
-        self.assertIn('选中图层的参数已改成中文',window.log.toPlainText());self.assertTrue(window.completion.isActive())
+        self.assertIn('选中图层的参数已改成中文',window.log.toPlainText())
     def test_without_a_translation_service_only_known_names_are_written(self):
         window=self.window;k1,k2=parameter_names.identity('fxA','p1'),parameter_names.identity('fxA','p2')
         window.parameter_pending[k1]='强度';window.parameter_enabled.add(k1)
         applied=self.run_layer({'parameters':[{'id':k1,'name':'Amount','effectMatchName':'fxA'},{'id':k2,'name':'Size','effectMatchName':'fxA'}]},ready=False)
-        self.assertEqual(applied[0][0],{k1:'强度'});self.assertIn('翻译服务未设置',window.log.toPlainText());self.assertFalse(window.completion.isActive())
+        self.assertEqual(applied[0][0],{k1:'强度'});self.assertIn('翻译服务未设置',window.log.toPlainText())
     def test_no_selection_says_what_to_do_and_writes_nothing(self):
         applied=self.run_layer({'parameters':[],'emptyReason':'noSelectedLayers'})
         self.assertEqual(applied,[]);self.assertIn('请先在 AE 的合成里选中图层',self.window.log.toPlainText())
@@ -423,9 +418,8 @@ class AutoTranslateTests(GuiCase):
         window=self.window;window.space.live=True;k=parameter_names.identity('tc Shine','p1')
         window.parameter_pending[k]='强度';window.parameter_enabled.add(k)
         self.assertTrue(window.quick_params_box.isChecked());self.assertTrue(window.quick_translate_box.isEnabled())   # on by default
-        window.quick_full_keys={k:'强度'};window.quick_full.start()
         window.quick_params_box.setChecked(False)
-        self.assertFalse(window.quick_parameters_on());self.assertFalse(window.quick_translate_box.isEnabled());self.assertFalse(window.quick_full.isActive())
+        self.assertFalse(window.quick_parameters_on());self.assertFalse(window.quick_translate_box.isEnabled())
         read=[]
         self.assertEqual(self.run_quick(window,read=lambda **kw:read.append(1) or {'parameters':[]}),[]);self.assertEqual(read,[])
         self.assertNotIn('参数还没翻译',window.log.toPlainText())

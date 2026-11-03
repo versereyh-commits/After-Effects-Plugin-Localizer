@@ -63,6 +63,11 @@ class GroupChecks(CategoryGui):
         w.uncheck_all_action.trigger();self.assertEqual((w.enabled,w.ticked),(set(),set()))
 
 class CategoryWrites(CategoryGui):
+    def test_combined_name_and_category_application_rereads_catalog_only_once(self):
+        w=self.window;plan=[('Lights','灯光','S_Glow')]
+        with patch.object(w,'apply_names',return_value=({'applied':{'S_Glow':'辉光'}},None,'')) as names,patch.object(w,'write_categories',return_value={'categories':{'Lights':1}}),patch.object(app_live,'with_live',return_value=(None,{},'')) as reread:
+            w.apply_with_categories({'S_Glow':'辉光'},plan)
+        names.assert_called_once_with({'S_Glow':'辉光'},reread=False);reread.assert_called_once()
     def test_actions_need_the_tested_build_a_connection_and_idle(self):
         w=self.window;title='应用此分类名到 AE'
         self.table.item(self.header('Sapphire Lighting'),CANDIDATE).setText('蓝宝石灯光')
@@ -76,25 +81,21 @@ class CategoryWrites(CategoryGui):
         self.live();w=self.window;self.table.item(self.header('Sapphire Lighting'),CANDIDATE).setText('蓝宝石灯光');self.tick('Sapphire Lighting')
         group={'category':'Sapphire Lighting','keys':['S_Glow','S_Other'],'supported':True,'version':TESTED}
         with patch.object(w,'work',side_effect=self.immediate),patch.object(w,'apply_names',return_value=({'applied':{}},w.live,'')) as names,\
-             patch.object(w.category_session,'group',return_value=group),patch.object(w.category_session,'apply_group',return_value={'applied':{'S_Glow':'蓝宝石灯光','S_Other':'蓝宝石灯光'}}) as apply,\
+             patch.object(w.category_session,'apply_groups',return_value={'categories':{'Sapphire Lighting':2},'categoryErrors':[]}) as apply,\
              patch.object(app_live,'with_live',side_effect=lambda value,image:(value,w.live,'')),patch.object(app_live,'refresh_effects') as refresh:
             w.apply_target()
-        apply.assert_called_once_with('S_Glow','蓝宝石灯光','Sapphire Lighting',['S_Glow','S_Other']);refresh.assert_not_called()
+        apply.assert_called_once_with([('Sapphire Lighting','蓝宝石灯光','S_Glow')]);refresh.assert_not_called()
         self.assertEqual(names.call_args.args[0],{'S_Glow':'辉光'});self.assertTrue(w.needs_refresh)
         self.assertIn('分类名称：Sapphire Lighting→蓝宝石灯光',w.log.toPlainText())
     def test_a_failed_category_is_reported_and_does_not_stop_the_others(self):
         self.live();w=self.window
         for group,value in (('Sapphire Lighting','蓝宝石灯光'),('RG Blurs and Glows','RG 模糊与辉光')):self.table.item(self.header(group),CANDIDATE).setText(value)
-        def apply(key,value,category,keys):
-            if key=='S_Glow':raise RuntimeError('分类已被外部修改')
-            return {'applied':{key:value}}
-        with patch.object(w,'work',side_effect=self.immediate),patch.object(w.category_session,'group',side_effect=lambda key:{'category':{'S_Glow':'Sapphire Lighting','tc Shine':'RG Blurs and Glows'}[key],'keys':[key]}),\
-             patch.object(w.category_session,'apply_group',side_effect=apply),patch.object(app_live,'with_live',side_effect=lambda value,image:(value,w.live,'')):
+        with patch.object(w,'work',side_effect=self.immediate),patch.object(w.category_session,'apply_groups',return_value={'categories':{'RG Blurs and Glows':1},'categoryErrors':['Sapphire Lighting：分类已被外部修改']}),patch.object(app_live,'with_live',side_effect=lambda value,image:(value,w.live,'')):
             w.apply_categories(['Sapphire Lighting','RG Blurs and Glows'])
         log=w.log.toPlainText();self.assertIn('分类名称未应用：Sapphire Lighting：分类已被外部修改',log);self.assertIn('RG Blurs and Glows→RG 模糊与辉光',log)
     def test_an_unverified_build_keeps_category_names_as_candidates(self):
         self.live(writable=False);w=self.window;self.table.item(self.header('Keying'),CANDIDATE).setText('抠像');self.tick('Keying');w.pending['Atom Key']='原子'
-        with patch.object(w,'work',side_effect=self.immediate),patch.object(w,'apply_names',return_value=({'applied':{}},w.live,'')),patch.object(w.category_session,'apply_group') as apply:
+        with patch.object(w,'work',side_effect=self.immediate),patch.object(w,'apply_names',return_value=({'applied':{}},w.live,'')),patch.object(w.category_session,'apply_groups') as apply:
             w.apply_target()
         apply.assert_not_called();self.assertIn('分类名只保存为候选',w.log.toPlainText())
         self.assertEqual(self.table.item(self.header('Keying'),STATUS).text(),'仅翻译')
@@ -194,7 +195,7 @@ class CategoriesOnly(CategoryGui):
         w.check_keys({'S_Glow'},True);w.check_keys({'S_Glow'},False);self.assertEqual(w.checked_groups(),['Sapphire Lighting'])
         self.table.item(self.header('Sapphire Lighting'),CANDIDATE).setText('蓝宝石灯光')
         with patch.object(w,'apply_names') as names,patch.object(w,'work',side_effect=self.immediate),patch.object(w.category_session,'group',return_value={'category':'Sapphire Lighting','keys':['S_Glow']}),\
-             patch.object(w.category_session,'apply_group',return_value={'applied':{'S_Glow':'蓝宝石灯光'}}) as apply,patch.object(app_live,'with_live',side_effect=lambda value,image:(value,w.live,'')):
+             patch.object(w.category_session,'apply_groups',return_value={'categories':{'Sapphire Lighting':1},'categoryErrors':[]}) as apply,patch.object(app_live,'with_live',side_effect=lambda value,image:(value,w.live,'')):
             w.apply_target()
         names.assert_not_called();apply.assert_called_once()
     def test_sweeping_over_a_category_box_ticks_only_the_category(self):

@@ -1,5 +1,5 @@
 """Parameter labels are translated with their own prompt (31-byte limit, AE wording); effect names keep theirs."""
-import io,json,unittest
+import io,json,threading,unittest
 from unittest.mock import patch
 from test_gui import GuiCase
 import llm_client,parameter_dialog
@@ -36,3 +36,32 @@ class ParameterPageTests(GuiCase):
         self.assertIs(translate.call_args.kwargs['system_prompt'],llm_client.PARAMETER_PROMPT)
         self.assertEqual(translate.call_args.args[0],[{'id':key,'sourceName':'Drip Rate','category':'所属效果 CC Drizzle'}])
         self.assertEqual(w.parameter_pending[key],'滴落率')
+    def side_by_side(self,fake):
+        w=self.window;key=identity('CC Drizzle','CC Drizzle-0001');lines=[]
+        w.parameter_page.loaded({'parameters':[{'id':key,'name':'Drip Rate','effectMatchName':'CC Drizzle','matchName':'CC Drizzle-0001'}]})
+        w.parameter_enabled.add(key)
+        option={'id':'choice-1','source':'Linear','effectMatchName':'CC Drizzle','popup':{'name':'Mode','capacity':40}}
+        with patch.object(w.settings,'ready',return_value=True),patch.object(parameter_dialog,'translate_names',fake),\
+             patch.object(w.parameter_page,'selected_options',return_value=[option]),\
+             patch.object(w,'work',lambda work,done:done(work(lines.append))):w.parameter_page.translate()
+        return key,lines
+    def test_labels_and_dropdowns_translate_at_the_same_time(self):
+        together=threading.Barrier(2,timeout=5);slowdowns=[]
+        def fake(items,*args,progress=None,slowdown=None,**options):
+            together.wait();slowdowns.append(slowdown);progress(1,1)
+            return {item['id']:'中' for item in items}
+        key,lines=self.side_by_side(fake)
+        self.assertIs(slowdowns[0],slowdowns[1]);self.assertEqual(self.window.parameter_pending[key],'中')
+        self.assertEqual(self.window.parameter_page.popup_stores()[0].values['choice-1'],'中')
+        self.assertEqual(sorted(lines[-1].split('，')),['下拉选项翻译 1/1','参数翻译 1/1'])
+    def test_a_failed_side_keeps_the_other_sides_results(self):
+        def fake(items,*args,**options):
+            if items[0]['id']=='choice-1':return {'choice-1':'线性'}
+            raise llm_client.TranslationError('服务失败',{},1)
+        self.side_by_side(fake)
+        self.assertEqual(self.window.parameter_page.popup_stores()[0].values['choice-1'],'线性')
+        self.assertIn('服务失败',self.window.parameter_page.status.text())
+    def test_the_same_failure_on_both_sides_shows_once(self):
+        def fake(items,*args,**options):raise llm_client.TranslationError('服务失败',{},1)
+        self.side_by_side(fake)
+        self.assertEqual(self.window.parameter_page.status.text().count('服务失败'),1)

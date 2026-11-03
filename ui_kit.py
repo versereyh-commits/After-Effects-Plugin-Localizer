@@ -129,6 +129,7 @@ def _draw(name,painter,color):
         painter.setPen(Qt.PenStyle.NoPen);painter.setBrush(QColor(color))
         for x in (9,15):
             for y in (6,12,18):painter.drawEllipse(QPointF(x,y),1.5,1.5)
+    elif name=='option':painter.drawRoundedRect(QRectF(4,7,16,10),2.5,2.5);_poly(painter,(9,10.8),(12,13.6),(15,10.8))
     elif name=='quick':_poly(painter,(13.5,2.5),(5,13.5),(11.5,13.5),(10.5,21.5),(19,10.5),(12.5,10.5),closed=True)
     elif name=='trash':
         painter.drawLine(QPointF(4,6.5),QPointF(20,6.5));_poly(painter,(9.5,6.5),(9.5,4),(14.5,4),(14.5,6.5));_poly(painter,(6,6.5),(7,20),(17,20),(18,6.5))

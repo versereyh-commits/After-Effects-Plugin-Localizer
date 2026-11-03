@@ -28,10 +28,28 @@ class Memory:
 
 class Registry:
     def __init__(self,p):self.p=p;self.profile=SimpleNamespace(version='26.5.0.89',flt_sha=E.PROFILES['26.5.0.89'].flt_sha,encoding='utf8',name_base=16,fc_vtable=1)
+    def check_session(self):pass
     def records(self):return [dict(address=base,matchName=bytes(raw[64:96]).split(b'\0')[0].decode(),displayName=bytes(raw[16:64]).split(b'\0')[0].decode(),category=bytes(raw[96:160]).split(b'\0')[0].decode()) for base,raw in self.p.blocks.items()]
     def target(self,key):return next(r for r in self.records() if r['matchName']==key)
 
 class Categories(unittest.TestCase):
+    def test_batch_opens_and_initializes_once_and_preserves_individual_restore(self):
+        with patch.object(E,'Registry',wraps=Registry) as registry,patch.object(self.session,'process',return_value=self.p) as opened:
+            result=self.session.apply_groups([('Lights','灯光','Key0'),('Color','颜色','Key2')])
+        self.assertEqual(result,{'categories':{'Lights':2,'Color':1},'categoryErrors':[]})
+        registry.assert_called_once();opened.assert_called_once_with(write=True)
+        self.assertEqual(len(self.session.restore()['restored']),3)
+    def test_batch_group_failure_rolls_back_only_that_group_and_continues(self):
+        self.p.fail_at=2
+        result=self.session.apply_groups([('Lights','灯光','Key0'),('Color','颜色','Key2')])
+        self.assertEqual(result['categories'],{'Color':1});self.assertEqual(len(result['categoryErrors']),1)
+        self.assertEqual(Registry(self.p).target('Key0')['category'],'Lights')
+        self.assertEqual(Registry(self.p).target('Key2')['category'],'颜色')
+    def test_batch_host_or_module_change_stops_before_next_group(self):
+        with patch.object(Registry,'check_session',side_effect=[None,RuntimeError('host changed')]),self.assertRaisesRegex(RuntimeError,'host changed'):
+            self.session.apply_groups([('Lights','灯光','Key0'),('Color','颜色','Key2')])
+        self.assertEqual(Registry(self.p).target('Key2')['category'],'Color')
+        self.assertEqual(len(self.session.journal()['entries']),2)
     def test_all_enabled_builtin_builds_and_matching_hashes_are_available(self):
         for version,profile in E.PROFILES.items():
             self.assertEqual(E.supported_build(version,profile.flt_sha),profile.enabled)

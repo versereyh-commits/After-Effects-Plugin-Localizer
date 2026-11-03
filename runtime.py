@@ -168,15 +168,17 @@ def legacy_text_problem(texts, encoding="mbcs") -> str | None:
     return None
 
 
-def native_probe() -> dict:
+def native_probe(detail: bool = False) -> dict:
+    """The running AE processes with path and version. detail adds their modules (about 200 ms; diagnostics only)."""
     dll = asset_root()/"native"/"ae_probe.dll"
     if not dll.exists():
         return {"error":"原生诊断模块不存在", "runtimeRenameEnabled":False}
     library = ctypes.CDLL(str(dll))
-    library.ae_probe_json.argtypes = [ctypes.c_char_p, ctypes.c_uint32]
-    library.ae_probe_json.restype = ctypes.c_int
+    probe = library.ae_probe_json if detail else library.ae_hosts_json
+    probe.argtypes = [ctypes.c_char_p, ctypes.c_uint32]
+    probe.restype = ctypes.c_int
     buffer = ctypes.create_string_buffer(1024*1024)
-    code = library.ae_probe_json(buffer, len(buffer))
+    code = probe(buffer, len(buffer))
     if code < 0:
         raise RuntimeError("原生模块的输出缓冲区不足")
     return json.loads(buffer.value.decode("utf-8"))

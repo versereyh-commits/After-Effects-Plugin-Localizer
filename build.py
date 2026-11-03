@@ -13,6 +13,7 @@ dist=root/(sys.argv[sys.argv.index("--dist-dir")+1] if "--dist-dir" in sys.argv 
 native_source=root/"native"/"ae_probe.c";native_dll=root/"native"/"ae_probe.dll"
 parameter_source=root/"native"/"ae_parameters.c";parameter_dll=root/"native"/"ae_parameters_v8.dll"
 dynamic_dll=root/"native"/"ae_parameters_v9.dll"
+popup_source=root/'native'/'ae_popup.c';popup_dll=root/'native'/'ae_popup_v2.dll'
 scan_source=root/"native"/"ae_scan.c";scan_dll=root/"native"/"ae_scan_v1.dll"
 import os,time
 # A helper an AE run from the source tree still has loaded cannot be overwritten, but Windows lets a loaded DLL be
@@ -43,6 +44,8 @@ def compile_dll(target,args):
     subprocess.run([sys.executable,"-m","ziglang","cc",*CPU,*args,"-o",str(fresh)],check=True,cwd=root)
     put(fresh,target)
 identity_source=root/'native'/'ae_host_identity.c';identity_dll=root/'native'/'ae_host_identity_v1.dll'
+if outdated(popup_dll,popup_source) or popup_dll.stat().st_mtime<parameter_source.stat().st_mtime:
+    compile_dll(popup_dll,['-shared','-O2','-std=c11','-DAE_DYNAMIC=1',str(popup_source),'-luser32'])
 if outdated(identity_dll,identity_source):
     compile_dll(identity_dll,['-shared','-O2','-std=c11',str(identity_source)])
 if outdated(scan_dll,scan_source):
@@ -97,7 +100,7 @@ if "--native-only" not in sys.argv:
     import os
     system=Path(os.environ.get("SystemRoot",r"C:\Windows"))
     clean_path=os.pathsep.join(str(p) for p in (Path(sys.base_prefix)/"DLLs",Path(sys.base_prefix),Path(sys.executable).parent,system/"System32",system,system/"System32"/"Wbem"))
-    subprocess.run([sys.executable,"-m","PyInstaller","--noconfirm","--clean","--windowed","--onedir","--distpath",str(dist),"--name","AE汉化工具","--add-data",str(root/"scripts")+";scripts",*(["--add-data",str(bridge)+";cep_signed"] if bridge else []),"--add-binary",str(identity_dll)+";native","--add-binary",str(native_dll)+";native","--add-binary",str(scan_dll)+";native","--add-binary",str(parameter_dll)+";native","--add-binary",str(dynamic_dll)+";native","--add-binary",str(legacy_parameter)+";native","--add-binary",str(legacy_dynamic)+";native","--hidden-import","comtypes.gen.UIAutomationClient","--exclude-module","PySide6.QtWebEngineCore","--exclude-module","PySide6.QtWebEngineWidgets","--exclude-module","PySide6.QtQml",str(root/"app_live.py")],check=True,cwd=root,env={**os.environ,"PATH":clean_path})
+    subprocess.run([sys.executable,"-m","PyInstaller","--noconfirm","--clean","--windowed","--onedir","--distpath",str(dist),"--name","AE汉化工具","--add-data",str(root/"scripts")+";scripts",*(["--add-data",str(bridge)+";cep_signed"] if bridge else []),"--add-binary",str(popup_dll)+";native","--add-binary",str(identity_dll)+";native","--add-binary",str(native_dll)+";native","--add-binary",str(scan_dll)+";native","--add-binary",str(parameter_dll)+";native","--add-binary",str(dynamic_dll)+";native","--add-binary",str(legacy_parameter)+";native","--add-binary",str(legacy_dynamic)+";native","--hidden-import","comtypes.gen.UIAutomationClient","--exclude-module","PySide6.QtWebEngineCore","--exclude-module","PySide6.QtWebEngineWidgets","--exclude-module","PySide6.QtQml",str(root/"app_live.py")],check=True,cwd=root,env={**os.environ,"PATH":clean_path})
     # Qt 6.12 on Windows 11 uses the OS ICU shim. PyInstaller picked Poppler's
     # same-named versioned ICU from the build host PATH; it has different exports.
     for name in ("icuuc.dll","icuin.dll","icudt.dll"):

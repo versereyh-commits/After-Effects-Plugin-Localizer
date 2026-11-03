@@ -68,7 +68,7 @@ def bounded_ascii(p,address,limit=256,block=32):
 def record_read_timing(metrics):
     """A bounded statistics-only log. No host/project identity, strings or pointers."""
     allowed={'event','readId','setupMs','hostMs','modulesMs','matchPoolMs','scanMs','treeMs','totalMs','tableMs','scanCount','mode','rows','instances','scanEngine','scanMeasuredMs','scanEnumMs','scanReadMs','scanSearchMs','scanValidateMs','scanBufferMs','scanRegions','scanEligibleRegions','scanReadCalls','scanReadBytes','scanReadFailures','scanHits','scanAlignedHits','scanParentChecks','scanRepeatedParents','scanValidationReads','scanBufferCapacityBytes','scanMergedRegions','scanJobs','scanWorkerCount','scanRetryRegions','scanCoalesced','scanTimingMode','scanResourceFallback'}
-    allowed.update(('readScope','scanTarget','scanEscalated','scanHeapMissed'))
+    allowed.update(('readScope','scanTarget','scanEscalated','scanHeapMissed','labels','popups','popupMs','labelMs','readMs','operations','structureMs','nativeMs','readbackMs'))
     safe={k:v for k,v in metrics.items() if k in allowed and isinstance(v,(str,int,float))}
     try:
         with _timing_lock:
@@ -143,7 +143,7 @@ class ParameterCatalog:
         upgrade=full and key in _cache and _scan_kind.get(key)=='heap'
         scan=rescan or key not in _cache or upgrade
         if scan:
-            reason=_reason or ('手动完整扫描' if rescan else '写入前完整扫描' if upgrade else _scan_reason.get(key,'首次扫描'));_scan_reason.pop(key,None)
+            reason=_reason or ('重新扫描' if rescan else '写入前完整扫描' if upgrade else _scan_reason.get(key,'首次扫描'));_scan_reason.pop(key,None)
             if progress:progress(reason+'，正在识别 AE 参数结构……')
             previous=_cache.get(key) if _scan_kind.get(key)=='heap' else None
             started=time.perf_counter();parades=self._scan_parades(full)
@@ -222,9 +222,11 @@ def public_rows(rows):
         unique[row['id']]['instances']+=1
     return sorted(unique.values(),key=lambda r:(r['effectMatchName'],r['matchName']))
 
-def read_parameters(rescan=False,progress=None,expected_image=None,scope='project'):
+def read_parameters(rescan=False,progress=None,expected_image=None,scope='project',extra=None):
+    """extra(p,catalog,actual,info) adds its dict to the report, sharing this read's process, structures and final
+    selection check."""
     if scope not in ('selected','project'):raise ValueError('未知参数读取范围')
-    started=time.perf_counter()
+    started=time.perf_counter();added={}
     with _lock,_process_lock(),(current_process(expected_image=expected_image) if expected_image else current_process()) as p:
         setup_ms=(time.perf_counter()-started)*1000;host_start=time.perf_counter();info={'readScope':scope}
         key=(p.pid,p.creation_time)
@@ -272,6 +274,7 @@ def read_parameters(rescan=False,progress=None,expected_image=None,scope='projec
             public=public_rows([r for r in rows if r['id'] in actual])
             for row in public:
                 row['name']=actual[row['id']][0];row['instances']=len(actual[row['id']]);row['mixedNames']=len(set(actual[row['id']]))>1
+            if extra:added=extra(p,catalog,actual,info)
         else:
             if scope=='project':_cache.pop(key,None)
             public=[]
@@ -287,7 +290,7 @@ def read_parameters(rescan=False,progress=None,expected_image=None,scope='projec
             if not public and not info.get('emptyReason'):info['emptyReason']='noSupportedParameters'
         metrics.update(totalMs=(time.perf_counter()-started)*1000,rows=len(public),instances=sum(r['instances'] for r in public))
         record_read_timing(metrics)
-        return {'pid':p.pid,'creationTime':p.creation_time,'parameters':public,'timings':metrics,**info}
+        return {'pid':p.pid,'creationTime':p.creation_time,'parameters':public,'timings':metrics,**info,**added}
 
 
 def bridge_root():
@@ -377,7 +380,11 @@ def native_layout(profile)->str:
     """What the dynamic helper's configure checks and then walks: root vtable, indexed vector, named container,
     its kind (0 list, 1 vector, 2 tree), and the three getters, in hex."""
     kind=2 if getattr(profile,'named_tree',False) else int(profile.named_vector)
-    return ','.join(format(v,'x') for v in (profile.root_vtable,profile.group_vector,profile.named_map,kind,profile.parent_get,profile.stream_match_get,profile.count_get))
+    # A vector's +8 end pointer is its count interface, not Profile.named_map (the
+    # default of the older map layouts). Built-in 2021 used the static label
+    # helper before popups began configuring the dynamic helper on every build.
+    named=profile.group_vector+8 if kind==1 else profile.named_map
+    return ','.join(format(v,'x') for v in (profile.root_vtable,profile.group_vector,named,kind,profile.parent_get,profile.stream_match_get,profile.count_get))
 
 def safe_unlink(path):
     try:path.unlink(missing_ok=True)
@@ -402,6 +409,12 @@ def cleanup_requests(parent):
             except (OSError,ValueError,TypeError):continue
     except OSError:pass
 
+CLEANUP_EVERY=300   # seconds; the files it removes are a day old, and looking through them costs about 40 ms
+_cleanup_due={}
+def cleanup_once(parent):
+    now=time.monotonic()
+    if now>=_cleanup_due.get(parent,0):_cleanup_due[parent]=now+CLEANUP_EVERY;cleanup_requests(parent)
+
 def run_native(p,operations,timeout=25,action='labels',project_token=None,scope=None):
     if scope is not None and (scope not in ('selected','project') or action not in ('catalog','selection')):raise ValueError('读取范围不能用于写入请求')
     # With the background extension loaded in AE (cep_bridge) the request goes through the folder it watches:
@@ -414,12 +427,20 @@ def run_native(p,operations,timeout=25,action='labels',project_token=None,scope=
     from host_identity import target,same
     expected=target(p)
     use_bridge=cep_bridge.connected(expected)
+    if action=='popups':
+        # An old signed extension must not claim the new operation.
+        base=cep_bridge.bundled()
+        try:capable=base is not None and "request.action==='popups'" in (base/cep_bridge.EXTENSION_ID/'parameter_bridge.jsx').read_text(encoding='utf8')
+        except OSError:capable=False
+        use_bridge=use_bridge and capable
     parent=cep_bridge.host_root(expected) if use_bridge else bridge_root()
-    try:
-        for old in (cep_bridge.root()/'hosts').iterdir():
-            if __import__('re').fullmatch(r'[1-9][0-9]*-[0-9a-f]{16}',old.name):cleanup_requests(old)
-    except OSError:pass
-    cleanup_requests(parent)
+    if time.monotonic()>=_cleanup_due.get('hosts',0):
+        _cleanup_due['hosts']=time.monotonic()+CLEANUP_EVERY
+        try:
+            for old in (cep_bridge.root()/'hosts').iterdir():
+                if __import__('re').fullmatch(r'[1-9][0-9]*-[0-9a-f]{16}',old.name):cleanup_once(old)
+        except OSError:pass
+    cleanup_once(parent)
     folder=parent/uuid.uuid4().hex
     try:folder.mkdir(parents=True)
     except OSError as e:
@@ -430,7 +451,7 @@ def run_native(p,operations,timeout=25,action='labels',project_token=None,scope=
     profile=None if action=='addEffect' else profile_for(p,file_version(Path(p.image)))   # the same choice Registry makes for this AE
     helper=None
     if profile is not None:
-        helper=asset_root()/'native'/('ae_parameters_v9.dll' if profile.native_dynamic else 'ae_parameters_v8.dll')
+        helper=asset_root()/'native'/('ae_popup_v2.dll' if action=='popups' else 'ae_parameters_v9.dll' if profile.native_dynamic else 'ae_parameters_v8.dll')
         if not helper.is_file():raise RuntimeError('参数辅助模块缺失，请保留完整 EXE 目录')
     identity_helper=asset_root()/'native'/'ae_host_identity_v1.dll'
     if not identity_helper.is_file():raise RuntimeError('宿主身份模块缺失，请更新完整软件及后台连接')
@@ -438,7 +459,12 @@ def run_native(p,operations,timeout=25,action='labels',project_token=None,scope=
     write_json_atomic(folder/'owner.json',{'expires':request['expires'],'targetHost':expected})
     if scope is not None:request['readScope']=scope
     if trial_projects():request['qaProjects']=list(trial_projects())
-    if profile is not None and profile.native_dynamic:
+    if profile is not None and (profile.native_dynamic or action=='popups'):
+        if action=='popups' and not profile.codec_sha:
+            from dataclasses import replace
+            modules={Path(m['path']).name.lower():m for m in p.modules()}
+            if 'u.dll' not in modules:raise RuntimeError('AE 编码模块缺失，未执行下拉写入')
+            profile=replace(profile,codec_sha=module_digest(p,modules['u.dll']['path']))
         request['adapter']={'flt':profile.flt_sha,'tdb':profile.tdb_sha,'codec':profile.codec_sha,'layout':native_layout(profile),'encoding':profile.encoding}
     launcher=keeper=None
     def relay():
@@ -459,7 +485,7 @@ def run_native(p,operations,timeout=25,action='labels',project_token=None,scope=
     claim_by=None
     if use_bridge:cep_bridge.submit(folder,request);claim_by=time.monotonic()+cep_bridge.CLAIM_WAIT
     else:relay()
-    until=time.monotonic()+timeout;finished=False;submitted=time.time()
+    until=time.monotonic()+timeout;finished=False;submitted=time.time();eager=time.monotonic()+2   # most answers come within this
     try:
         while time.monotonic()<until:
             if keeper:keeper.check()
@@ -479,7 +505,7 @@ def run_native(p,operations,timeout=25,action='labels',project_token=None,scope=
                 if claim_by is not None and time.monotonic()>claim_by:
                     claim_by=None
                     if cep_bridge.withdraw(folder):relay()
-            time.sleep(.1)
+            time.sleep(.02 if time.monotonic()<eager else .1)
         raise TimeoutError(_timeout_message(p,folder,request,timeout,use_bridge,launcher,submitted))
     finally:
         safe_unlink(permit)
@@ -611,10 +637,9 @@ class ParameterSession:
         by AE, so a count never proves everything was found). fast=True (an effect quick_search just added) first
         tries the cached structure: it writes only when memory holds at least as many instances as AE reports, then
         reads every visible instance back; any shortfall raises FastMiss before or after the write, and the caller
-        repeats with a full scan. A later full pass (rescan=True) covers copies made after the scan.
+        repeats with a full scan.
         full (default: not fast) needs a structure from all of AE's memory. full=False (the parameter page) may write
-        from a heap-only structure with every strict guard kept; the result then has heapOnly=True and the caller
-        follows up with complete()."""
+        from a heap-only structure with every strict guard kept; no full scan follows, a restore does its own."""
         names={k:validate_label(v) for k,v in names.items()}
         for key in names:split_identity(key)
         if not names:raise ValueError('请先选择参数并填写中文候选')
@@ -627,7 +652,6 @@ class ParameterSession:
             if any(len(name.encode(encoding))>31 for name in names.values()):raise ValueError('译名超过当前 AE 名称缓冲区容量')
             full=not fast if full is None else full
             actual=_host_names(p,strict=False) if fast else _host_names(p);rows=[r for r in catalog.rows(rescan=rescan,progress=progress,full=full) if r['id'] in actual];journal=self.journal()
-            heap_only={'heapOnly':True} if _scan_kind.get((p.pid,p.creation_time))=='heap' else {}
             scanned=lambda:bool(getattr(catalog,'timings',{}).get('scanCount'))
             if fast and any(sum(1 for r in rows if r['id']==key)<len(actual.get(key,())) for key in names):raise FastMiss('缓存结构里没有找到全部实例',scanned())
             if (journal.get('pid'),journal.get('creationTime'))!=(p.pid,p.creation_time):journal={'schemaVersion':1,'entries':{}}
@@ -638,16 +662,21 @@ class ParameterSession:
                 names={k:v for k,v in names.items() if k in existing};missing=set()
                 if not names:return {'changed':0,'parameters':0}
             if missing:raise ValueError('部分参数已不在当前 AE 中，请重新读取后再应用')
-            originals={}
+            originals={};mixed=[]
             for key in names:
                 entry=journal['entries'].get(key)
                 if entry:
                     if any(value not in (entry['original'],entry['applied'],entry.get('previous')) for value in actual[key]):raise RuntimeError('参数名称已被外部修改，未覆盖')
                     originals[key]=entry['original']
                 else:
-                    if len(set(actual[key]))!=1:raise RuntimeError('同一参数的实例名称不同，暂不支持统一改名后精确恢复')
+                    # Some plugins relabel a parameter themselves, leaving copies with different names: no single
+                    # original to restore, so that parameter is left alone and the rest of the batch goes on.
+                    if len(set(actual[key]))!=1 or len({r.get('pfName',r['name']) for r in rows if r['id']==key})>1:mixed.append(key);continue
                     originals[key]=validate_label(actual[key][0])
                     if originals[key]!=actual[key][0]:raise ValueError('原始参数名称含首尾空白，暂不支持安全恢复')
+            if mixed:
+                names={k:v for k,v in names.items() if k not in mixed}
+                if not names:return {'changed':0,'parameters':0,'mixed':mixed}
             unchanged={key for key in names if key not in journal['entries'] and all(value==names[key] for value in actual[key]) and all(row['name']==names[key] for row in rows if row['id']==key)}
             operations=[];pf_originals={}
             for row in rows:
@@ -676,7 +705,8 @@ class ParameterSession:
                 elif entry['applied']!=names[key]:entry['previous']=entry['applied'];entry['applied']=names[key]
             # Durable logical identities before any host writes. No process addresses stored here.
             _save(self.path,journal)
-            if not operations:return {'changed':0,'parameters':len(names),'unchanged':len(unchanged),**heap_only}
+            skipped={'mixed':mixed} if mixed else {}
+            if not operations:return {'changed':0,'parameters':len(names),'unchanged':len(unchanged),**skipped}
             result=run_native(p,operations)
             if result.get('error'):raise RuntimeError('参数应用未完成，恢复记录已保留：'+result['error'])
             after=_host_names(p,strict=False) if fast else _host_names(p)
@@ -686,24 +716,12 @@ class ParameterSession:
             # Every instance AE shows was read back renamed: the cached structure is trusted for this shape.
             if fast:_shape_context[(p.pid,p.creation_time)]=_name_signature(after)
             for entry in journal['entries'].values():entry.pop('previous',None)
-            _save(self.path,journal);result={'changed':result.get('changed',0),'parameters':len(names),**heap_only}
+            _save(self.path,journal);result={'changed':result.get('changed',0),'parameters':len(names)}
             if fast:   # quick_search: say which way it went
                 result['scanned']=scanned()
                 if result['scanned']:result['scanTarget']=getattr(catalog,'timings',{}).get('scanTarget','full')
             if unchanged:result['unchanged']=len(unchanged)
-            return result
-    def complete(self,names):
-        """Follow-up to apply(full=False): scans all of AE's memory and writes again only when that finds structures
-        the heap-only scan had not (statistics only go to the read log). Nothing to do once the structure is full."""
-        started=time.perf_counter()
-        with _lock,_process_lock(),self.process() as p:
-            key=(p.pid,p.creation_time)
-            if key not in _cache or _scan_kind.get(key)!='heap':return {'missed':0,'checked':False}
-            catalog=ParameterCatalog(p);catalog.roots(full=True);missed=catalog.timings.get('scanHeapMissed',0)
-        record_read_timing({'event':'complete','scanTarget':'full','scanMs':catalog.timings.get('scanMs',0),'scanHeapMissed':missed,'totalMs':(time.perf_counter()-started)*1000})
-        if not missed:return {'missed':0,'checked':True}
-        # The structure is full now: this write covers what the heap scan left out (and re-notifies the rest).
-        return {**self.apply(names,skip_missing=True),'missed':missed,'checked':True}
+            return {**result,**skipped}
     def restore(self,keys=None,progress=None):
         with _lock,_process_lock():
             journal=self.journal();wanted=set(journal['entries']) if keys is None else set(keys)&set(journal['entries'])

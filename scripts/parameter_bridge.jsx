@@ -128,7 +128,9 @@
           for(var i=0;i<request.operations.length;i++){
             if(!permitted())throw new Error('请求已取消');
             var op=request.operations[i];
-            if(typeof op.afterPf==='string'&&typeof op.beforeDisplay==='string')lib.setLabel(op.address,op.guid,op.parent,op.before,op.after,op.afterPf,op.beforeDisplay);
+            if(request.action==='popups'){
+                if(lib.setPopup(op.address,op.guid,op.parent,op.pointer,op.before,op.after,op.pfName,op.flags,op.default)!==1)throw new Error('下拉选项写入未确认');
+            }else if(typeof op.afterPf==='string'&&typeof op.beforeDisplay==='string')lib.setLabel(op.address,op.guid,op.parent,op.before,op.after,op.afterPf,op.beforeDisplay);
             else lib.setLabel(op.address,op.guid,op.parent,op.before,op.after);
             done.push(op);result.changed++;
           }
@@ -136,7 +138,7 @@
     }catch(e){
         result.error=String(e);result.rollbackFailed=0;
         for(var ij=instanceDone.length-1;ij>=0;ij--){var prior=instanceDone[ij];try{var current=String(prior.target.name);if(current!==prior.after&&current!==prior.before)throw new Error('实例回滚守卫不符');prior.target.name=prior.before;if(String(prior.target.name)!==prior.before)throw new Error('实例回滚回读不符');}catch(instanceRollback){result.rollbackFailed++;}}
-        for(var j=done.length-1;j>=0;j--){var prev=done[j];try{if(typeof prev.afterPf==='string'&&typeof prev.beforeDisplay==='string')lib.setLabel(prev.address,prev.guid,prev.parent,prev.afterPf,prev.beforeDisplay,prev.before,prev.after);else lib.setLabel(prev.address,prev.guid,prev.parent,prev.after,prev.before);}catch(rollback){result.rollbackFailed++;}}
+        for(var j=done.length-1;j>=0;j--){var prev=done[j];try{if(request.action==='popups'){if(lib.setPopup(prev.address,prev.guid,prev.parent,prev.pointer,prev.after,prev.before,prev.pfName,prev.flags,prev.default)!==1)throw new Error('下拉选项回滚未确认');}else if(typeof prev.afterPf==='string'&&typeof prev.beforeDisplay==='string')lib.setLabel(prev.address,prev.guid,prev.parent,prev.afterPf,prev.beforeDisplay,prev.before,prev.after);else lib.setLabel(prev.address,prev.guid,prev.parent,prev.after,prev.before);}catch(rollback){result.rollbackFailed++;}}
     }
     stage('result');
     var file=new File(request.output);file.encoding='UTF-8';

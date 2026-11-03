@@ -66,25 +66,9 @@ class ParameterTests(unittest.TestCase):
         with self.fast_host(extra=['滴落率']):
             with self.assertRaises(names.FastMiss) as miss:self.session.apply({self.key:'强度'},fast=True,rescan=True)
         self.assertTrue(miss.exception.scanned)
-    def heap_kind(self,kind):
-        handle=patch.dict(names._scan_kind,{(3,4):kind});handle.start();self.addCleanup(handle.stop)
-        handle=patch.dict(names._cache,{(3,4):{1}});handle.start();self.addCleanup(handle.stop)
-    def test_page_write_from_the_heap_says_so(self):
-        self.heap_kind('heap');seen=[];self.catalog.rows=lambda **kw:seen.append(kw.get('full'))or copy.deepcopy(self.rows)
-        result=self.session.apply({self.key:'滴落率'},full=False);self.assertEqual(seen,[False]);self.assertTrue(result['heapOnly'])
-    def complete_with(self,missed):
-        self.heap_kind('heap');roots=[]
-        def scan(full=False):roots.append(full);self.catalog.timings={'scanMs':3000,'scanHeapMissed':missed};names._scan_kind[(3,4)]='full'
-        self.catalog.roots=scan
-        with patch.object(names,'record_read_timing') as record:result=self.session.complete({self.key:'滴落率'})
-        self.assertEqual(roots,[True]);self.assertEqual(record.call_args.args[0]['scanHeapMissed'],missed);return result
-    def test_complete_writes_nothing_when_the_heap_held_everything(self):
-        self.assertEqual(self.complete_with(0),{'missed':0,'checked':True});self.assertEqual(self.calls,[])
-    def test_complete_writes_again_when_the_full_scan_found_more(self):
-        result=self.complete_with(1);self.assertEqual((result['missed'],result['changed']),(1,2));self.assertEqual({r['name'] for r in self.rows},{'滴落率'})
-    def test_complete_has_nothing_to_do_after_a_full_structure(self):
-        self.heap_kind('full');self.catalog.roots=lambda **kw:self.fail('no scan')
-        self.assertEqual(self.session.complete({self.key:'滴落率'}),{'missed':0,'checked':False})
+    def test_page_write_may_use_the_heap_and_starts_no_later_scan(self):
+        seen=[];self.catalog.rows=lambda **kw:seen.append(kw.get('full'))or copy.deepcopy(self.rows)
+        result=self.session.apply({self.key:'滴落率'},full=False);self.assertEqual(seen,[False]);self.assertNotIn('heapOnly',result);self.assertFalse(hasattr(self.session,'complete'))
     def test_writes_and_restores_need_a_full_scan_but_fast_writes_may_use_the_heap(self):
         seen=[];self.catalog.rows=lambda **kw:seen.append(kw.get('full'))or copy.deepcopy(self.rows)
         self.session.apply({self.key:'滴落率'});self.session.restore()
@@ -134,6 +118,15 @@ class ParameterTests(unittest.TestCase):
         self.assertNotIn(localized,self.session.journal()['entries'])
         self.assertEqual({r['pfName'] for r in self.rows if r['id']==localized},{' '})
         self.assertEqual({r['name'] for r in self.rows if r['id']==self.key},{'滴落率'})
+    def test_parameter_with_differing_copies_is_skipped_and_the_rest_written(self):
+        # BCC relabels "Wipe/Slide" to "Wipe" itself: copies disagree, so there is no single original to restore.
+        mixed=names.identity('BCC VR Sharpen','BCC VR Sharpen-10158083');originals=copy.deepcopy(self.rows)
+        self.rows+=[dict(row,id=mixed,name='Wipe',pfName=pf,matchName='BCC VR Sharpen-10158083',effectMatchName='BCC VR Sharpen',address=row['address']+3000) for row,pf in zip(originals,('Wipe/Slide','Wipe'))]
+        result=self.session.apply({mixed:'擦除',self.key:'滴落率'})
+        self.assertEqual(result['mixed'],[mixed]);self.assertEqual(result['parameters'],1)
+        self.assertNotIn(mixed,self.session.journal()['entries']);self.assertEqual({r['pfName'] for r in self.rows if r['id']==mixed},{'Wipe/Slide','Wipe'})
+        self.assertEqual({r['name'] for r in self.rows if r['id']==self.key},{'滴落率'})
+        self.assertEqual(self.session.apply({mixed:'擦除'})['parameters'],0)
     def test_late_preflight_conflict_does_not_change_prior_journal_entry(self):
         self.session.apply({self.key:'滴落率'})
         second=names.identity('other','param')

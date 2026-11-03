@@ -62,48 +62,66 @@ class CategorySession:
     def apply_group(self,key,value,expected_category,expected_members=None):
         with _lock,_process_lock(),self.process(write=True) as p:
             main_window(p.pid);r=Registry(p)
-            if not supported(r.profile):raise RuntimeError('此构建或效果模块尚未验证分类写入：'+r.profile.version)
-            rows=self._rows(r)
-            if key not in rows or rows[key]['category']!=expected_category:raise RuntimeError('效果分类已变化，请重新操作')
-            if not expected_category:raise ValueError('空分类暂不支持修改')
-            encoded=encode_name(value,r.profile.encoding);value=encoded.split(b'\0',1)[0].decode(r.profile.encoding)
-            if value!=expected_category and any(row['category']==value for row in rows.values()):raise ValueError('此分类名称已存在，请使用不同名称')
-            wanted={k:row for k,row in rows.items() if row['category']==expected_category}
-            if expected_members is not None and set(wanted)!=set(expected_members):raise RuntimeError('分类包含的效果已变化，请重新确认')
-            j=self._active(p,self.journal())
-            if j['entries'] and j['profileSha256']!=r.profile.flt_sha:raise RuntimeError('分类恢复记录模块不符')
-            previous=json.loads(json.dumps(j));j.update(pid=p.pid,creationTime=p.creation_time,image=p.image,profileSha256=r.profile.flt_sha)
-            offset=self._span(r);staged=[]
-            for k,row in wanted.items():
-                before=p.read(row['address']+offset,64)
-                if b'\0' not in before[:48]:raise ValueError('分类超出已验证的48字节写入范围，未修改：'+k)
-                entry=j['entries'].get(k)
-                if entry and before.hex()!=entry['appliedHex']:raise RuntimeError('分类已被外部修改，未覆盖：'+k)
-                after=encoded+before[48:]
-                if before==after:continue
-                j['entries'][k]={'originalHex':entry['originalHex'] if entry else before.hex(),'appliedHex':after.hex(),
-                                  'originalName':entry['originalName'] if entry else row['category'],'newName':value}
-                full=p.read(row['address'],fc_size(r.profile));staged.append((k,row,before,after,full))
-            if not staged:return {'applied':{},'unchanged':len(wanted)}
-            _save(self.path,j);attempted=[]
-            try:
-                for k,row,before,after,full in staged:
-                    current=r.target(k)
-                    if current['address']!=row['address'] or p.read(row['address'],len(full))!=full:raise RuntimeError('分类目录在写入前变化，已停止')
-                    attempted.append((k,row,before,after));p.write_buffer(row['address']+offset,after[:48])
-                    expected=full[:offset]+after+full[offset+64:]
-                    if p.read(row['address'],len(full))!=expected or r.target(k)['category']!=value:raise RuntimeError('分类写入后核验失败')
-            except Exception:
-                failed=False
-                for k,row,before,after in reversed(attempted):
-                    try:
-                        current=r.target(k);actual=p.read(current['address']+offset,64)
-                        if current['address']!=row['address'] or actual not in (before,after):raise RuntimeError('回滚冲突')
-                        if actual==after:p.write_buffer(current['address']+offset,before[:48])
-                    except Exception:failed=True
-                if not failed:_save(self.path,previous)
-                raise
-            return {'applied':{k:value for k,row,*rest in staged}}
+            return self._apply_group(p,r,key,value,expected_category,expected_members)
+    def apply_groups(self,plan):
+        """One host/module validation per explicit batch; each group keeps its own durable rollback."""
+        done={};errors=[]
+        if not plan:return {'categories':done,'categoryErrors':errors}
+        with _lock,_process_lock(),self.process(write=True) as p:
+            main_window(p.pid);r=Registry(p)
+            for group,value,key in plan:
+                r.check_session() # host exit/module relocation/manager change stops the batch
+                try:
+                    rows=self._rows(r)
+                    if key not in rows:raise ValueError('当前 AE 未加载此效果')
+                    category=rows[key]['category'];members=[k for k,row in rows.items() if row['category']==category]
+                    result=self._apply_group(p,r,key,value,category,members,rows)
+                    done[group]=len(result.get('applied',{}))
+                except Exception as error:errors.append(f'{group}：{error}')
+        return {'categories':done,'categoryErrors':errors}
+    def _apply_group(self,p,r,key,value,expected_category,expected_members=None,rows=None):
+        if not supported(r.profile):raise RuntimeError('此构建或效果模块尚未验证分类写入：'+r.profile.version)
+        rows=self._rows(r) if rows is None else rows
+        if key not in rows or rows[key]['category']!=expected_category:raise RuntimeError('效果分类已变化，请重新操作')
+        if not expected_category:raise ValueError('空分类暂不支持修改')
+        encoded=encode_name(value,r.profile.encoding);value=encoded.split(b'\0',1)[0].decode(r.profile.encoding)
+        if value!=expected_category and any(row['category']==value for row in rows.values()):raise ValueError('此分类名称已存在，请使用不同名称')
+        wanted={k:row for k,row in rows.items() if row['category']==expected_category}
+        if expected_members is not None and set(wanted)!=set(expected_members):raise RuntimeError('分类包含的效果已变化，请重新确认')
+        j=self._active(p,self.journal())
+        if j['entries'] and j['profileSha256']!=r.profile.flt_sha:raise RuntimeError('分类恢复记录模块不符')
+        previous=json.loads(json.dumps(j));j.update(pid=p.pid,creationTime=p.creation_time,image=p.image,profileSha256=r.profile.flt_sha)
+        offset=self._span(r);staged=[]
+        for k,row in wanted.items():
+            before=p.read(row['address']+offset,64)
+            if b'\0' not in before[:48]:raise ValueError('分类超出已验证的48字节写入范围，未修改：'+k)
+            entry=j['entries'].get(k)
+            if entry and before.hex()!=entry['appliedHex']:raise RuntimeError('分类已被外部修改，未覆盖：'+k)
+            after=encoded+before[48:]
+            if before==after:continue
+            j['entries'][k]={'originalHex':entry['originalHex'] if entry else before.hex(),'appliedHex':after.hex(),
+                              'originalName':entry['originalName'] if entry else row['category'],'newName':value}
+            full=p.read(row['address'],fc_size(r.profile));staged.append((k,row,before,after,full))
+        if not staged:return {'applied':{},'unchanged':len(wanted)}
+        _save(self.path,j);attempted=[]
+        try:
+            for k,row,before,after,full in staged:
+                current=r.target(k)
+                if current['address']!=row['address'] or p.read(row['address'],len(full))!=full:raise RuntimeError('分类目录在写入前变化，已停止')
+                attempted.append((k,row,before,after));p.write_buffer(row['address']+offset,after[:48])
+                expected=full[:offset]+after+full[offset+64:]
+                if p.read(row['address'],len(full))!=expected or r.target(k)['category']!=value:raise RuntimeError('分类写入后核验失败')
+        except Exception:
+            failed=False
+            for k,row,before,after in reversed(attempted):
+                try:
+                    current=r.target(k);actual=p.read(current['address']+offset,64)
+                    if current['address']!=row['address'] or actual not in (before,after):raise RuntimeError('回滚冲突')
+                    if actual==after:p.write_buffer(current['address']+offset,before[:48])
+                except Exception:failed=True
+            if not failed:_save(self.path,previous)
+            raise
+        return {'applied':{k:value for k,row,*rest in staged}}
     def restore(self,keys=None):
         """keys: only these effects' categories (a whole AE group is passed, so no group is split); None for all."""
         with _lock,_process_lock():

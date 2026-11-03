@@ -89,6 +89,13 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual(result["memoryWrites"],0)
         self.assertFalse(result["runtimeRenameEnabled"])
 
+    def test_plain_process_list_leaves_out_the_module_details(self):
+        detail=native_probe(detail=True);plain=native_probe()
+        self.assertEqual(plain["mode"],"read_only");self.assertIsInstance(plain["processes"],list)
+        for row in plain["processes"]:self.assertNotIn("inspectedModules",row)
+        for row in detail["processes"]:
+            if "error" not in row:self.assertIn("inspectedModules",row)
+
     def test_installed_ae_version_is_read_from_binary(self):
         # Optional real-host check: point AE_LOCALIZER_TEST_AE at an AE 2026 (26.0.0.67) AfterFX.exe to run it.
         path=Path(os.environ.get("AE_LOCALIZER_TEST_AE") or "missing")

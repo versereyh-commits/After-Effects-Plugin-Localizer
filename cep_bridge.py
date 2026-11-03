@@ -147,10 +147,29 @@ def install(debug_mode=False):
         shutil.rmtree(staging,ignore_errors=True);raise
     if debug_mode:enable_debug_mode()
 
+def _aside()->Path:return _appdata()/'AE-Localizer'/'cep-old'
+
 def _delete():
+    """A running AE keeps the extension's native module loaded, and a loaded DLL cannot be deleted, only moved:
+    the old folder (or, failing that, each file in use) goes to a folder outside Adobe's extension list, which is
+    emptied once AE has let go of it."""
     target=installed()
     if target.name!=EXTENSION_ID:raise RuntimeError('扩展路径异常，未删除')
-    if target.exists():shutil.rmtree(target)
+    aside=_aside()
+    for old in aside.glob(EXTENSION_ID+'-*'):shutil.rmtree(old,ignore_errors=True)
+    if not target.exists():return
+    try:shutil.rmtree(target);return
+    except PermissionError:pass
+    place=aside/f'{EXTENSION_ID}-{time.strftime("%Y%m%d%H%M%S")}-{uuid.uuid4().hex[:6]}';place.mkdir(parents=True,exist_ok=True)
+    for file in sorted(target.rglob('*'),key=lambda f:len(f.parts),reverse=True):
+        if file.is_dir():
+            try:file.rmdir()
+            except OSError:pass
+            continue
+        try:file.unlink()
+        except PermissionError:
+            moved=place/file.relative_to(target);moved.parent.mkdir(parents=True,exist_ok=True);os.replace(file,moved)
+    shutil.rmtree(target)
 
 def remove():
     """Deletes only this extension's own folder and puts back the debug mode values this program changed."""

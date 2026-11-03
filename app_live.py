@@ -16,6 +16,7 @@ from runtime import data_root,file_version,write_json_atomic
 from settings_store import Settings
 from llm_client import translate_names,TranslationError,PROVIDERS,PARAMETER_PROMPT,CATEGORY_PROMPT,list_models
 from parameter_names import ParameterSession,identity,split_identity,validate_label
+from popup_names import PopupSession
 from effect_instances import EffectInstanceSession
 from effect_categories import CategorySession,supported_build as category_build
 from effect_menu_names import MenuNameSession
@@ -32,7 +33,7 @@ from ui_kit import confirm,choose,inform,ask_text,Prompt,SchemeDelegate,SchemeRo
 from ui_kit import (SHADOW,STATUS_MARK,Banner,DiamondDelegate,Breather,EmptyState,FadeStack,Legend,LoaderButton,MetricTile,UsageTile,NavRail,Pill,SearchField,Spinner,StatusTag,Surface,
                     button,divider,elastic,fade_in,icon,label,logo,menu_button,page_head,repolish,soft_path,table_style)
 
-APP_VERSION='1.4.1'
+APP_VERSION='1.4.2'
 APP_NAME='AE汉化工具'
 # Installed copies: the current folder name, and the folder older versions used (an upgrade keeps it).
 INSTALL_FOLDERS=('AE汉化工具','AE插件名称汉化')
@@ -44,7 +45,7 @@ LIMITS=('· 效果与参数汉化只写在正在运行的 AE 里，不改插件�
         '· 面板与脚本汉化会备份并修改本地文件，重新打开面板后生效；恢复时遇到外部修改会停止覆盖。JSXBIN 不支持。\n'
         '· 参数名称每次都要在参数页读取后应用，不会自动重新应用。\n'
         '· 只有已验证的 AE 构建能实时汉化；其他版本需先在“AE 版本”页自动识别与适配。\n'
-        '· 下拉菜单选项和插件自绘的界面无法汉化；参数名称最多约 10 个汉字，效果名称约 15 个汉字。\n'
+        '· 下拉选项汉化向所有已完成参数适配的 AE 版本开放，仅读写结构与编码核验通过的标准下拉框；译文受原始字节容量限制，应用后切换图层刷新控件。插件自绘界面仍不支持。\n'
         '· “效果和预设”列表要手动刷新才显示新名称；图层上的效果标题随工程保存。')
 CHECK,ORIGINAL,CANDIDATE,CURRENT,KEY,CATEGORY,STATUS,FAVORITE=range(8)
 SUPPORTED_BUILD='26.0.0.67'
@@ -508,7 +509,6 @@ class Window(QMainWindow):
     task_finished=Signal(str)
     quick_result=Signal(object,object,float)   # quick search: entry, result dict or error text, seconds since Enter
     layer_result=Signal(object,float,object,str)   # Shift+Space: result dict or error text, seconds, new translations, translation note
-    completion_result=Signal(object,float)   # the full scan after a parameter-page write from the heap-only structure: result or error, seconds
     quick_params_result=Signal(object,object,float,str,object,str)   # its parameter names: entry, result or error, seconds, 'cache' / 'scan' / 'full', new translations, translation note
     def __init__(self):
         super().__init__();self._tasks={};self._stopping=threading.Event();self.task_finished.connect(self.task_done);self.setWindowTitle(f'{APP_NAME} {APP_VERSION}');self.resize(1400,880);self.setMinimumSize(1200,720)
@@ -535,6 +535,7 @@ class Window(QMainWindow):
         space=next((s for s in self.spaces if s.key==remembered_version),None) or next((s for s in self.spaces if s.live),self.spaces[0])
         load_warning=self.bind_space(space)
         self.parameter_session=ParameterSession()
+        self.popup_session=PopupSession(data_root()/'popup-session.json')
         self.instance_session=EffectInstanceSession()
         self.category_session=CategorySession();self.menu_name_session=MenuNameSession(self.session,self.category_session)
         self.bind_targets()
@@ -570,8 +571,6 @@ class Window(QMainWindow):
         # Quick effect search over AE (quick_search): a key that exists only while AE is in front, bound like the others.
         self.quick=QuickSearch();self.quick.upcoming=self.quick_sections;self.quick.chosen.connect(self.quick_add);self.quick_result.connect(self.quick_added);self.quick_params_result.connect(self.quick_params_done)
         # After quick adds, one full pass (debounced) writes the same names to effect copies the cached structure missed.
-        self.quick_full_keys={};self.quick_full=QTimer(self);self.quick_full.setSingleShot(True);self.quick_full.setInterval(15000);self.quick_full.timeout.connect(self.quick_full_pass)
-        self.completion_keys={};self.completion=QTimer(self);self.completion.setSingleShot(True);self.completion.setInterval(1000);self.completion.timeout.connect(self.completion_pass);self.completion_result.connect(self.completion_done)
         self.quick_key=AeHotkey(self);self.quick_key.triggered.connect(self.open_quick_search);self.quick_key.unavailable.connect(self.quick_key_taken);self.keymap.bind('quick_search',self.quick_key)
         self.layer_running=False;self.layer_key=AeHotkey(self,hotkey_id=HOTKEY_ID+1);self.layer_key.triggered.connect(self.layer_parameters);self.layer_key.unavailable.connect(self.layer_key_taken);self.keymap.bind('layer_parameters',self.layer_key);self.layer_result.connect(self.layer_done)
         self.go(EFFECTS);self.update_buttons();QTimer.singleShot(100,self.start_scan)
@@ -1340,7 +1339,7 @@ class Window(QMainWindow):
         except Exception as error:self.error('移除后台连接失败：'+str(error));return
         self.log.appendPlainText('已移除后台连接扩展');self.update_bridge_info()
     def update_nav(self):
-        counts=(len(self.plugins),len(self.parameter_page.rows) or '',len(self.schemes),len(self.spaces),self.unread or '',len(self.favorites.favorites) or '',self.panel_page.visible_count() or '')
+        counts=(len(self.plugins),len(self.parameter_page.params) or '',len(self.schemes),len(self.spaces),self.unread or '',len(self.favorites.favorites) or '',self.panel_page.visible_count() or '')
         for button_,count in zip(self.nav_buttons,counts):button_.set_count(count,button_ is self.nav_buttons[SETTINGS] and bool(self.unread))
     def update_pill(self):
         if not self.space.live:state,text='warn','仅翻译'
@@ -1400,7 +1399,7 @@ class Window(QMainWindow):
         self.note.setText(f'{self.space.label}（{self.space.version}）：支持实时改名。更名在当前 AE 会话内生效，插件文件保持原样。' if self.space.live else
                           f'{self.space.label}（{self.space.version}）：只能扫描、翻译和保存方案，尚未适配效果名和参数标签的实时改名。已验证构建：{supported_text()}。中文候选、勾选和方案与其他版本分开保存。')
         self.banner.setVisible(not self.space.live)
-        self.scope_info.setText(f'效果名和参数标签实时写入：{supported_text()}。\n支持标准第一层参数标签和折叠标题；下拉菜单内部条目和插件自绘界面暂不支持。')
+        self.scope_info.setText(f'效果名和参数标签实时写入：{supported_text()}。\n支持标准第一层参数标签和折叠标题；下拉选项汉化目前支持 AE 2026（26.5.0.89）的标准下拉框；插件自绘界面暂不支持。')
         self.versions_note.setText(f'实时写入只对已验证构建开放：{supported_text()}。其他版本可扫描、翻译和保存方案；检测到版本不代表已适配。')
         self.fill_versions();self.update_pill();self.update_nav()
     def fill_versions(self):
@@ -1427,7 +1426,6 @@ class Window(QMainWindow):
         if not 0<=index<len(self.spaces):return
         space=self.spaces[index]
         if space is self.space or self.busy():self.update_version_bar();return
-        self.quick_full.stop();self.completion.stop();self.quick_full_keys={};self.completion_keys={}
         warning=self.bind_space(space)
         self.bind_targets()
         try:write_json(self.version_path,{'key':space.key})
@@ -1440,6 +1438,7 @@ class Window(QMainWindow):
             self.session.expected_image=self.space.exe
             if hasattr(self,'category_session'):self.category_session.expected_image=self.space.exe
             if hasattr(self,'parameter_session'):self.parameter_session.expected_image=self.space.exe
+            if hasattr(self,'popup_session'):self.popup_session.expected_image=self.space.exe
             if hasattr(self,'instance_session'):self.instance_session.expected_image=self.space.exe
         if self.live and self.space.live and self.space.exe and self.live.get('image'):
             from ae_paths import path_key
@@ -2066,16 +2065,9 @@ class Window(QMainWindow):
         self.work(lambda progress:self.apply_with_categories({},plan),self.applied)
     def write_categories(self,plan)->dict:
         """Runs in the job. A failed category is rolled back on its own and reported; the others still go."""
-        done={};errors=[]
-        for group,value,key in plan:
-            try:
-                found=self.category_session.group(key)
-                if found['category']==value:done[group]=0;continue
-                done[group]=len(self.category_session.apply_group(key,value,found['category'],found['keys']).get('applied',{}))
-            except Exception as error:errors.append(f'{group}：{error}')
-        return {'categories':done,'categoryErrors':errors}
+        return self.category_session.apply_groups(plan)
     def apply_with_categories(self,names,plan):
-        operation,live,error=self.apply_names(names) if names else ({'applied':{}},None,'')
+        operation,live,error=self.apply_names(names,reread=not bool(plan)) if names else ({'applied':{}},None,'')
         if plan:operation.update(self.write_categories(plan));_,live,error=with_live(None,self.space.exe)
         return operation,live,error
     def restore_categories(self,groups=None):
@@ -2178,7 +2170,7 @@ class Window(QMainWindow):
         rows=self.selected_rows()
         if effect is None and len(rows)==1:effect=self.table.item(rows[0],KEY).text()
         self.go(PARAMETERS);self.parameter_page.focus_effect(effect)
-    def apply_names(self,values,instances=True):
+    def apply_names(self,values,instances=True,reread=True):
         # Effect names only; parameter labels are applied from the parameters page.
         # instances=False writes the palette catalog alone (the automatic re-apply never edits the open project).
         originals={plugin.match_name:plugin.display_name for plugin in self.plugins};chinese=dict(values)
@@ -2192,7 +2184,7 @@ class Window(QMainWindow):
         originals.update({key:entry['originalName'] for key,entry in self.session.journal()['entries'].items()})
         try:operation['instanceResult']=self.instance_session.apply(operation.get('applied',{}),originals)
         except Exception as error:raise RuntimeError('效果目录名称已应用，但图层效果标题未完成同步；可重试应用或恢复：'+str(error)) from error
-        return with_live(operation,self.space.exe)
+        return with_live(operation,self.space.exe) if reread else (operation,None,'')
     def translations_selected(self):
         """The current row's name from the detail field; batches go through the checked items."""
         rows=self.selected_rows()
@@ -2278,11 +2270,14 @@ class Window(QMainWindow):
         result=self.restore_effect_names()
         try:result['parameterResult']=self.parameter_session.restore(progress=progress)
         except Exception as error:result.setdefault('restoreErrors',[]).append('参数标签恢复失败：'+str(error))
+        try:result['popupResult']=self.popup_session.restore(progress=progress)
+        except Exception as error:result.setdefault('restoreErrors',[]).append('下拉选项恢复失败：'+str(error))
         try:result['categoryResult']=self.category_session.restore()
         except Exception as error:result.setdefault('restoreErrors',[]).append('效果分类恢复失败：'+str(error))
         if self.close_after:
             if result.get('restoreErrors'):raise RuntimeError('部分原名未恢复，记录已保留：'+'；'.join(result['restoreErrors']))
             if result.get('instanceResult',{}).get('pending'):raise RuntimeError('其他工程或已移动效果仍有实例标题恢复记录；请返回原工程恢复后退出，或取消退出前恢复')
+            if result.get('popupResult',{}).get('pending'):raise RuntimeError('其他工程仍有下拉选项恢复记录；请返回原工程恢复后退出，或取消退出前恢复')
         return result
     # The schemes page writes a saved scheme's effect names to AE, or puts them back, through the same paths as the effects page.
     def scheme_effect_names(self,scheme:SavedScheme)->dict[str,str]:
@@ -2710,7 +2705,7 @@ class Window(QMainWindow):
                         rows[plugin.match_name]=(plugin.match_name,display,name,source)
                 keys=pick_effects(self,sorted(rows.values(),key=lambda r:r[1].casefold()))
             else:
-                for key in set(known)|{r['id'] for r in self.parameter_page.rows}|set(self.parameter_labels)|self.parameter_enabled:
+                for key in set(known)|{r['id'] for r in self.parameter_page.params}|set(self.parameter_labels)|self.parameter_enabled:
                     if key not in taken:name,source=known.get(key,('',''));rows[key]=(key,self.key_label(key,part),name,source)
                 keys=pick_parameters(self,sorted(rows.values(),key=lambda r:r[1].casefold()))
         if not keys:return
@@ -3007,7 +3002,6 @@ class Window(QMainWindow):
             same=result.get('unchanged',0);written=result.get('parameters',0)-same
             text=f'选中图层的参数已改成中文：写入 {written} 个参数（{result.get("changed",0)} 处），{same} 个本来就是中文，{seconds:.2f} 秒'+(f'。{note}' if note else '')
             self.log.appendPlainText(text);self.quick_notice('参数已汉化',text,error=bool(note))
-            if result.get('heapOnly'):self.schedule_completion(result.get('names',{}))
         else:
             text=f'选中图层的参数没有改成中文（{seconds:.2f} 秒）：{result}'+(f'。{note}' if note else '')
             self.log.appendPlainText(text);self.quick_notice('参数未汉化',text,error=True)
@@ -3077,7 +3071,6 @@ class Window(QMainWindow):
     def quick_parameters_on(self)->bool:return self.ui_preferences().get('quickParameters') is not False
     def set_quick_parameters(self,on):
         self.save_ui_preference('quickParameters',bool(on));self.quick_translate_box.setEnabled(bool(on))
-        if not on:self.quick_full.stop();self.quick_full_keys={}    # no follow-up full scan either
     def quick_parameters(self,entry):
         if self._stopping.is_set():return
         if self.busy():
@@ -3133,47 +3126,10 @@ class Window(QMainWindow):
             self.log.appendPlainText(f"已自动翻译“{entry.title}”的 {len(translated)} 个参数并保存到当前版本的参数记录")
         if note:self.log.appendPlainText(note);self.quick_notice('参数自动翻译',note,error=True)
         if isinstance(result,dict):
-            how={'cache':'缓存结构','heap':'默认堆扫描','scan':'完整扫描','full':'补充完整扫描'}[route]
+            how={'cache':'缓存结构','heap':'默认堆扫描','scan':'完整扫描'}[route]
             self.log.appendPlainText(f"“{entry.title}”的参数名称已写入 {result.get('changed',0)} 处（{result.get('parameters',0)} 个参数，{how}，{seconds:.2f} 秒）")
-            # Written from a cached or heap-only structure: a later full scan also covers copies made since.
-            if route in ('cache','heap'):self.quick_full_keys.update(self.quick_parameter_names(entry.match_name));self.quick_full.start()
         elif not note:
             self.log.appendPlainText(f"“{entry.title}”的参数名称未写入（{seconds:.2f} 秒）：{result}");self.quick_notice('参数名称未写入',str(result),error=True)
-    def quick_full_pass(self):
-        """The later full scan after cache-only writes: copies of an effect made after the last scan get the names too."""
-        names,self.quick_full_keys=self.quick_full_keys,{}
-        if not names or self._stopping.is_set():return
-        if self.busy():self.quick_full_keys.update(names);self.quick_full.start();return
-        import time
-        started=time.perf_counter();entry=type('Entry',(),{'title':f'{len({split_identity(k)[0] for k in names})} 个快速添加的效果'})()
-        def run():
-            try:
-                result=self.parameter_session.apply(names,rescan=True,skip_missing=True)
-            except Exception as error:result=str(error) or type(error).__name__
-            self.quick_params_result.emit(entry,result,time.perf_counter()-started,'full',{},'')
-        self.background('quick-parameters-full',run)
-    def schedule_completion(self,names):
-        """After the parameter page wrote from a heap-only structure: a full scan in the background, writing again
-        only if it finds structures outside the default heap."""
-        if self._stopping.is_set():return
-        self.completion_keys.update(names);self.completion.start()
-    def completion_pass(self):
-        names,self.completion_keys=self.completion_keys,{}
-        if not names or self._stopping.is_set():return
-        if self.busy():self.completion_keys.update(names);self.completion.start();return
-        import time
-        started=time.perf_counter()
-        def run():
-            try:result=self.parameter_session.complete(names)
-            except Exception as error:result=str(error) or type(error).__name__
-            self.completion_result.emit(result,time.perf_counter()-started)
-        self.background('parameter-completion',run)
-    def completion_done(self,result,seconds):
-        if not isinstance(result,dict):
-            self.log.appendPlainText(f'参数写入后的补充完整扫描未完成（{seconds:.2f} 秒）：{result}');return
-        if result.get('missed'):
-            self.log.appendPlainText(f"补充完整扫描在默认堆以外找到 {result['missed']} 组参数结构，已补写 {result.get('changed',0)} 处（{seconds:.2f} 秒）")
-        elif result.get('checked'):self.log.appendPlainText(f'补充完整扫描核对完毕：参数结构都在默认堆里，无需补写（{seconds:.2f} 秒）')
     # Tray: closing the window hides it while the option is on, so the quick search key keeps working.
     def tray_on_close(self)->bool:return self.ui_preferences().get('trayOnClose') is not False
     def set_tray_on_close(self,on):
@@ -3203,13 +3159,13 @@ class Window(QMainWindow):
             if not self.tray_told:self.tray_told=True;self.tray.showMessage(APP_NAME,'仍在托盘中运行，快速搜索可用。右键托盘图标可退出。',QSystemTrayIcon.MessageIcon.Information,4000)
             return
         if self.busy():
-            self._stopping.set();self.quick_full.stop();self.completion.stop();self.quick_full_keys={};self.completion_keys={}
+            self._stopping.set()
             event.ignore();self.status.setText('正在等待当前操作安全收尾，完成后退出');return
         dialog=getattr(self,'adapter_dialog',None)
         if dialog and dialog.validation and dialog.validation.held:
             event.ignore();dialog.restore_validation();self.status.setText('正在恢复验证改名，恢复完成后可关闭');return
         # A damaged journal cannot be restored from; closing must still work (AE keeps names until it restarts).
-        try:entries=self.session.journal().get('entries') or self.parameter_session.journal().get('entries') or self.instance_session.journal().get('entries') or self.category_session.journal().get('entries')
+        try:entries=self.session.journal().get('entries') or self.parameter_session.journal().get('entries') or self.instance_session.journal().get('entries') or self.category_session.journal().get('entries') or self.popup_session.journal().get('entries')
         except Exception:entries=None
         if self.exit_restore.isChecked() and entries and not self.close_after:
             event.ignore();self.close_after=True;self.work(lambda progress:self.restore_names(progress),self.exit_restored);return

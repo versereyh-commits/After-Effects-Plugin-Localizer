@@ -298,6 +298,12 @@ class ParallelTests(unittest.TestCase):
         self.assertEqual(result,{f'E{i:03d}':f'中E{i:03d}' for i in range(65)})
         self.assertEqual(self.peak,3);self.assertEqual(len(self.starts),7);self.assertEqual(tokens,[7]*7)
         self.assertEqual(progress[-1],(65,65));self.assertEqual([d for d,_ in progress],sorted(d for d,_ in progress))
+    def test_a_429_is_shared_with_translations_alongside(self):
+        shared=threading.Event();self.refuse={0:[429]}
+        self.assertEqual(len(self.call(10,slowdown=shared)),10);self.assertTrue(shared.is_set())
+    def test_a_429_elsewhere_slows_this_translation(self):
+        shared=threading.Event();shared.set()
+        self.assertEqual(len(self.call(40,slowdown=shared)),40);self.assertEqual(self.peak,1)
     def test_rate_limit_drops_to_one_batch_at_a_time(self):
         self.refuse={0:[429]};self.slow={1,2}
         self.assertEqual(len(self.call(70)),70)

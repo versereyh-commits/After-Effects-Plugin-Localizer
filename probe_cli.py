@@ -13,7 +13,7 @@ parser.add_argument("--mutate",action="store_true")
 parser.add_argument("--match",action="append",help="live：只输出这些内部标识（可重复）")
 args = parser.parse_args()
 if args.command == "native":
-    result = native_probe()
+    result = native_probe(detail=True)
 elif args.command == "catalog":
     result = run_catalog_probe(Path(args.path),args.mutate,folder=Path(args.output) if args.output else None)
     result = {k:v for k,v in result.items() if k not in ("catalog","nativeProbe")}

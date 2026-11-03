@@ -81,7 +81,7 @@ __declspec(dllexport) int ae_file_version_json(const wchar_t *path,char *output,
     if(!path || !output || capacity<32) return -1;
     Json j={output,capacity,0,0}; version(&j,path); return j.failed?-1:(int)j.used;
 }
-__declspec(dllexport) int ae_probe_json(char *output,uint32_t capacity) {
+static int probe(char *output,uint32_t capacity,int detail) {
     if(!output || capacity<32) return -1;
     Json j={output,capacity,0,0};
     emit(&j,"{\"schemaVersion\":1,\"mode\":\"read_only\",\"runtimeRenameEnabled\":false,\"memoryWrites\":0,\"processes\":[");
@@ -107,6 +107,7 @@ __declspec(dllexport) int ae_probe_json(char *output,uint32_t capacity) {
         emit(&j,",\"imagePath\":");
         if(QueryFullProcessImageNameW(process,0,image,&image_length)) { string(&j,image); emit(&j,",\"fileVersion\":"); version(&j,image); }
         else emit(&j,"null");
+        if(!detail){emit(&j,"}");CloseHandle(process);continue;} /* the modules take about 200 ms and only the diagnostic output uses them */
         HMODULE modules[4096]; DWORD needed=0; unsigned selected=0,loaded=0;
         emit(&j,",\"inspectedModules\":[");
         if(EnumProcessModulesEx(process,modules,sizeof(modules),&needed,LIST_MODULES_64BIT)) {
@@ -129,3 +130,5 @@ __declspec(dllexport) int ae_probe_json(char *output,uint32_t capacity) {
     if(snapshot!=INVALID_HANDLE_VALUE) CloseHandle(snapshot);
     emit(&j,"]}"); return j.failed?-1:(int)j.used;
 }
+__declspec(dllexport) int ae_probe_json(char *output,uint32_t capacity) {return probe(output,capacity,1);}
+__declspec(dllexport) int ae_hosts_json(char *output,uint32_t capacity) {return probe(output,capacity,0);}

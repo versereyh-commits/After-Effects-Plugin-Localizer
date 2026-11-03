@@ -1,15 +1,28 @@
 """Parameter-label page: per-effect, per-parameter candidates applied to AE's native effect controls."""
-from PySide6.QtCore import Qt,QTimer
-from PySide6.QtGui import QColor,QFont,QKeySequence,QShortcut,QActionGroup
-from PySide6.QtWidgets import QApplication,QWidget,QVBoxLayout,QHBoxLayout,QLineEdit,QTableWidget,QTableWidgetItem,QComboBox,QHeaderView,QToolButton,QMenu,QStackedWidget,QButtonGroup,QPushButton,QAbstractItemView
-from parameter_names import read_parameters,validate_label,record_read_timing
-import time
+from PySide6.QtCore import Qt,QTimer,QSize
+from PySide6.QtGui import QColor,QFont,QKeySequence,QShortcut,QActionGroup,QIcon,QPainter,QPixmap
+from PySide6.QtWidgets import QApplication,QWidget,QVBoxLayout,QHBoxLayout,QLineEdit,QTableWidget,QTableWidgetItem,QComboBox,QHeaderView,QToolButton,QMenu,QStackedWidget,QButtonGroup,QPushButton,QAbstractItemView,QStyledItemDelegate,QStyleOptionViewItem
+from parameter_names import read_parameters,validate_label,record_read_timing,split_identity
+from popup_names import BUILD,POPUP_PROMPT,option_key,pack_translation,validate_option,REFRESH_NOTE
+import threading,time
+from concurrent.futures import ThreadPoolExecutor
 from llm_client import translate_names,TranslationError,PARAMETER_PROMPT
 import ui_kit
 from ui_kit import CheckDragger,CheckHeader,check_state,SHADOW,Breather,DiamondDelegate,EmptyState,LoaderButton,MetricTile,SearchField,Surface,TrashDelegate,button,icon,label,confirm
 H_CHECK,H_EFFECT,H_NAME,H_CHINESE,H_TRASH=range(5)  # columns of the record of translated parameters
 
 STATUS=5
+OPTION_ROLE=Qt.ItemDataRole.UserRole+21   # the row is a dropdown choice, not a parameter label
+
+class OptionDelegate(QStyledItemDelegate):
+    """A dropdown choice sits indented under its parameter behind a faint dropdown glyph; drawn at paint time so it
+    follows the theme."""
+    def initStyleOption(self,option,index):
+        super().initStyleOption(option,index)
+        if not index.data(OPTION_ROLE):return
+        ratio=self.parent().devicePixelRatioF();pixmap=QPixmap(int(30*ratio),int(14*ratio));pixmap.setDevicePixelRatio(ratio);pixmap.fill(Qt.GlobalColor.transparent)
+        painter=QPainter(pixmap);painter.drawPixmap(14,0,ui_kit.icon('option',ui_kit.FAINT,14).pixmap(14,14));painter.end()
+        option.icon=QIcon(pixmap);option.decorationSize=QSize(30,14);option.features|=QStyleOptionViewItem.ViewItemFeature.HasDecoration
 FILTERS=(('all','全部参数',None),('checked','已勾选',None),('todo','待翻译','hollow'),('applied','已应用','solid'))
 
 def menu_tool(text,entries,parent)->QToolButton:
@@ -20,7 +33,7 @@ def menu_tool(text,entries,parent)->QToolButton:
 class ParameterPanel(QWidget):
     """Host work runs on the owner window's single worker, so only one job touches AE at a time."""
     def __init__(self,owner):
-        super().__init__(owner);self.owner=owner;self.rows=[];self.filling=False;self.wanted=None;self.writing=set();self.read_scope='selected';self.empty_reason=None
+        super().__init__(owner);self.owner=owner;self.rows=[];self.params=[];self.popups=[];self.popup_report=None;self.filling=False;self.wanted=None;self.writing=set();self.read_scope='selected';self.empty_reason=None
         layout=QVBoxLayout(self);layout.setContentsMargins(0,0,0,0);layout.setSpacing(12)
         tiles=QWidget();tile_row=QHBoxLayout(tiles);tile_row.setContentsMargins(SHADOW,0,SHADOW,0);tile_row.setSpacing(12)
         self.chip_group=QButtonGroup(self);self.chips={}
@@ -69,10 +82,10 @@ class ParameterPanel(QWidget):
         table_style(self.table);self.table.setSelectionMode(QTableWidget.SelectionMode.NoSelection);header=self.table.horizontalHeader();header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive);header.setStretchLastSection(True);header.moveSection(STATUS,1)
         for c,width in ((0,52),(STATUS,104),(1,190),(2,200),(3,190),(4,260)):self.table.setColumnWidth(c,width)
         self.delegate=DiamondDelegate(self.table,lambda index:bool(self.writing) and 0<=index.row()<len(self.rows) and self.rows[index.row()]['id'] in self.writing)
-        self.table.setItemDelegateForColumn(STATUS,self.delegate);self.breather=Breather(self.table,self.delegate)
-        self.dragger=CheckDragger(self.table,0,lambda row:self.rows[row]['id'] in self.owner.parameter_enabled,self.paint_checks,self.finish_checks)
+        self.table.setItemDelegateForColumn(STATUS,self.delegate);self.breather=Breather(self.table,self.delegate);self.table.setItemDelegateForColumn(1,OptionDelegate(self.table))
+        self.dragger=CheckDragger(self.table,0,lambda row:self.is_checked(self.rows[row]),self.paint_checks,self.finish_checks)
         self.table.itemChanged.connect(self.changed);self.stack.addWidget(self.table);self.build_history();card.box.addWidget(self.stack,1)
-        self.status=label('在 AE 图层中添加效果后点击“读取 AE 参数”。当前适配标准参数标签和折叠标题，暂不翻译下拉菜单内部条目或插件自绘界面。','muted',True);card.box.addWidget(self.status)
+        self.status=label('在 AE 图层中添加效果后点击“读取 AE 参数”。已完成参数适配的 AE 版本会同时尝试读取标准下拉框选项，列在所属参数下方并带小标记。','muted',True);card.box.addWidget(self.status)
         self.write_scope_note=label('读取范围仅限制列表；应用和恢复仍影响整个工程中同类效果的已加载实例。','muted',True);card.box.addWidget(self.write_scope_note)
         # The layer-parameters key (app_live.Window.layer_parameters); the window sets the text whenever keys change.
         self.key_note=label('','muted',True);card.box.addWidget(self.key_note)
@@ -125,33 +138,84 @@ class ParameterPanel(QWidget):
     def load(self,rescan=False):
         if self.owner.busy() or not self.owner.space.live:return
         scope=self.read_scope
-        self.owner.work(lambda progress:read_parameters(rescan=rescan,progress=progress,expected_image=self.owner.space.exe,scope=scope),self.loaded)
+        extra=self.popup_reader()
+        self.owner.work(lambda progress:read_parameters(rescan=rescan,progress=progress,expected_image=self.owner.space.exe,scope=scope,extra=extra),self.read_done)
     def row_status(self,i)->str:
-        candidate=self.owner.parameter_pending.get(self.rows[i]['id'],'').strip()
+        candidate=self.candidate(self.rows[i]).strip()
         if not candidate:return '待翻译'
         return '已应用' if self.rows[i]['name']==candidate else '待应用'
-    def loaded(self,report):
+
+    # Dropdown choices (all parameter-adapted AE versions) are rows under their parameter, read along with the labels.
+    def popup_stores(self):
+        folder=self.owner.space.folder
+        if getattr(self,'_popup_folder',None)!=folder:
+            from app_live import CandidateStore
+            self._popup_folder=folder;self._popup_pending=CandidateStore(folder/'popup-translations.json');self._popup_checked=CandidateStore(folder/'popup-enabled.json',keys=True)
+            for store in (self._popup_pending,self._popup_checked):
+                message=store.secure()
+                if message:self.owner.log.appendPlainText(message)
+        return self._popup_pending,self._popup_checked
+    def popup_supported(self)->bool:return bool(self.owner.space.live)
+    @staticmethod
+    def is_option(row)->bool:return row.get('kind')=='option'
+    def is_checked(self,row)->bool:return row['id'] in (self.popup_stores()[1].values if self.is_option(row) else self.owner.parameter_enabled)
+    def mark(self,row,on):
+        target=self.popup_stores()[1].values if self.is_option(row) else self.owner.parameter_enabled
+        (target.add if on else target.discard)(row['id'])
+    def candidate(self,row)->str:return (self.popup_stores()[0].values if self.is_option(row) else self.owner.parameter_pending).get(row['id'],'')
+    def save_checks(self):
+        self.owner.save_parameters()
+        message=self.popup_stores()[1].save()
+        if message:self.owner.log.appendPlainText(message)
+    def option_rows(self,popup)->list[dict]:
+        match=split_identity(popup['id'])[1]
+        return [{'id':option_key(popup,i),'kind':'option','popup':popup,'index':i,'name':popup['currentOptions'][i],'source':source,'effectMatchName':popup['effectMatchName'],'matchName':f'{match} · 选项 {i+1}'}
+                for i,source in enumerate(popup['options']) if source.strip()!='(-']
+    def compose(self)->list[dict]:
+        """Labels in the order read, each dropdown parameter followed by its choices."""
+        options={}
+        for popup in self.popups:options.setdefault(popup['id'],[]).extend(self.option_rows(popup))
+        rows=[]
+        for row in self.params:rows.append(row);rows.extend(options.pop(row['id'],[]))
+        for extra in options.values():rows.extend(extra)
+        return rows
+    def popup_reader(self):return self.owner.popup_session.reader(self.read_scope) if self.popup_supported() else None
+    def read_done(self,report):
+        self.loaded(report);base=self.status.text()
+        if report.get('popupError'):
+            self.status.setText(base+' 下拉选项未读取：'+report['popupError']);self.owner.log.appendPlainText('下拉选项读取失败：'+report['popupError'])
+        elif report.get('popups'):self.popups_loaded(report['popups'],base)
+    def popups_loaded(self,report,base):
+        self.popup_report=report;self.popups=report['parameters'];self.loaded({'parameters':self.params},keep_popups=True)
+        options=sum(1 for row in self.rows if self.is_option(row))
+        self.status.setText(base+(f' 含 {len(self.popups)} 个下拉参数的 {options} 个选项（带小标记）。' if self.popups else ''))
+    def loaded(self,report,keep_popups=False):
+        if not keep_popups:self.popups=[];self.popup_report=None
         started=time.perf_counter();self.table.setUpdatesEnabled(False)
         try:
-            self.rows=report['parameters'];self.empty_reason=report.get('emptyReason');self.filling=True;self.table.setRowCount(len(self.rows))
+            self.params=[r for r in report['parameters'] if not self.is_option(r)];self.rows=self.compose();self.empty_reason=report.get('emptyReason');self.filling=True;self.table.setRowCount(len(self.rows))
             wanted=self.wanted or self.effects.currentData();self.wanted=None
             self.effects.blockSignals(True);self.effects.clear();self.effects.addItem('所有已加载效果','')
             for effect in sorted({r['effectMatchName'] for r in self.rows}):self.effects.addItem(effect,effect)
             found=self.effects.findData(wanted);self.effects.setCurrentIndex(max(found,0));self.effects.blockSignals(False)
             mono=QFont('Cascadia Mono');mono.setStyleHint(QFont.StyleHint.Monospace);mono.setPixelSize(12)
             for i,row in enumerate(self.rows):
-                check=QTableWidgetItem();check.setFlags(Qt.ItemFlag.ItemIsEnabled|Qt.ItemFlag.ItemIsUserCheckable);check.setCheckState(Qt.CheckState.Checked if row['id'] in self.owner.parameter_enabled else Qt.CheckState.Unchecked);self.table.setItem(i,0,check)
-                for col,value in ((1,row['name']),(2,self.owner.parameter_pending.get(row['id'],'')),(3,row['effectMatchName']),(4,row['matchName']),(STATUS,'')):
+                check=QTableWidgetItem();check.setFlags(Qt.ItemFlag.ItemIsEnabled|Qt.ItemFlag.ItemIsUserCheckable);check.setCheckState(Qt.CheckState.Checked if self.is_checked(row) else Qt.CheckState.Unchecked);self.table.setItem(i,0,check)
+                for col,value in ((1,row['name']),(2,self.candidate(row)),(3,row['effectMatchName']),(4,row['matchName']),(STATUS,'')):
                     item=QTableWidgetItem(value)
                     if col!=2:item.setFlags(item.flags()&~Qt.ItemFlag.ItemIsEditable)
                     if col in (3,4):item.setForeground(QColor(ui_kit.MUTED))
                     if col==4:item.setFont(mono)
                     self.table.setItem(i,col,item)
+                if self.is_option(row):
+                    popup=row['popup'];tip=f"下拉选项 {row['index']+1}/{len(popup['options'])} · 所属参数“{popup['name']}”\n原文：{row['source']}\n整组译文合计不超过 {popup['capacity']} 个 {popup.get('encoding','utf8')} 字节（含分隔符）"
+                    self.table.item(i,1).setData(OPTION_ROLE,True)
+                    for col in range(1,STATUS+1):self.table.item(i,col).setToolTip(tip)
                 self.table.item(i,STATUS).setText(self.row_status(i))
             self.filling=False;self.remember_labels();self.fill_history();self.filter_rows();self.update_counts();self.owner.update_nav();self.update_check_all();self.update_empty()
             scope_text='选中图层' if self.read_scope=='selected' else '整个工程'
             if not self.rows:self.status.setText({'noActiveComp':'没有活动合成，请在 AE 中打开合成并选择图层。','noSelectedLayers':'没有选中图层，请在 AE 中选择图层后读取。','noSupportedParameters':'选中图层没有可读取的受支持参数。'}.get(self.empty_reason,scope_text+'没有可读取的受支持参数。'))
-            if self.rows:self.status.setText(f'{scope_text}：读取 {len(self.rows)} 个参数标签、{sum(r.get("instances",1) for r in self.rows)} 个参数实例；图层或效果变化后请重新读取。')
+            if self.params:self.status.setText(f'{scope_text}：读取 {len(self.params)} 个参数标签、{sum(r.get("instances",1) for r in self.params)} 个参数实例；图层或效果变化后请重新读取。')
             if wanted and found<0 and self.rows:self.status.setText(f'{scope_text}没有已加载的 {wanted}；显示范围内全部 {len(self.rows)} 个参数。')
         finally:
             self.filling=False;self.table.setUpdatesEnabled(True)
@@ -161,109 +225,176 @@ class ParameterPanel(QWidget):
     def refresh_values(self):
         """A scheme replaced the candidates and checks: redraw the rows already read, keeping the status line."""
         if not self.rows:self.fill_history();self.update_empty();return
-        status=self.status.text();self.loaded({'parameters':self.rows});self.status.setText(status)
+        status=self.status.text();self.loaded({'parameters':self.params},keep_popups=True);self.status.setText(status)
     def row_matches(self,i,mode)->bool:
         if mode=='all':return True
-        key=self.rows[i]['id']
-        return {'checked':key in self.owner.parameter_enabled,'todo':self.row_status(i)=='待翻译','applied':self.row_status(i)=='已应用'}[mode]
+        return {'checked':self.is_checked(self.rows[i]),'todo':self.row_status(i)=='待翻译','applied':self.row_status(i)=='已应用'}[mode]
     def filter_rows(self):
         effect=self.effects.currentData();query=self.search.text().casefold();mode=FILTERS[max(self.chip_group.checkedId(),0)][0]
         for i,row in enumerate(self.rows):self.table.setRowHidden(i,bool(effect and row['effectMatchName']!=effect) or query not in ' '.join(self.table.item(i,c).text() for c in range(1,5)).casefold() or not self.row_matches(i,mode))
         if hasattr(self,'empty_clear'):self.update_empty()
         if hasattr(self,'check_header'):self.update_check_header()
     def visible(self):return [i for i in range(len(self.rows)) if not self.table.isRowHidden(i)]
-    def update_check_header(self):self.check_header.set_state(check_state(self.rows[i]['id'] in self.owner.parameter_enabled for i in self.visible()))
+    def update_check_header(self):self.check_header.set_state(check_state(self.is_checked(self.rows[i]) for i in self.visible()))
     def toggle_visible(self):
         rows=self.visible()
-        if rows and not self.owner.busy() and self.owner.space.live:self.check(not all(self.rows[i]['id'] in self.owner.parameter_enabled for i in rows))
+        if rows and not self.owner.busy() and self.owner.space.live:self.check(not all(self.is_checked(self.rows[i]) for i in rows))
     def update_counts(self):
         for key,_,_ in FILTERS:self.chips[key].set_value(len(self.rows) if key=='all' else sum(1 for i in range(len(self.rows)) if self.row_matches(i,key)))
         self.update_check_header()
     def changed(self,item):
         if self.filling or item.column() not in (0,2):return
-        key=self.rows[item.row()]['id']
+        row=self.rows[item.row()]
         if item.column()==0:
             checked=item.checkState()==Qt.CheckState.Checked;anchor=self.anchor;self.anchor=item.row();visible=self.visible()
             if anchor is not None and anchor!=item.row() and anchor in visible and item.row() in visible and QApplication.keyboardModifiers()&Qt.KeyboardModifier.ShiftModifier:
                 first,last=sorted((visible.index(anchor),visible.index(item.row())));self.filling=True
                 for i in visible[first:last+1]:
-                    self.table.item(i,0).setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
-                    (self.owner.parameter_enabled.add if checked else self.owner.parameter_enabled.discard)(self.rows[i]['id'])
+                    self.table.item(i,0).setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked);self.mark(self.rows[i],checked)
                 self.filling=False
-            elif checked:self.owner.parameter_enabled.add(key)
-            else:self.owner.parameter_enabled.discard(key)
-        else:
-            self.owner.parameter_pending[key]=item.text()
+            else:self.mark(row,checked)
+            self.save_checks()
+        elif self.is_option(row):
+            pending=self.popup_stores()[0];pending.values[row['id']]=item.text()
+            message=pending.save()
+            if message:self.status.setText(message)
             self.filling=True;self.table.item(item.row(),STATUS).setText(self.row_status(item.row()));self.filling=False
-        self.owner.save_parameters();self.update_counts()
-        if item.column()==2:self.fill_history()
-    def update_check_all(self):self.check_all_btn.setEnabled(bool(self.rows) and self.owner.space.live and not self.owner.busy())
+        else:
+            self.owner.parameter_pending[row['id']]=item.text();self.owner.save_parameters()
+            self.filling=True;self.table.item(item.row(),STATUS).setText(self.row_status(item.row()));self.filling=False
+        self.update_counts()
+        if item.column()==2 and not self.is_option(row):self.fill_history()
+    def update_check_all(self):
+        self.check_all_btn.setEnabled(bool(self.rows) and self.owner.space.live and not self.owner.busy())
     def check_all(self,value):
         if not self.rows or self.owner.busy() or not self.owner.space.live:return
         self.check(value,all_rows=True)
-        self.status.setText(f'已勾选全部 {len(self.rows)} 个参数；不受筛选影响。' if value else f'已取消全部 {len(self.rows)} 个参数的勾选。')
+        self.status.setText(f'已勾选全部 {len(self.rows)} 项；不受筛选影响。' if value else f'已取消全部 {len(self.rows)} 项的勾选。')
     def check(self,value,all_rows=False):
         self.filling=True
         for i in range(len(self.rows)):
             if all_rows or not self.table.isRowHidden(i):
-                self.table.item(i,0).setCheckState(Qt.CheckState.Checked if value else Qt.CheckState.Unchecked)
-                key=self.rows[i]['id']
-                if value:self.owner.parameter_enabled.add(key)
-                else:self.owner.parameter_enabled.discard(key)
-        self.filling=False;self.owner.save_parameters();self.update_counts()
+                self.table.item(i,0).setCheckState(Qt.CheckState.Checked if value else Qt.CheckState.Unchecked);self.mark(self.rows[i],value)
+        self.filling=False;self.save_checks();self.update_counts()
     def paint_checks(self,rows,state):
         self.filling=True
         for row in rows:
-            self.table.item(row,0).setCheckState(Qt.CheckState.Checked if state else Qt.CheckState.Unchecked)
-            (self.owner.parameter_enabled.add if state else self.owner.parameter_enabled.discard)(self.rows[row]['id'])
+            self.table.item(row,0).setCheckState(Qt.CheckState.Checked if state else Qt.CheckState.Unchecked);self.mark(self.rows[row],state)
         self.filling=False
     def finish_checks(self,rows,state):
-        self.anchor=rows[-1];self.owner.save_parameters();self.update_counts()
-        self.status.setText(f"已{'勾选' if state else '取消勾选'} {len(rows)} 个参数")
-    def selected(self):return [r for r in self.rows if r['id'] in self.owner.parameter_enabled]
+        self.anchor=rows[-1];self.save_checks();self.update_counts()
+        self.status.setText(f"已{'勾选' if state else '取消勾选'} {len(rows)} 项")
+    def selected(self):return [r for r in self.params if r['id'] in self.owner.parameter_enabled]
+    def selected_options(self):return [r for r in self.rows if self.is_option(r) and self.is_checked(r)]
+    def popup_values(self):
+        """Dropdown parameters with a checked choice that has a candidate. AE stores a parameter's choices as one
+        string, so the checked choices take their candidates and the rest keep what AE shows now."""
+        pending,checked=self.popup_stores();values={};problems=[]
+        for popup in self.popups:
+            picked=False;texts=[]
+            for i,source in enumerate(popup['options']):
+                key=option_key(popup,i);text=pending.values.get(key,'').strip()
+                if source.strip()!='(-' and key in checked.values and text:texts.append(text);picked=True
+                else:texts.append(popup['currentOptions'][i])
+            if not picked or texts==popup['currentOptions']:continue
+            try:pack_translation(popup['original'],texts,popup.get('encoding','utf8'));values[popup['id']]=texts
+            except ValueError as error:problems.append(f"{popup['name']}：{error}")
+        return values,problems
     def translate(self):
-        selected=self.selected()
-        if not selected:self.status.setText('请先勾选参数');return
+        selected=self.selected();options=self.selected_options()
+        if not selected and not options:self.status.setText('请先勾选参数或下拉选项');return
         if not self.owner.settings.ready() and not self.owner.configure_api():return
         settings=self.owner.settings
         def run(progress):
+            # Side by side, so up to two sets of three batches; a 429 on either slows both.
+            slowdown=threading.Event();lock=threading.Lock();shown={}
+            def side(items,title,**options):
+                def update(done,total):
+                    with lock:shown[title]=f'{title} {done}/{total}';progress('，'.join(shown.values()))
+                if not items:return {},''
+                try:return translate_names(items,settings.key,settings.base_url,settings.model,progress=update,service=settings.service,usage=self.owner.record_usage,slowdown=slowdown,**options),''
+                except TranslationError as e:return e.partial,str(e)
             # The parameter prompt carries the 31-byte limit and AE's usual wording; category names the effect for context.
-            items=[{'id':r['id'],'sourceName':r['name'],'category':'所属效果 '+r['effectMatchName']} for r in selected]
-            try:return translate_names(items,settings.key,settings.base_url,settings.model,progress=lambda n,total:progress(f'参数翻译 {n}/{total}'),service=settings.service,usage=self.owner.record_usage,system_prompt=PARAMETER_PROMPT),''
-            except TranslationError as e:return e.partial,str(e)
+            labels=[{'id':r['id'],'sourceName':r['name'],'category':'所属效果 '+r['effectMatchName']} for r in selected]
+            dropdowns=[{'id':r['id'],'sourceName':r['source'],'category':f"{r['effectMatchName']} / {r['popup']['name']}；整组选项预算 {r['popup']['capacity']} {r['popup'].get('encoding','utf8')}字节（含分隔符）"} for r in options]
+            with ThreadPoolExecutor(2) as pool:
+                names=pool.submit(side,labels,'参数翻译',system_prompt=PARAMETER_PROMPT)
+                choices=pool.submit(side,dropdowns,'下拉选项翻译',system_prompt=POPUP_PROMPT,_text_validator=validate_option)
+                return (*names.result(),*choices.result())
         def done(result):
-            names,error=result;valid={};failures=[]
+            names,error,choices,choice_error=result;valid={};failures=[]
             for key,name in names.items():
                 try:valid[key]=validate_label(name)
                 except ValueError:failures.append(key)
-            self.owner.parameter_pending.update(valid);self.owner.save_parameters();self.loaded({'parameters':self.rows});self.status.setText(f'已翻译 {len(valid)} 项；查看候选后应用。'+(f'{len(failures)} 项名称过长，请手动缩短。' if failures else '')+error)
+            self.owner.parameter_pending.update(valid);self.owner.save_parameters()
+            pending=self.popup_stores()[0];pending.values.update(choices);message=pending.save() if choices else ''
+            self.refresh_values();over=[]
+            for popup in self.popups:
+                texts=[pending.values.get(option_key(popup,i),'').strip() or popup['currentOptions'][i] for i in range(len(popup['options']))]
+                try:pack_translation(popup['original'],texts,popup.get('encoding','utf8'))
+                except ValueError:over.append(popup['name'])
+            self.status.setText(f'已翻译 {len(valid)} 个参数'+(f'、{len(choices)} 个下拉选项' if options else '')+'；查看候选后应用。'+(f'{len(failures)} 项名称过长，请手动缩短。' if failures else '')
+                                +(f'{len(over)} 个下拉参数的译文超出原文字节容量（{"、".join(over[:3])}），请缩短。' if over else '')+error+(choice_error if choice_error!=error else '')+message)
         self.owner.work(run,done)
     def apply(self):
         names={r['id']:self.owner.parameter_pending.get(r['id'],'') for r in self.selected() if self.owner.parameter_pending.get(r['id'],'').strip()}
-        skipped=len(self.selected())-len(names)
-        if not names:self.status.setText('勾选的参数还没有中文候选，请先翻译或双击“中文候选”填写');return
-        scope=self.read_scope
-        # Written from the heap-only structure when that is what is cached (strict guards unchanged); a background
-        # full scan then covers anything outside the default heap.
-        def work(progress):return self.owner.parameter_session.apply(names,progress,full=False),read_parameters(expected_image=self.owner.space.exe,scope=scope)
+        skipped=len(self.selected())-len(names);popups,problems=self.popup_values()
+        # What AE already shows needs no write. Copies with different names are written, in case one is a new instance.
+        ready={r['id'] for r in self.selected() if r['id'] in names and r['name']==names[r['id']] and not r.get('mixedNames')}
+        for key in ready:del names[key]
+        if not names and not popups:
+            pending=ready or any(self.candidate(r).strip() for r in self.selected_options())
+            self.status.setText('；'.join(problems)+'。请缩短译文' if problems else ('勾选的项目都已是目标文字，无需写入。'+(REFRESH_NOTE if self.popups else '')) if pending else '勾选的参数和下拉选项还没有中文候选，请先翻译或双击“中文候选”填写');return
+        scope=self.read_scope;binding=self.popup_report;extra=self.popup_reader()
+        # Written from the heap-only structure when that is what is cached (strict guards unchanged). Choices go first:
+        # they check the project their last read saw.
+        def work(progress):
+            choice,choice_error=None,'';started=time.perf_counter()
+            if popups:
+                try:choice=self.owner.popup_session.apply(popups,binding,progress)
+                except Exception as error:choice_error=str(error)
+            choices_done=time.perf_counter()
+            operation=self.owner.parameter_session.apply(names,progress,full=False) if names else None
+            labels_done=time.perf_counter();report=read_parameters(expected_image=self.owner.space.exe,scope=scope,extra=extra)
+            record_read_timing({'event':'apply','labels':len(names),'popups':len(popups),'popupMs':(choices_done-started)*1000,'labelMs':(labels_done-choices_done)*1000,'readMs':(time.perf_counter()-labels_done)*1000})
+            return operation,choice,choice_error,report
         def done(result):
-            operation,report=result;self.loaded(report);same=operation.get('unchanged',0);written=operation['parameters']-same
-            if operation.get('heapOnly'):self.owner.schedule_completion(names)
-            self.status.setText(f"已应用 {written} 个参数名称，{same} 项已为目标名称，{skipped} 项无候选已跳过；请在 AE 原有控件中调节。")
-            self.owner.toast.notify('参数处理完成',f"已应用 {written} 项，{same} 项无需修改")
-        self.writing=set(names);self.owner.work(work,done)
+            operation,choice,choice_error,report=result;self.read_done(report);parts=[];counts=[]
+            if operation:
+                same=operation.get('unchanged',0)+len(ready);written=operation['parameters']-operation.get('unchanged',0);counts.append(f'参数 {written} 项')
+                parts.append(f"已应用 {written} 个参数名称，{same} 项已为目标名称，{skipped} 项无候选已跳过；请在 AE 原有控件中调节。")
+                if operation.get('mixed'):
+                    shown='、'.join(split_identity(k)[1] for k in operation['mixed'][:3])+(f" 等 {len(operation['mixed'])} 个" if len(operation['mixed'])>3 else '')
+                    parts.append(f"{shown}参数的各副本名称不同（插件自行改名），无法确定原名，已跳过。")
+            if choice:parts.append(f"已应用 {choice['parameters']} 个下拉参数的选项；"+REFRESH_NOTE);counts.append(f"下拉参数 {choice['parameters']} 个")
+            if choice_error:parts.append('下拉选项未应用：'+choice_error)
+            if problems:parts.append('未应用（超出原文字节容量）：'+'；'.join(problems))
+            self.status.setText(' '.join(parts));self.owner.toast.notify('参数处理完成','、'.join(counts) or '没有写入')
+        self.writing=set(names)|{r['id'] for r in self.selected_options() if r['popup']['id'] in popups};self.owner.work(work,done)
         if self.owner.busy():self.breather.start()
         else:self.writing=set()
     def stop_writing(self):
         if self.writing:self.writing=set();self.breather.stop()
-    def restore(self):self.restore_keys([r['id'] for r in self.selected()])
-    def restore_all(self):self.restore_keys(None)
-    def restore_keys(self,keys):
-        scope=self.read_scope
-        def work(progress):return self.owner.parameter_session.restore(keys,progress),read_parameters(expected_image=self.owner.space.exe,scope=scope)
+    def restore(self):self.restore_keys([r['id'] for r in self.selected()],sorted({r['popup']['id'] for r in self.selected_options()}))
+    def restore_all(self):self.restore_keys(None,None)
+    def restore_keys(self,keys,popup_keys=()):
+        """A checked choice restores its whole dropdown parameter: AE keeps the choices as one string."""
+        scope=self.read_scope;extra=self.popup_reader()
+        def work(progress):
+            operation=self.owner.parameter_session.restore(keys,progress) if keys is None or keys else {}
+            choice={}
+            if popup_keys is None or popup_keys:
+                try:choice=self.owner.popup_session.restore(popup_keys,progress)
+                except Exception as error:choice={'error':str(error)}
+            return operation,choice,read_parameters(expected_image=self.owner.space.exe,scope=scope,extra=extra)
         def done(result):
-            operation,report=result;self.loaded(report);self.status.setText(f"已恢复 {operation.get('restored',0)} 个参数；{operation.get('pending',0)} 个未加载参数保留恢复记录。")
-            self.owner.toast.notify('已恢复参数原名',f"已恢复 {operation.get('restored',0)} 个参数标签")
+            operation,choice,report=result;self.read_done(report)
+            text=f"已恢复 {operation.get('restored',0)} 个参数；{operation.get('pending',0)} 个未加载参数保留恢复记录。"
+            if choice.get('parameters'):text+=f" 已恢复 {choice['parameters']} 个下拉参数的选项；"+REFRESH_NOTE
+            if choice.get('pending'):text+=f" {choice['pending']} 个未加载的下拉参数保留恢复记录。"
+            if choice.get('error'):text+=' 下拉选项未恢复：'+choice['error']
+            self.status.setText(text)
+            self.owner.toast.notify('已恢复参数原名',f"已恢复 {operation.get('restored',0)} 个参数标签"+(f"、{choice['parameters']} 个下拉参数" if choice.get('parameters') else ''))
         self.owner.work(work,done)
 
     # The record: every parameter of this AE version that has a Chinese candidate, readable without AE.
@@ -293,7 +424,7 @@ class ParameterPanel(QWidget):
         labels=getattr(self.owner,'parameter_labels',None)
         if labels is None:return
         before=dict(labels)
-        for row in self.rows:
+        for row in self.params:
             if row['name'] and row['name']!=self.owner.parameter_pending.get(row['id']):labels.setdefault(row['id'],row['name'])
         if labels!=before:
             message=self.owner.parameter_labels_store.save()
@@ -344,7 +475,7 @@ class ParameterPanel(QWidget):
     def refresh_project_checks(self):
         """The project view shows the same checks; redraw them without touching its filters."""
         self.filling=True
-        for i,row in enumerate(self.rows):self.table.item(i,0).setCheckState(Qt.CheckState.Checked if row['id'] in self.owner.parameter_enabled else Qt.CheckState.Unchecked)
+        for i,row in enumerate(self.rows):self.table.item(i,0).setCheckState(Qt.CheckState.Checked if self.is_checked(row) else Qt.CheckState.Unchecked)
         self.filling=False;self.update_counts()
     def history_changed(self,item):
         if self.history_filling or item.column() not in (H_CHECK,H_CHINESE):return

@@ -4,7 +4,7 @@ from pathlib import Path
 import cpu_check
 
 root=Path(cpu_check.__file__).resolve().parent
-SHIPPED=('ae_parameters_v6.dll','ae_parameters_v7.dll','ae_parameters_v8.dll','ae_parameters_v9.dll','ae_probe.dll','ae_scan_v1.dll')
+SHIPPED=('ae_parameters_v6.dll','ae_parameters_v7.dll','ae_parameters_v8.dll','ae_parameters_v9.dll','ae_popup_v1.dll','ae_popup_v2.dll','ae_probe.dll','ae_scan_v1.dll')
 
 class KindTests(unittest.TestCase):
     def test_extensions_are_named(self):

@@ -127,18 +127,54 @@ class Registry:
             # lea rax,[rcx+field]; ret
             if p.read(self.base+rva,5)!=bytes((0x48,0x8d,0x41,start,0xc3)):raise RuntimeError('AE 名称字段接口校验失败，未执行写入')
         self.manager=p.u64(self.base+self.profile.manager)
+    def check_session(self):
+        """Cheap per-group checks inside a single already hash-verified write batch."""
+        self.p.ensure_alive()
+        names={'flt.dll','tdb.dll','u.dll'}
+        def identity(modules):
+            return sorted((m['name'].casefold(),m['base'],str(Path(m['path'])).casefold()) for m in modules if m['name'].casefold() in names)
+        if identity(self.p.modules())!=identity(self.modules):raise RuntimeError('AE 模块在批量操作期间发生变化')
+        if self.p.u64(self.base+self.profile.manager)!=self.manager:raise RuntimeError('AE 效果目录管理器在批量操作期间发生变化')
+        for rva,(start,_) in zip((self.profile.name_get,self.profile.match_get,self.profile.category_get),fc_fields(self.profile)):
+            if self.p.read(self.base+rva,5)!=bytes((0x48,0x8d,0x41,start,0xc3)):raise RuntimeError('AE 名称字段接口在批量操作期间发生变化')
     def records(self):
         try:addresses=catalog_addresses(self.p,self.profile,self.manager+self.profile.registry_vector)
         except ValueError:raise RuntimeError('AE 效果目录结构不符，未执行写入') from None
-        rows=[self.read_record(address) for address in addresses if address]
+        addresses=[address for address in addresses if address]
+        # Read nearby catalog objects together, but never substitute cached bytes
+        # for a process read. Legacy AE stores these objects inline in one list.
+        size=fc_size(self.profile);ordered=sorted(set(addresses));blocks={};run=[]
+        def fetch():
+            if not run:return
+            if len(run)>1:
+                start=run[0];length=run[-1]+size-start
+                try:
+                    raw=self.p.read(start,length)
+                    if len(raw)!=length:raise RuntimeError('效果目录读取不完整')
+                except (OSError,RuntimeError):pass # sparse/unreadable gap: original individual reads below
+                else:
+                    for address in run:blocks[address]=raw[address-start:address-start+size]
+        for address in ordered:
+            if run and (not 0<=address-run[-1]-size<=64 or address+size-run[0]>262144):fetch();run=[]
+            run.append(address)
+        fetch()
+        cache=getattr(self,'_record_cache',{})
+        self._record_cache={address:cache[address] for address in ordered if address in cache}
+        rows=[self.read_record(address,blocks.get(address)) for address in addresses]
         # Effects AE reports without an internal name -- empty, or bytes this build cannot read (seen on AE 2021) --
         # cannot be told apart, renamed or restored, so they are left out, untouched, and only listed in `unnamed`.
         base=fc_fields(self.profile)[0][0] # the guard keeps the bytes before the name, then the internal name
         bare=[nameless(r['guard'][base:base+32],match_encoding(self.profile)) for r in rows]
         self.unnamed=[r['displayName'] for r,b in zip(rows,bare) if b]
         return [r for r,b in zip(rows,bare) if not b]
-    def read_record(self,address):
-        data=self.p.read(address,fc_size(self.profile))
+    def read_record(self,address,data=None):
+        if data is None:data=self.p.read(address,fc_size(self.profile))
+        cache=getattr(self,'_record_cache',None)
+        if cache is None:self._record_cache=cache={}
+        previous=cache.get(address)
+        # Full raw equality includes type, names, identifiers and category.
+        # The cache belongs to this Registry operation, never another host/session.
+        if previous and previous[0]==data:return dict(previous[1])
         if not fc_object(self.profile,self.base,data):raise RuntimeError('AE 效果目录对象类型不符，未执行写入')
         fields=[];spans=fc_fields(self.profile)
         for start,end_field in spans:
@@ -146,7 +182,8 @@ class Registry:
             if b'\0' not in raw:raise RuntimeError('AE 效果名称字段未终止，未执行写入')
             # The internal name is read the way AE reads it (see Profile.match_encoding), so keys match AE's own.
             fields.append(decode_name(raw,match_encoding(self.profile) if start==spans[1][0] else self.profile.encoding))
-        return {'address':address,'nameAt':address+spans[0][0],'displayName':fields[0],'matchName':fields[1],'category':fields[2],'guard':fc_guard(self.profile,data)}
+        row={'address':address,'nameAt':address+spans[0][0],'displayName':fields[0],'matchName':fields[1],'category':fields[2],'guard':fc_guard(self.profile,data)}
+        cache[address]=(data,dict(row));return row
     def unchanged(self,row):
         # One catalog snapshot is taken before a batch; each object is then re-read just before its write.
         now=self.read_record(row['address'])
