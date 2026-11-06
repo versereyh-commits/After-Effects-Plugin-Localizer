@@ -13,19 +13,19 @@ from PySide6.QtWidgets import (QAbstractItemView,QApplication,QCheckBox,QComboBo
 
 # Tokens: one ink, one paper, greys between. Colour appears only for errors.
 # Dark mode swaps the two: chalk on slate, the ink blocks turn light with dark text on them.
-LIGHT=dict(INK='#18181b',INK_2='#3f3f46',MUTED='#6b6b74',FAINT='#a1a1aa',LINE='#e4e4e7',LINE_SOFT='#efeff1',
+LIGHT=dict(FACE_BODY='#000000',FACE_FEATURE='#ffffff',INK='#18181b',INK_2='#3f3f46',MUTED='#6b6b74',FAINT='#a1a1aa',LINE='#e4e4e7',LINE_SOFT='#efeff1',
            CANVAS='#f4f4f5',PAPER='#ffffff',HOVER='#f4f4f5',SELECT='#ececef',DANGER='#b42318',DANGER_HOVER='#9a1c13',
            ON_INK='#ffffff',ON_INK_MUTED='#a1a1aa',INK_HOVER='#2c2c31',INK_PRESS='#000000',INK_DIVIDER='#3f3f46',
            BORDER_HOVER='#c9c9cf',BUTTON_HOVER='#fafafa',ROW_HOVER='#f8f8f9',CARD_HOVER='#f7f7f8',SCROLL='#d4d4d8',BOX='#b8b8c0',TILE_HOVER='#d4d4d8',
            INK_DISABLED='#d9d9de',ON_INK_DISABLED='#f6f6f7',CHECK_DISABLED='#a1a1aa',TIP_KEY_FG='#d4d4d8',TIP_KEY_BG='#2f2f35',
            SHADOW_RGB=(24,24,27),SHADOW_GAIN=1.0)
-DARK=dict(INK='#ececee',INK_2='#c4c4ca',MUTED='#9a9aa3',FAINT='#6e6e77',LINE='#34343a',LINE_SOFT='#2a2a2f',
+DARK=dict(FACE_BODY='#ffffff',FACE_FEATURE='#000000',INK='#ececee',INK_2='#c4c4ca',MUTED='#9a9aa3',FAINT='#6e6e77',LINE='#34343a',LINE_SOFT='#2a2a2f',
           CANVAS='#131316',PAPER='#1c1c20',HOVER='#26262b',SELECT='#2e2e34',DANGER='#ec5d61',DANGER_HOVER='#f2777a',
           ON_INK='#18181b',ON_INK_MUTED='#6b6b74',INK_HOVER='#d4d4d8',INK_PRESS='#ffffff',INK_DIVIDER='#c4c4ca',
           BORDER_HOVER='#4a4a52',BUTTON_HOVER='#232327',ROW_HOVER='#222226',CARD_HOVER='#232327',SCROLL='#3f3f46',BOX='#55555d',TILE_HOVER='#4a4a52',
           INK_DISABLED='#3a3a40',ON_INK_DISABLED='#6b6b74',CHECK_DISABLED='#55555d',TIP_KEY_FG='#3f3f46',TIP_KEY_BG='#d4d4d8',
           SHADOW_RGB=(0,0,0),SHADOW_GAIN=2.6)
-INK=INK_2=MUTED=FAINT=LINE=LINE_SOFT=CANVAS=PAPER=HOVER=SELECT=DANGER=DANGER_HOVER=ON_INK=ON_INK_MUTED=INK_HOVER=INK_PRESS=INK_DIVIDER=''
+FACE_BODY=FACE_FEATURE=INK=INK_2=MUTED=FAINT=LINE=LINE_SOFT=CANVAS=PAPER=HOVER=SELECT=DANGER=DANGER_HOVER=ON_INK=ON_INK_MUTED=INK_HOVER=INK_PRESS=INK_DIVIDER=''
 BORDER_HOVER=BUTTON_HOVER=ROW_HOVER=CARD_HOVER=SCROLL=BOX=TILE_HOVER=INK_DISABLED=ON_INK_DISABLED=CHECK_DISABLED=TIP_KEY_FG=TIP_KEY_BG=''
 SHADOW_RGB=(24,24,27);SHADOW_GAIN=1.0;DARK_MODE=False
 def set_theme(dark:bool):
@@ -36,6 +36,9 @@ def is_dark()->bool:return DARK_MODE
 def tone(role:str)->str:
     """The current value of a colour name such as 'INK_2'."""
     return (DARK if DARK_MODE else LIGHT)[role]
+def see_through(color:str,alpha:float)->str:
+    """A palette colour for a stylesheet, partly transparent."""
+    c=QColor(color);return f'rgba({c.red()},{c.green()},{c.blue()},{round(alpha*255)})'
 def shadow(alpha:float)->QColor:
     r,g,b=SHADOW_RGB;return QColor(r,g,b,max(0,min(255,int(alpha*SHADOW_GAIN))))
 set_theme(False)
@@ -136,6 +139,14 @@ def _draw(name,painter,color):
         painter.drawLine(QPointF(10,10.5),QPointF(10,16.5));painter.drawLine(QPointF(14,10.5),QPointF(14,16.5))
     elif name=='panel':
         painter.drawRoundedRect(QRectF(3,4.5,18,15),2.5,2.5);painter.drawLine(QPointF(3,9),QPointF(21,9));painter.drawLine(QPointF(9.5,9),QPointF(9.5,19.5))
+    elif name=='image':
+        painter.drawRoundedRect(QRectF(3.5,5,17,14),2.5,2.5);painter.drawEllipse(QPointF(8.5,9.8),1.5,1.5);_poly(painter,(3.8,16.5),(9,12.5),(12.5,15),(16,11.5),(20.2,15.5))
+    elif name=='history':
+        painter.drawArc(QRectF(4,4,16,16),60*16,300*16);_poly(painter,(12,8),(12,12.5),(15,14));_poly(painter,(3.5,5),(4.2,9.4),(8.6,8.4))
+    elif name=='plus':painter.drawLine(QPointF(12,5),QPointF(12,19));painter.drawLine(QPointF(5,12),QPointF(19,12))
+    elif name=='close':painter.drawLine(QPointF(6.5,6.5),QPointF(17.5,17.5));painter.drawLine(QPointF(17.5,6.5),QPointF(6.5,17.5))
+    elif name=='back':_poly(painter,(14.5,6),(8.5,12),(14.5,18))
+    elif name=='copy':painter.drawRoundedRect(QRectF(8.5,8.5,11.5,11.5),2,2);_poly(painter,(15.5,8.5),(15.5,4),(4,4),(4,15.5),(8.5,15.5))
     elif name=='plug':
         _poly(painter,(8,3),(8,8));_poly(painter,(16,3),(16,8));_poly(painter,(5,8),(19,8),(19,12),(15.5,16),(8.5,16),(5,12),closed=True);painter.drawLine(QPointF(12,16),QPointF(12,21))
 
@@ -417,6 +428,43 @@ QLabel#navCount[active="true"] {{ color:{ON_INK_MUTED}; }}
 QLabel#navCount[alert="true"] {{ color:{PAPER}; background:{DANGER}; border-radius:9px; padding:0 6px; font-weight:600; }}
 QFrame#hostCard {{ background:{CANVAS}; border-radius:16px; }}
 QLabel#hostTitle {{ font-weight:600; }}
+QFrame#aiDrawer {{ background:transparent; border:none; }}
+QScrollArea#aiScroll,QWidget#aiFeed {{ background:transparent; }}
+QFrame#aiMine {{ background:{INK}; border-radius:14px; }}
+QFrame#aiComposer {{ background:{see_through(CANVAS,.62)}; border:1px solid {LINE}; border-radius:16px; }}
+QFrame#aiComposer[focused="true"] {{ border-color:{BORDER_HOVER}; }}
+QPushButton#aiChip {{ background:transparent; border:none; border-radius:9px; padding:3px 4px; font-size:11px; color:{MUTED}; min-height:20px; }}
+QPushButton#aiChip:hover {{ background:{HOVER}; color:{INK}; }}
+QPushButton#aiChip[alarm="true"] {{ color:{DANGER}; }}
+QFrame#aiPop {{ background:{PAPER}; border:1px solid {LINE}; border-radius:10px; }}
+QFrame#aiPopRow {{ background:transparent; border-radius:7px; }}
+QFrame#aiPopRow:hover {{ background:{HOVER}; }}
+QLabel#aiPopTitle {{ font-size:12px; color:{INK}; }}
+QLabel#aiPopTitle:disabled {{ color:{FAINT}; }}
+QLabel#aiPopNote {{ font-size:11px; color:{MUTED}; }}
+QLineEdit#aiPopSearch {{ font-size:12px; min-height:20px; padding:2px 8px; border:none; border-bottom:1px solid {LINE}; border-radius:0; background:transparent; margin-bottom:2px; }}
+QFrame#aiRow {{ background:transparent; border-radius:10px; }}
+QFrame#aiRow:hover {{ background:{HOVER}; }}
+QFrame#aiRow[current="true"] {{ background:{SELECT}; }}
+QLabel#aiRowTitle {{ color:{INK}; }}
+QLabel#aiGreeting {{ font-size:20px; font-weight:600; }}
+QPushButton#aiSuggest {{ background:transparent; border:1px solid {LINE}; border-radius:12px; padding:6px 12px; min-height:20px; text-align:left; color:{INK_2}; }}
+QPushButton#aiSuggest:hover {{ background:{HOVER}; border-color:{BORDER_HOVER}; color:{INK}; }}
+QPushButton#aiSteps {{ background:transparent; border:none; padding:2px 0; text-align:left; font-size:12px; color:{MUTED}; }}
+QPushButton#aiSteps:hover {{ color:{INK}; }}
+QToolButton#aiIcon {{ background:transparent; border:none; border-radius:8px; padding:5px; }}
+QToolButton#aiIcon:hover {{ background:{HOVER}; }}
+QLabel#aiDivider {{ color:{FAINT}; font-size:11px; }}
+QFrame#aiChoice {{ background:{see_through(PAPER,.6)}; border:1px solid {LINE}; border-radius:12px; }}
+QFrame#aiChoice:hover {{ background:{HOVER}; border-color:{BORDER_HOVER}; }}
+QLabel#aiChoiceTitle {{ color:{INK}; font-weight:600; background:transparent; }}
+QLabel#aiChoiceNote {{ color:{MUTED}; font-size:12px; background:transparent; }}
+QLabel#aiThumb {{ border:1px solid {LINE}; border-radius:6px; }}
+QLabel#aiMineText {{ color:{ON_INK}; }}
+QFrame#aiReply {{ background:transparent; }}
+QLabel#aiReplyText {{ color:{INK}; }}
+QFrame#aiCard {{ background:{PAPER}; border:1px solid {BORDER_HOVER}; border-radius:12px; }}
+QTextEdit#aiInput {{ background:transparent; border:none; padding:0; color:{INK}; }}
 QLabel#navFoot {{ color:{FAINT}; font-size:11px; }}
 
 QLabel#pageTitle {{ font-size:22px; font-weight:600; }}

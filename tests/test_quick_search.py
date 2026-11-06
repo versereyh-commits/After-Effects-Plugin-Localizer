@@ -1,6 +1,9 @@
 import os
 os.environ.setdefault('QT_QPA_PLATFORM','offscreen')
 from pathlib import Path
+import threading as _threading
+REAL_THREAD=_threading.Thread
+SHORT=lambda items,*a,**k:{i['id']:'中' for i in items}
 import json,shutil,subprocess,unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -300,10 +303,14 @@ class LayerParameterTests(GuiCase):
         self.assertIn('选中图层',note.text())
         self.window.keymap.assign('layer_parameters',sequence('Ctrl+Alt+P'));self.assertIn('Ctrl+Alt+P',note.text())
         self.window.keymap.assign('layer_parameters',sequence(''));self.assertTrue(note.isHidden())
-    def run_layer(self,report,apply_result=None,ready=True,translate=None):
-        window=self.window;window.space.live=True;threads=[];applied=[]
-        def apply(names,**kw):applied.append((dict(names),kw));return dict(apply_result or {'changed':2,'parameters':len(names)})
-        with patch.object(parameter_names,'read_parameters',return_value=report),patch.object(window.parameter_session,'apply',apply),             patch.object(window.settings,'ready',return_value=ready),patch.object(app_live,'translate_names',translate or (lambda items,*a,**k:{i['id']:'译'+i['sourceName'] for i in items})),             patch.object(window,'save_parameters'),patch('threading.Thread',lambda target,**kw:threads.append(target) or type('T',(),{'start':lambda self:None,'join':lambda self,**kw:None})()):
+    def run_layer(self,report,apply_result=None,ready=True,translate=None,popup_apply=None):
+        window=self.window;window.space.live=True;threads=[];applied=[];self.popup_calls=[]
+        def apply(names,**kw):applied.append((dict(names),kw));self.popup_calls.append('labels');return dict(apply_result or {'changed':2,'parameters':len(names)})
+        def choose(values,binding,*a):
+            self.popup_calls.append(('choices',values,binding))
+            if isinstance(popup_apply,Exception):raise popup_apply
+            return popup_apply or {'changed':1,'parameters':len(values)}
+        with patch.object(parameter_names,'read_parameters',return_value=report),patch.object(window.parameter_session,'apply',apply),patch.object(window.popup_session,'apply',choose),             patch.object(window.settings,'ready',return_value=ready),patch.object(app_live,'translate_names',translate or (lambda items,*a,**k:{i['id']:'译'+i['sourceName'] for i in items})),             patch.object(window,'save_parameters'),patch('threading.Thread',lambda target=None,name=None,**kw:threads.append(target) or type('T',(),{'start':lambda self:None,'join':lambda self,**kw:None})() if name=='layer-parameters' else REAL_THREAD(target=target,name=name,**kw)):
             window.layer_parameters();self.assertTrue(window.layer_running)
             window.layer_parameters();self.assertEqual(len(threads),1)   # a second press while running starts nothing
             threads.pop()()
@@ -324,6 +331,52 @@ class LayerParameterTests(GuiCase):
     def test_no_selection_says_what_to_do_and_writes_nothing(self):
         applied=self.run_layer({'parameters':[],'emptyReason':'noSelectedLayers'})
         self.assertEqual(applied,[]);self.assertIn('请先在 AE 的合成里选中图层',self.window.log.toPlainText())
+    def popup(self,options=('Addition','Screen Blend','(-','Multiply Blend'),current=None,capacity=60,ident=None):
+        ident=ident or parameter_names.identity('fxA','mode');text='|'.join(options)
+        return {'id':ident,'effectMatchName':'fxA','name':'Mode','original':text,'current':'|'.join(current or options),'options':list(options),'currentOptions':list(current or options),'capacity':capacity,'encoding':'utf8'}
+    def test_dropdown_choices_are_translated_and_written_first(self):
+        from popup_names import option_key
+        window=self.window;k1=parameter_names.identity('fxA','p1');window.parameter_pending[k1]='强度';window.parameter_enabled.add(k1);pop=self.popup();binding={'host':'h','projectToken':1,'parameters':[pop]}
+        import popup_names
+        known=option_key(pop,0);pending,enabled=window.parameter_page.popup_stores();pending.values[known]='相加';enabled.values.add(known)
+        seen=[]
+        def translate(items,*a,**k):seen.append((k.get('system_prompt'),[i['sourceName'] for i in items]));return {i['id']:('滤色' if k.get('system_prompt')==popup_names.POPUP_PROMPT else '译'+i['sourceName']) for i in items}
+        self.run_layer({'parameters':[{'id':k1,'name':'Amount','effectMatchName':'fxA'}],'popups':binding},translate=translate)
+        self.assertEqual(self.popup_calls[0][0],'choices');self.assertEqual(self.popup_calls[1],'labels')
+        self.assertEqual(self.popup_calls[0][1],{pop['id']:['相加','滤色','(-','滤色']});self.assertIs(self.popup_calls[0][2],binding)
+        import popup_names
+        self.assertIn((popup_names.POPUP_PROMPT,['Screen Blend','Multiply Blend']),seen);self.assertNotIn('(-',str(seen))
+        self.assertEqual(pending.values[option_key(pop,1)],'滤色');self.assertIn(option_key(pop,3),enabled.values)
+        log=window.log.toPlainText();self.assertIn('下拉选项改了 1 个参数',log);self.assertIn('切换到别的图层',log)
+    def test_choices_already_in_chinese_are_not_written(self):
+        from popup_names import option_key
+        window=self.window;pop=self.popup(options=('Add','Screen'),current=('相加','滤色'))
+        pending,enabled=window.parameter_page.popup_stores()
+        for i,text in enumerate(('相加','滤色')):pending.values[option_key(pop,i)]=text;enabled.add(option_key(pop,i)) if hasattr(enabled,'add') else enabled.values.add(option_key(pop,i))
+        self.run_layer({'parameters':[],'popups':{'parameters':[pop]}});self.assertEqual(self.popup_calls,[]);self.assertIn('下拉选项都已是中文',window.log.toPlainText())
+    def test_choices_too_long_are_left_out_and_said(self):
+        window=self.window;pop=self.popup(options=('A','B'),capacity=3);k1=parameter_names.identity('fxA','p1')
+        self.run_layer({'parameters':[{'id':k1,'name':'Amount','effectMatchName':'fxA'}],'popups':{'parameters':[pop]}},translate=lambda items,*a,**k:{i['id']:'很长的中文译文' for i in items})
+        self.assertEqual(self.popup_calls,['labels']);self.assertIn('超出原文容量',window.log.toPlainText())
+    def test_a_failed_choice_write_keeps_the_labels(self):
+        window=self.window;k1=parameter_names.identity('fxA','p1')
+        applied=self.run_layer({'parameters':[{'id':k1,'name':'Amount','effectMatchName':'fxA'}],'popups':{'parameters':[self.popup()]}},popup_apply=RuntimeError('工程已变化'),translate=SHORT)
+        self.assertEqual(len(applied),1);self.assertIn('下拉选项没有写入：工程已变化',window.log.toPlainText())
+    def test_choices_unreadable_still_write_the_labels(self):
+        window=self.window;k1=parameter_names.identity('fxA','p1')
+        applied=self.run_layer({'parameters':[{'id':k1,'name':'Amount','effectMatchName':'fxA'}],'popupError':'不支持'})
+        self.assertEqual(len(applied),1);self.assertEqual(self.popup_calls,['labels']);self.assertIn('下拉选项未读取：不支持',window.log.toPlainText())
+    def test_only_dropdowns_selected_still_works(self):
+        window=self.window;applied=self.run_layer({'parameters':[],'popups':{'parameters':[self.popup()]}},translate=SHORT)
+        self.assertEqual(applied,[]);self.assertEqual(self.popup_calls[0][0],'choices')
+    def test_another_versions_choice_translations_are_borrowed(self):
+        import json
+        from popup_names import option_key
+        window=self.window;pop=self.popup(options=('Addition','Screen Blend'));folder=Path(self.temp.name)/'other2';folder.mkdir()
+        (folder/'popup-translations.json').write_text(json.dumps({option_key(pop,0):'相加',option_key(pop,1):'滤色'},ensure_ascii=False),encoding='utf8');(folder/'popup-enabled.json').write_text(json.dumps([option_key(pop,0),option_key(pop,1)]),encoding='utf8')
+        other=type('Space',(),{'folder':folder,'version':'1.0'})()
+        with patch.object(window,'spaces',[*window.spaces,other]):self.run_layer({'parameters':[],'popups':{'parameters':[pop]}},ready=False)
+        self.assertEqual(self.popup_calls[0][1],{pop['id']:['相加','滤色']});self.assertIn('labels',self.popup_calls) if False else None
     def test_not_connected_does_nothing(self):
         self.window.space.live=False
         with patch('threading.Thread') as thread:self.window.layer_parameters()

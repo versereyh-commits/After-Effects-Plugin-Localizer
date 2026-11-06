@@ -370,6 +370,7 @@ class ParameterPanel(QWidget):
             if choice_error:parts.append('下拉选项未应用：'+choice_error)
             if problems:parts.append('未应用（超出原文字节容量）：'+'；'.join(problems))
             self.status.setText(' '.join(parts));self.owner.toast.notify('参数处理完成','、'.join(counts) or '没有写入')
+            if counts:self.owner.assistant_note('helpless' if choice_error or problems or (operation and operation.get('mixed')) else 'done')
         self.writing=set(names)|{r['id'] for r in self.selected_options() if r['popup']['id'] in popups};self.owner.work(work,done)
         if self.owner.busy():self.breather.start()
         else:self.writing=set()

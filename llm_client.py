@@ -4,6 +4,7 @@ Most services speak the OpenAI chat-completions protocol; Claude uses Anthropic'
 Messages API. Every reply is validated the same way before any name is kept."""
 from __future__ import annotations
 import errno,json,socket,threading,time
+import encodings.idna   # looked up by name when a host name is resolved: a frozen build's worker thread reported "unknown encoding: idna" without this
 from concurrent.futures import FIRST_COMPLETED,ThreadPoolExecutor,wait as wait_any
 from dataclasses import dataclass,field
 from http.client import IncompleteRead
@@ -75,18 +76,31 @@ def check_endpoint(base_url:str):
     if parsed.scheme!='https' and not (parsed.scheme=='http' and parsed.hostname in ('127.0.0.1','localhost','::1')):
         raise ValueError('接口地址需要 HTTPS；本机接口（localhost）可使用 HTTP')
 
-def build_request(service:Provider,base_url:str,key:str,model:str,batch:list[dict],*,system_prompt=None,messages=None)->Request:
+def wire_messages(service:Provider,messages:list[dict])->list[dict]:
+    """Messages as the service expects them. An attached picture is {'media','data'} (base64) on the message."""
+    out=[]
+    for message in messages:
+        images=message.get('images')
+        if not images:out.append({'role':message['role'],'content':message['content']});continue
+        if service.protocol=='anthropic':parts=[{'type':'image','source':{'type':'base64','media_type':i['media'],'data':i['data']}} for i in images]+[{'type':'text','text':message['content']}]
+        else:parts=[{'type':'text','text':message['content']}]+[{'type':'image_url','image_url':{'url':f"data:{i['media']};base64,{i['data']}"}} for i in images]
+        out.append({'role':message['role'],'content':parts})
+    return out
+
+def build_request(service:Provider,base_url:str,key:str,model:str,batch:list[dict],*,system_prompt=None,messages=None,fields=None)->Request:
     content=json.dumps({'items':batch},ensure_ascii=False);headers={'Content-Type':'application/json'}
     system_prompt=SYSTEM_PROMPT if system_prompt is None else system_prompt
-    messages=[{'role':'user','content':content}] if messages is None else messages
+    messages=[{'role':'user','content':content}] if messages is None else wire_messages(service,messages)
     if service.protocol=='anthropic':
         body={'model':model,'max_tokens':service.max_tokens,'system':system_prompt,'messages':messages}
         headers.update({'x-api-key':key,'anthropic-version':'2023-06-01'});url=base_url.rstrip('/')+'/messages'
     else:
         body={'model':model,'messages':[{'role':'system','content':system_prompt},*messages],service.token_field:service.max_tokens,'stream':False,**service.extra}
         if service.json_mode:body['response_format']={'type':'json_object'}
+        if fields and 'thinking' in fields:body.pop('thinking',None)
         if key:headers['Authorization']='Bearer '+key
         url=base_url.rstrip('/')+'/chat/completions'
+    if fields:body.update(fields)
     return Request(url,data=json.dumps(body,ensure_ascii=False).encode('utf8'),headers=headers,method='POST')
 
 def analysis_turn(system_prompt,messages,config,*,wait=time.sleep,cancelled=None):
@@ -118,6 +132,107 @@ def analysis_turn(system_prompt,messages,config,*,wait=time.sleep,cancelled=None
             raise RuntimeError(f'{chosen.name} 分析响应格式无效或读取失败') from None
         if cancelled and cancelled():raise RuntimeError('AI 识别已取消')
         wait(2**attempt)
+
+class ChatError(RuntimeError):
+    """A failed assistant turn. kind: 'limit' (too many requests), 'network', 'service' or 'format'."""
+    def __init__(self,kind,message):
+        self.kind=kind;super().__init__(message)
+
+# Default is medium strength (the user's choice). 'off' remains for the summary request, which needs no thought.
+EFFORTS={'default':'默认','low':'低','high':'高','max':'Max'}
+def effort_fields(service:Provider,effort:str)->dict:
+    """What each service calls thinking strength. 'off' adds nothing: the service's own default stays. A model that
+    refuses these fields gets the request again without them (chat_turn)."""
+    if effort not in EFFORTS:return {}
+    budget={'low':2048,'default':6000,'high':16000,'max':32000}[effort]
+    # Most services have no level above high, and an unknown word would cost the thinking altogether (see chat_turn).
+    level={'default':'medium','max':'high'}.get(effort,effort)
+    if service.protocol=='anthropic':return {'thinking':{'type':'enabled','budget_tokens':budget},'max_tokens':budget+service.max_tokens}
+    if service.key=='deepseek':return {'thinking':{'type':'enabled'},'reasoning_effort':'max' if effort=='max' else level}
+    if service.key=='openrouter':return {'reasoning':{'effort':level}}
+    if service.key in ('qwen','siliconflow'):return {'enable_thinking':True,'thinking_budget':budget}
+    if service.key in ('zhipu','doubao'):return {'thinking':{'type':'enabled'}}
+    return {'reasoning_effort':level}
+
+_assistant_requests=threading.BoundedSemaphore(2)
+
+def _chat_response(request,opener,timeout,cancelled):
+    """Cancellation discards a late HTTP result. At most two bounded socket requests may remain in flight.
+
+    urllib cannot interrupt DNS/connect reliably. Only the socket worker is daemonic; it never calls UI,
+    stores conversation data, executes tools or retries. The actual agent remains joinable until safe.
+    """
+    def read():
+        with opener(request,timeout=timeout) as response:return response.read(1048577)
+    if cancelled is None:return read()
+    if cancelled():raise ChatError('stopped','已停止')
+    if not _assistant_requests.acquire(blocking=False):raise ChatError('network','先前请求仍在收尾，请稍后重试')
+    done=threading.Event();abandoned=threading.Event();box={}
+    def fetch():
+        try:box['value']=read()
+        except Exception as error:
+            if abandoned.is_set() and isinstance(error,HTTPError):error.close()
+            else:box['error']=error
+        finally:done.set();_assistant_requests.release()
+    threading.Thread(target=fetch,daemon=True,name='assistant-http').start()
+    deadline=time.monotonic()+timeout
+    while not done.wait(.05):
+        if cancelled() or time.monotonic()>=deadline:
+            abandoned.set()
+            raise ChatError('stopped','已停止') if cancelled() else TimeoutError('request deadline')
+    if cancelled():
+        error=box.get('error')
+        if isinstance(error,HTTPError):error.close()
+        raise ChatError('stopped','已停止')
+    if 'error' in box:raise box['error']
+    return box['value']
+
+def chat_turn(system_prompt,messages,config,*,wait=time.sleep,cancelled=None,usage=None,timeout=240,opener=urlopen,prompt_tokens=None,notice=None)->tuple[str,bool]:
+    """One assistant turn: the reply's text and whether the token limit cut it off. Only returns text; the caller
+    validates what it asks for. Slow failures retry like analysis_turn."""
+    chosen=provider(config['service']);key=config['key'].strip();model=config['model'].strip()
+    if chosen.needs_key and not key:raise ChatError('service','请先配置翻译模型的 API Key')
+    if not model:raise ChatError('service','请先填写模型名称')
+    try:check_endpoint(config['base_url'])
+    except ValueError as error:raise ChatError('service',str(error)) from None
+    fields=effort_fields(chosen,config.get('effort','off'));pictures=any(m.get('images') for m in messages);dropped=False
+    request=build_request(chosen,config['base_url'],key,model,[],system_prompt=system_prompt,messages=messages,fields=fields)
+    for attempt in range(3):
+        if cancelled and cancelled():raise ChatError('stopped','已停止')
+        try:
+            raw=_chat_response(request,opener,timeout,cancelled)
+            if len(raw)>1048576:raise ChatError('format','模型回复过大，已停止')
+            payload=json.loads(raw.decode('utf8'))
+            if usage:
+                try:usage(reply_tokens(payload))
+                except Exception:pass
+            if dropped and notice:notice('这个模型不支持所选的思考强度，这次按默认方式回答')
+            if prompt_tokens:
+                figures=payload.get('usage') if isinstance(payload,dict) else None
+                seen=(figures.get('prompt_tokens') or figures.get('input_tokens')) if isinstance(figures,dict) else None
+                if isinstance(seen,int) and seen>0:prompt_tokens(seen)
+            return reply_text(chosen,payload)
+        except HTTPError as error:
+            code=error.code;error.close()
+            # This model does not take the chosen thinking strength: ask again without it, and say so.
+            if code in (400,422) and fields:
+                fields=None;dropped=True;request=build_request(chosen,config['base_url'],key,model,[],system_prompt=system_prompt,messages=messages)
+                continue
+            if code in (400,413,415,422) and pictures:raise ChatError('vision',f'当前模型 {model} 没有接受图片（HTTP {code}）。可以换一个支持看图的模型再发。') from None
+            if code==429 and attempt==2:raise ChatError('limit',f'{chosen.name} 提示请求太频繁，请稍后再试') from None
+            if attempt==2 or not (code==429 or 500<=code<600):raise ChatError('service',f'{chosen.name} 请求失败（HTTP {code}），请检查接口、模型和余额') from None
+        except (URLError,TimeoutError,ConnectionError):
+            if attempt==2:raise ChatError('network',f'连接 {chosen.name} 失败或超时，请检查网络与接口地址') from None
+        except ChatError:raise
+        except (ValueError,KeyError,IndexError,TypeError,AttributeError,UnicodeError,IncompleteRead,OSError):
+            raise ChatError('format',f'{chosen.name} 的回复格式无效或读取失败') from None
+        if cancelled and cancelled():raise ChatError('stopped','已停止')
+        if cancelled and wait is time.sleep:
+            until=time.monotonic()+2**attempt
+            while time.monotonic()<until:
+                if cancelled():raise ChatError('stopped','已停止')
+                time.sleep(min(.05,max(0,until-time.monotonic())))
+        else:wait(2**attempt)
 
 def reply_text(service:Provider,payload:dict)->tuple[str,bool]:
     """The reply's text and whether the service cut it off at the token limit."""

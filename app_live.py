@@ -1,4 +1,9 @@
 from __future__ import annotations
+import sys
+import patch_loader
+APP_VERSION='1.4.3'
+# Before anything else is imported: a module the assistant corrected on this computer replaces the built-in one.
+if __name__=='__main__' and '--selftest-tls' not in sys.argv:patch_loader.install(APP_VERSION);patch_loader.run_main_override()
 from pathlib import Path
 from dataclasses import asdict
 from datetime import datetime
@@ -33,7 +38,6 @@ from ui_kit import confirm,choose,inform,ask_text,Prompt,SchemeDelegate,SchemeRo
 from ui_kit import (SHADOW,STATUS_MARK,Banner,DiamondDelegate,Breather,EmptyState,FadeStack,Legend,LoaderButton,MetricTile,UsageTile,NavRail,Pill,SearchField,Spinner,StatusTag,Surface,
                     button,divider,elastic,fade_in,icon,label,logo,menu_button,page_head,repolish,soft_path,table_style)
 
-APP_VERSION='1.4.2'
 APP_NAME='AE汉化工具'
 # Installed copies: the current folder name, and the folder older versions used (an upgrade keeps it).
 INSTALL_FOLDERS=('AE汉化工具','AE插件名称汉化')
@@ -508,7 +512,7 @@ def pick_parameters(parent,rows)->list[str]:return pick_effects(parent,rows,'参
 class Window(QMainWindow):
     task_finished=Signal(str)
     quick_result=Signal(object,object,float)   # quick search: entry, result dict or error text, seconds since Enter
-    layer_result=Signal(object,float,object,str)   # Shift+Space: result dict or error text, seconds, new translations, translation note
+    layer_result=Signal(object,float,object,str)   # Ctrl+Shift+Space: result dict or error text, seconds, new translations {'labels','choices'}, notes
     quick_params_result=Signal(object,object,float,str,object,str)   # its parameter names: entry, result or error, seconds, 'cache' / 'scan' / 'full', new translations, translation note
     def __init__(self):
         super().__init__();self._tasks={};self._stopping=threading.Event();self.task_finished.connect(self.task_done);self.setWindowTitle(f'{APP_NAME} {APP_VERSION}');self.resize(1400,880);self.setMinimumSize(1200,720)
@@ -576,6 +580,28 @@ class Window(QMainWindow):
         self.go(EFFECTS);self.update_buttons();QTimer.singleShot(100,self.start_scan)
         self.update_job=None;self.update_offer=None;self.pending_installer=None;self.reapplied_for=None;self.show_update_info()
         QTimer.singleShot(2500,self.auto_check_update);QTimer.singleShot(600,self.show_release_notice)
+        # The assistant reaches these through here: in the frozen program this file is __main__, not an importable module.
+        self.assistant_env={'version':APP_VERSION,'with_live':with_live,'open_scheme':open_scheme,'root':data_root()}
+        from assistant_panel import AssistantPanel
+        self.assistant=AssistantPanel(self);self.assistant.drawer.set_frosted(self.frosted_glass())
+        if patch_loader.safe_mode:self.setWindowTitle(self.windowTitle()+'（安全模式）')
+        if patch_loader.notice:self.log.appendPlainText(patch_loader.notice);self.toast.notify('安全模式' if patch_loader.safe_mode else 'AI 的修改已撤销',patch_loader.notice,error=True)
+        elif patch_loader.active():self.log.appendPlainText('正在使用 AI 打的补丁：'+'、'.join(patch_loader.active()))
+        QTimer.singleShot(1200,self.check_patches)
+    def check_patches(self):
+        """A patched start counts when the assistant can still work, not when a window appears: only it could repair anything later."""
+        if not patch_loader.active() or self._stopping.is_set():return
+        import patch_check
+        patch_check.health(self,self.patches_checked)
+    def patches_checked(self,ok,detail):
+        if ok:
+            patch_loader.started();state=patch_loader.trial_state(APP_VERSION)
+            if state:self.assistant.show_trial(state)
+            return
+        self.log.appendPlainText('AI 助手自检没有通过：'+detail);text=patch_loader.health_failed()
+        if text:self.log.appendPlainText(text);self.toast.notify('AI 的修改已撤销',text,error=True)
+    def assistant_note(self,key):
+        if hasattr(self,'assistant'):self.assistant.job_note(key)
     # What is new: shown once, the first time a new version opens; the settings page offers it again.
     def show_release_notice(self):
         seen=self.ui_preferences().get('seenVersion')
@@ -608,6 +634,12 @@ class Window(QMainWindow):
     def load_ui_preferences(self):ui_kit.set_motion(self.ui_preferences().get('motion',True) is not False)
     def save_motion(self,enabled):
         ui_kit.set_motion(enabled);self.save_ui_preference('motion',bool(enabled))
+    # Frosted glass behind the AI panel: on unless turned off; off, the panel is a plain colour and draws nothing of the page.
+    def frosted_glass(self)->bool:return self.ui_preferences().get('frostedGlass') is not False
+    def set_frosted_glass(self,on):
+        self.save_ui_preference('frostedGlass',bool(on))
+        assistant=getattr(self,'assistant',None)
+        if assistant is not None:assistant.drawer.set_frosted(bool(on))
     # Dark mode: off unless chosen; switches the whole interface at once, nothing is reloaded and AE is not touched.
     def set_dark_mode(self,on):
         on=bool(on);self.save_ui_preference('darkMode',on)
@@ -1067,7 +1099,9 @@ class Window(QMainWindow):
         self.motion_box=QCheckBox('界面动效');self.motion_box.setChecked(ui_kit.motion());self.motion_box.toggled.connect(self.save_motion);col.addWidget(self.motion_box)
         col.addWidget(label('加载动画、页面淡入与数字滚动。Windows 关闭“显示动画”时自动停用。','muted',True))
         self.dark_box=QCheckBox('深色模式');self.dark_box.setChecked(ui_kit.is_dark());self.dark_box.toggled.connect(self.set_dark_mode);col.addWidget(self.dark_box)
-        col.addWidget(label('深色背景、浅色文字，立即生效。','muted',True));col.addStretch();grid.addWidget(frame,0,2)
+        col.addWidget(label('深色背景、浅色文字，立即生效。','muted',True))
+        self.glass_box=QCheckBox('AI 面板毛玻璃');self.glass_box.setChecked(self.frosted_glass());self.glass_box.toggled.connect(self.set_frosted_glass);col.addWidget(self.glass_box)
+        col.addWidget(label('透出并模糊后面的页面。关闭后为纯色背景，更省资源。','muted',True));col.addStretch();grid.addWidget(frame,0,2)
         frame,col=self.settings_card('适配范围')
         self.scope_info=label('','field',True);col.addWidget(self.scope_info)
         col.addWidget(label(f'候选、勾选、方案和恢复记录保存在：\n{data_root()}','muted',True));col.addSpacing(6)
@@ -1482,11 +1516,13 @@ class Window(QMainWindow):
             finally:self.task_finished.emit(name)
         thread=threading.Thread(target=guarded,daemon=False,name=name);self._tasks[name]=(thread,space)
         for widget in self.buttons:widget.setEnabled(False)
+        if hasattr(self,'assistant'):self.assistant.job_started()
         thread.start();return True
     def task_done(self,name):
         task=self._tasks.pop(name,None)
         if task:task[0].join(timeout=.05)
         self.update_buttons()
+        if hasattr(self,'assistant') and not self.busy():self.assistant.job_finished()
         if self._stopping.is_set():QTimer.singleShot(0,self.close)
 
     def work(self,work,callback,failure=None):
@@ -1497,11 +1533,13 @@ class Window(QMainWindow):
         if self.next_loader:
             widget,kind,verb=self.next_loader;widget.setEnabled(True);widget.start(kind,verb);self.loading_button=widget
         if self.writing:self.breather.start()
+        if hasattr(self,'assistant'):self.assistant.job_started()
     def finished(self,job=None):
         if job is not None and job is not self.job:return
         if self.loading_button:self.loading_button.stop();self.loading_button=None
         if self.writing:self.writing=set();self.breather.stop()
         self.parameter_page.stop_writing();self.panel_page.finished();self.progress.hide();self.update_buttons();self.update_usage()
+        if hasattr(self,'assistant'):self.assistant.job_finished()
         if self.close_after or self._stopping.is_set():QTimer.singleShot(0,self.close)
     def update_buttons(self):
         if self.busy():return
@@ -1590,6 +1628,7 @@ class Window(QMainWindow):
         self.toast.notify('此 AE 版本不支持' if UNSUPPORTED in message else '操作未完成',message,error=True);self.status.setText(message);self.status.setToolTip(message)
         # A failure while closing cancels a pending install too, so a later close never starts it unasked.
         self.log.appendPlainText('操作未完成：'+message);self.close_after=False;self.pending_installer=None
+        if hasattr(self,'assistant'):self.assistant.job_failed()
         if self.pages.currentIndex()!=SETTINGS:self.unread+=1;self.update_nav()
     def start_scan(self):
         self.status.setText('正在读取插件名称资源……');self.work(lambda progress:scan(self.roots,lambda n,name:progress(f'已检查 {n} 个文件 · {name}')),self.show_scan)
@@ -2229,7 +2268,7 @@ class Window(QMainWindow):
         if failed:=operation.get('categoryErrors'):
             for problem in failed:self.log.appendPlainText('分类名称未应用：'+problem)
             self.toast.notify(f'{len(failed)} 个分类名称未应用','；'.join(failed)[:300],error=True)
-        if written or categories:self.needs_refresh=True
+        if written or categories:self.needs_refresh=True;self.assistant_note('helpless' if operation.get('categoryErrors') or operation.get('unwritable') else 'done')
         self.update_refresh_hint()
         self.status.setText('名称已写入 AE，图层效果标题已同步；目录请点击“刷新 AE 列表”' if written or instance_count else '分类名称已写入 AE；点击“刷新 AE 列表”后重新搜索' if categories else '没有需要写入的名称')
         self.show_reread(live,read_error)
@@ -2958,50 +2997,109 @@ class Window(QMainWindow):
         text=f'“选中图层参数改成中文”的快捷键 {key} 已被其他程序占用，在 AE 中按下不会生效。可在“设置与日志 → 快捷键”中改为其他组合'
         self.log.appendPlainText(text);self.toast.notify('快捷键被占用',text,error=True)
     def layer_parameters(self,ae_window=0):
-        """The layer-parameters key over AE: every parameter of the effects on AE's selected layers in Chinese.
-        Checked translations of this AE version first, then another version's for the same parameter, then (the
-        translation service set up) translated now and kept in this version's record; written like the parameter
-        page's Apply (heap-first with a background full check). Like that Apply, every instance of those parameters
-        in the project is renamed, not only the selected layers'."""
+        """The layer-parameters key over AE: every parameter of the effects on AE's selected layers in Chinese, their
+        dropdown choices included. Checked translations of this AE version first, then another version's for the same
+        parameter or choice, then (the translation service set up) translated now and kept in this version's record;
+        written like the parameter page's Apply, choices first. Like that Apply, every instance in the project is
+        renamed, not only the selected layers'."""
         if self.busy() or self._stopping.is_set():self.quick_notice('参数汉化','当前操作尚未完成，请稍候');return
         if self.layer_running:self.quick_notice('参数汉化','上一次还在进行，请稍候');return
         if not self.space.live:self.quick_notice('参数汉化','还没有连接 AE：请先在本软件中连接 AE',error=True);return
         import time
+        from concurrent.futures import ThreadPoolExecutor
         from parameter_names import read_parameters
-        known=self.quick_parameter_names(None);ready=self.settings.ready();settings=self.settings;image=self.space.exe
-        started=time.perf_counter();self.layer_running=True
+        from popup_names import POPUP_PROMPT,option_key,pack_translation,validate_option
+        known=self.quick_parameter_names(None);known_choices=self.quick_popup_names();ready=self.settings.ready();settings=self.settings;image=self.space.exe
+        reader=self.popup_session.reader('selected');started=time.perf_counter();self.layer_running=True
+        def translate(items,**options):
+            if not items or not ready:return {},''
+            try:return translate_names(items,settings.key,settings.base_url,settings.model,service=settings.service,usage=self.record_usage,cancelled=self._stopping.is_set,slowdown=slowdown,**options),''
+            except TranslationError as error:return error.partial,'翻译未全部完成：'+str(error)
+        slowdown=threading.Event()
         def run():
-            translated={};note=''
+            translated={'labels':{},'choices':{}};notes=[]
             try:
-                report=read_parameters(expected_image=image,scope='selected');rows=report.get('parameters',[])
-                if not rows:
+                report=read_parameters(expected_image=image,scope='selected',extra=reader);rows=report.get('parameters',[])
+                block=report.get('popups') or None;popups=block['parameters'] if block else []
+                if report.get('popupError'):notes.append('下拉选项未读取：'+report['popupError'])
+                if not rows and not popups:
                     reason={'noSelectedLayers':'请先在 AE 的合成里选中图层','noActiveComp':'请先打开一个合成并选中图层'}.get(report.get('emptyReason'),'选中的图层上没有可汉化的参数')
-                    self.layer_result.emit(reason,time.perf_counter()-started,{},'');return
+                    self.layer_result.emit(reason,time.perf_counter()-started,translated,'；'.join(notes));return
                 names={r['id']:known[r['id']] for r in rows if r['id'] in known}
                 todo=[{'id':r['id'],'sourceName':r['name'],'category':'所属效果 '+r['effectMatchName']} for r in rows if r['id'] not in names]
-                if todo and ready:
-                    try:raw=translate_names(todo,settings.key,settings.base_url,settings.model,service=settings.service,usage=self.record_usage,cancelled=self._stopping.is_set,system_prompt=PARAMETER_PROMPT)
-                    except TranslationError as error:raw=error.partial;note='翻译未全部完成：'+str(error)
-                    for key,name in raw.items():
-                        try:translated[key]=validate_label(name)
-                        except ValueError:pass
-                    names.update(translated)
-                elif todo:note=f'{len(todo)} 个参数还没有译名，翻译服务未设置，已跳过'
-                if not names:self.layer_result.emit(note or '没有可写入的译名',time.perf_counter()-started,translated,'');return
+                choices={};choice_todo=[]
+                for popup in popups:
+                    budget=f"{popup['effectMatchName']} / {popup['name']}；整组选项预算 {popup['capacity']} {popup.get('encoding','utf8')}字节（含分隔符）"
+                    for i,source in enumerate(popup['options']):
+                        if source.strip()=='(-':continue
+                        key=option_key(popup,i)
+                        if key in known_choices:choices[key]=known_choices[key]
+                        else:choice_todo.append({'id':key,'sourceName':source,'category':budget})
+                # Side by side, like the parameter page: a 429 on either slows both.
+                with ThreadPoolExecutor(2) as pool:
+                    labels=pool.submit(translate,todo,system_prompt=PARAMETER_PROMPT);options=pool.submit(translate,choice_todo,system_prompt=POPUP_PROMPT,_text_validator=validate_option)
+                    (raw,label_note),(raw_choices,choice_note)=labels.result(),options.result()
+                for key,name in raw.items():
+                    try:translated['labels'][key]=validate_label(name)
+                    except ValueError:pass
+                for key,text in raw_choices.items():
+                    source=next((item['sourceName'] for item in choice_todo if item['id']==key),None)
+                    try:translated['choices'][key]=validate_option(source,text) if source is not None else None
+                    except ValueError:pass
+                translated['choices']={k:v for k,v in translated['choices'].items() if v}
+                names.update(translated['labels']);choices.update(translated['choices'])
+                notes+=[n for n in {label_note,choice_note} if n]
+                missing=len(todo)+len(choice_todo)
+                if missing and not ready:notes.append(f'{missing} 个参数或下拉选项还没有译名，翻译服务未设置，已跳过')
+                # AE keeps a parameter's choices as one string: untranslated ones keep what AE shows now.
+                values={};same=0;over=[]
+                for popup in popups:
+                    texts=[popup['currentOptions'][i] if source.strip()=='(-' else choices.get(option_key(popup,i)) or popup['currentOptions'][i] for i,source in enumerate(popup['options'])]
+                    if texts==popup['currentOptions']:same+=1;continue
+                    try:pack_translation(popup['original'],texts,popup.get('encoding','utf8'));values[popup['id']]=texts
+                    except ValueError:over.append(popup['name'])
+                if over:notes.append('下拉选项译文超出原文容量，未写入：'+'、'.join(over[:3])+(f' 等 {len(over)} 个' if len(over)>3 else '')+'，可在参数页缩短')
+                if not names and not values:
+                    self.layer_result.emit('下拉选项都已是中文' if same and not over else '没有可写入的译名',time.perf_counter()-started,translated,'；'.join(notes));return
                 if self._stopping.is_set():raise RuntimeError('正在退出，未启动新的参数写入')
-                result=self.parameter_session.apply(names,full=False,skip_missing=True);result['names']=names
+                # Choices go first: they check the project their read saw.
+                choice=None;choice_error=''
+                if values:
+                    try:choice=self.popup_session.apply(values,block)
+                    except Exception as error:choice_error=str(error) or type(error).__name__
+                result=self.parameter_session.apply(names,full=False,skip_missing=True) if names else {'changed':0,'parameters':0}
+                result['names']=names;result['choices']=choice;result['choiceError']=choice_error;result['choicesSame']=same
             except Exception as error:result=str(error) or type(error).__name__
-            self.layer_result.emit(result,time.perf_counter()-started,translated,note)
+            self.layer_result.emit(result,time.perf_counter()-started,translated,'；'.join(notes))
         self.background('layer-parameters',run)
+    def quick_popup_names(self)->dict[str,str]:
+        """Checked dropdown-choice translations of this AE version, then another version's for the very same choice
+        (the key holds the effect, the parameter and AE's original text, so it only matches the same thing)."""
+        def checked(values,enabled):return {k:v.strip() for k,v in values.items() if isinstance(v,str) and v.strip() and k in enabled}
+        pending,enabled=self.parameter_page.popup_stores();names=checked(pending.values,enabled.values)
+        for space in self.spaces:
+            if space.folder==self.space.folder:continue
+            for key,value in checked(CandidateStore(space.folder/'popup-translations.json').values,CandidateStore(space.folder/'popup-enabled.json',keys=True).values).items():names.setdefault(key,value)
+        return names
     def layer_done(self,result,seconds,translated,note):
-        self.layer_running=False
-        if translated:
-            self.parameter_pending.update(translated);self.parameter_enabled.update(translated);self.save_parameters()
-            self.log.appendPlainText(f'已自动翻译选中图层的 {len(translated)} 个参数并保存到当前版本的参数记录')
+        self.layer_running=False;labels=translated.get('labels',{});choices=translated.get('choices',{})
+        if labels:
+            self.parameter_pending.update(labels);self.parameter_enabled.update(labels);self.save_parameters()
+            self.log.appendPlainText(f'已自动翻译选中图层的 {len(labels)} 个参数并保存到当前版本的参数记录')
+        if choices:
+            pending,enabled=self.parameter_page.popup_stores();pending.values.update(choices);enabled.values.update(choices)
+            for message in (pending.save(),enabled.save()):
+                if message:self.log.appendPlainText(message)
+            self.log.appendPlainText(f'已自动翻译 {len(choices)} 个下拉选项并保存到当前版本的记录')
+            self.parameter_page.refresh_values()
         if isinstance(result,dict):
-            same=result.get('unchanged',0);written=result.get('parameters',0)-same
-            text=f'选中图层的参数已改成中文：写入 {written} 个参数（{result.get("changed",0)} 处），{same} 个本来就是中文，{seconds:.2f} 秒'+(f'。{note}' if note else '')
-            self.log.appendPlainText(text);self.quick_notice('参数已汉化',text,error=bool(note))
+            same=result.get('unchanged',0);written=result.get('parameters',0)-same;choice=result.get('choices');problem=result.get('choiceError')
+            parts=[f'写入 {written} 个参数（{result.get("changed",0)} 处），{same} 个本来就是中文'] if result.get('names') else []
+            if choice:parts.append(f"下拉选项改了 {choice.get('parameters',0)} 个参数（切换到别的图层再回来才会显示）")
+            if result.get('choicesSame'):parts.append(f"{result['choicesSame']} 个下拉参数本来就是中文")
+            if problem:parts.append('下拉选项没有写入：'+problem)
+            text='选中图层的参数已改成中文：'+'，'.join(parts)+f'，{seconds:.2f} 秒'+(f'。{note}' if note else '')
+            self.log.appendPlainText(text);self.quick_notice('参数已汉化',text,error=bool(note or problem))
         else:
             text=f'选中图层的参数没有改成中文（{seconds:.2f} 秒）：{result}'+(f'。{note}' if note else '')
             self.log.appendPlainText(text);self.quick_notice('参数未汉化',text,error=True)
@@ -3158,6 +3256,10 @@ class Window(QMainWindow):
             event.ignore();self.hide()
             if not self.tray_told:self.tray_told=True;self.tray.showMessage(APP_NAME,'仍在托盘中运行，快速搜索可用。右键托盘图标可退出。',QSystemTrayIcon.MessageIcon.Information,4000)
             return
+        assistant=getattr(self,'assistant',None)
+        if assistant and (assistant.in_turn or (assistant.thread and assistant.thread.is_alive())):
+            self._stopping.set();assistant.stop();event.ignore();self.status.setText('正在等待 AI 助手当前操作安全收尾，完成后退出')
+            QTimer.singleShot(100,self.close);return
         if self.busy():
             self._stopping.set()
             event.ignore();self.status.setText('正在等待当前操作安全收尾，完成后退出');return
@@ -3171,6 +3273,7 @@ class Window(QMainWindow):
             event.ignore();self.close_after=True;self.work(lambda progress:self.restore_names(progress),self.exit_restored);return
         # A running update check is not waited for: it only reads, and its daemon thread ends with the program.
         event.accept();self.quick_key.close();self.layer_key.close();self.quick.hide()
+        if hasattr(self,'assistant'):self.assistant.shutdown()
         if self.tray:self.tray.hide()
         if self.pending_installer:self.launch_installer()
 
@@ -3187,7 +3290,7 @@ def tls_selftest(report:Path)->int:
     try:
         import ssl,urllib.request
         from updater import tls_context
-        ssl.create_default_context();tls_context();urllib.request.build_opener(urllib.request.HTTPSHandler())
+        ssl.create_default_context();tls_context();urllib.request.build_opener(urllib.request.HTTPSHandler());'example.com'.encode('idna')   # host names go through this codec
         report.write_text('ok',encoding='utf8');return 0
     except Exception as error:
         report.write_text(f'{type(error).__name__}: {error}',encoding='utf8');return 1
@@ -3198,9 +3301,12 @@ def main():
     # The stylesheet lives on the windows, not the application (ui_kit.restyle): a theme switch then restyles in a
     # fraction of the time. The application keeps no sheet at all -- one on both makes every restyle slower still.
     apply_theme(app,'',ui_kit.is_dark());ui_kit.install(app);ui_kit.restyle(app,ui_kit.stylesheet())
+    if patch_loader.SELFTEST in sys.argv:
+        import patch_check
+        at=sys.argv.index(patch_loader.SELFTEST);patch_check.run_child(Window,Path(sys.argv[at+1]),Path(sys.argv[at+2]))
     # One copy at a time: a second start (Start menu, while this one sits in the tray) shows the running window and exits.
     from PySide6.QtNetwork import QLocalServer,QLocalSocket
-    name='AE-Localizer-'+(os.environ.get('USERNAME') or 'user')
+    name='AE-Localizer-'+(os.environ.get('USERNAME') or 'user')+'-'+patch_loader.instance_tag()
     other=QLocalSocket();other.connectToServer(name)
     if other.waitForConnected(300):
         other.write(b'show');other.flush();other.waitForBytesWritten(300);other.disconnectFromServer();return

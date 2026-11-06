@@ -26,6 +26,15 @@ for stale in (root/"native").glob("*.locked-*.dll"):
 # GFNI/AVX2/BMI instructions that AE on an AMD Zen 1-3 or an older Intel CPU cannot run (cpu_check.py checks).
 CPU=["-target","x86_64-windows-gnu","-mcpu=baseline"]
 import json,shutil
+def program_source()->Path:
+    """A copy of the program's Python for the assistant to read and patch on a user's computer: the same set the public
+    repository carries, so nothing private ships this way."""
+    stage=root/"build"/"source-stage"
+    if stage.exists():shutil.rmtree(stage)
+    stage.mkdir(parents=True)
+    for file in root.glob("*.py"):
+        if file.name not in ("package_release.py","sync_public.py","make_installer.py","build.py","publish_update.py"):shutil.copy2(file,stage/file.name)
+    return stage
 # Which CPU target each helper was built for: a helper from before this target (or another one) is rebuilt.
 stamp_path=root/"native"/"build-target.json"
 try:stamps=json.loads(stamp_path.read_text(encoding="utf-8"))
@@ -100,7 +109,7 @@ if "--native-only" not in sys.argv:
     import os
     system=Path(os.environ.get("SystemRoot",r"C:\Windows"))
     clean_path=os.pathsep.join(str(p) for p in (Path(sys.base_prefix)/"DLLs",Path(sys.base_prefix),Path(sys.executable).parent,system/"System32",system,system/"System32"/"Wbem"))
-    subprocess.run([sys.executable,"-m","PyInstaller","--noconfirm","--clean","--windowed","--onedir","--distpath",str(dist),"--name","AE汉化工具","--add-data",str(root/"scripts")+";scripts",*(["--add-data",str(bridge)+";cep_signed"] if bridge else []),"--add-binary",str(popup_dll)+";native","--add-binary",str(identity_dll)+";native","--add-binary",str(native_dll)+";native","--add-binary",str(scan_dll)+";native","--add-binary",str(parameter_dll)+";native","--add-binary",str(dynamic_dll)+";native","--add-binary",str(legacy_parameter)+";native","--add-binary",str(legacy_dynamic)+";native","--hidden-import","comtypes.gen.UIAutomationClient","--exclude-module","PySide6.QtWebEngineCore","--exclude-module","PySide6.QtWebEngineWidgets","--exclude-module","PySide6.QtQml",str(root/"app_live.py")],check=True,cwd=root,env={**os.environ,"PATH":clean_path})
+    subprocess.run([sys.executable,"-m","PyInstaller","--noconfirm","--clean","--windowed","--onedir","--distpath",str(dist),"--name","AE汉化工具","--add-data",str(root/"scripts")+";scripts","--add-data",str(root/"assistant_help.md")+";.","--add-data",str(program_source())+";source",*(["--add-data",str(bridge)+";cep_signed"] if bridge else []),"--add-binary",str(popup_dll)+";native","--add-binary",str(identity_dll)+";native","--add-binary",str(native_dll)+";native","--add-binary",str(scan_dll)+";native","--add-binary",str(parameter_dll)+";native","--add-binary",str(dynamic_dll)+";native","--add-binary",str(legacy_parameter)+";native","--add-binary",str(legacy_dynamic)+";native","--hidden-import","comtypes.gen.UIAutomationClient","--exclude-module","PySide6.QtWebEngineCore","--exclude-module","PySide6.QtWebEngineWidgets","--exclude-module","PySide6.QtQml",str(root/"app_live.py")],check=True,cwd=root,env={**os.environ,"PATH":clean_path})
     # Qt 6.12 on Windows 11 uses the OS ICU shim. PyInstaller picked Poppler's
     # same-named versioned ICU from the build host PATH; it has different exports.
     for name in ("icuuc.dll","icuin.dll","icudt.dll"):
